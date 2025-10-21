@@ -286,6 +286,53 @@ def select_point():
     except Exception as e:
         return f"Error: {e}", 400
 
+@app.route('/nudge', methods=['POST'])
+def nudge():
+    """Nudge the current tracking box by (dx, dy) pixels and re-init the tracker."""
+    global bbox, tracking, tracker, current_frame
+    try:
+        dx = int(request.form.get("dx", 0))
+        dy = int(request.form.get("dy", 0))
+        if current_frame is None:
+            return "No frame", 400
+
+        h, w = current_frame.shape[:2]
+
+        # If we have no bbox yet, create one centered first
+        if bbox is None:
+            bw = bh = 60
+            cx = w // 2
+            cy = h // 2
+        else:
+            x, y, bw, bh = map(int, bbox)
+            cx = x + bw // 2
+            cy = y + bh // 2
+
+        # Apply nudge
+        cx = max(bw // 2, min(w - bw // 2, cx + dx))
+        cy = max(bh // 2, min(h - bh // 2, cy + dy))
+
+        # Rebuild clamped bbox
+        x_new = int(max(0, min(w - bw, cx - bw // 2)))
+        y_new = int(max(0, min(h - bh, cy - bh // 2)))
+        bbox_new = (x_new, y_new, bw, bh)
+
+        # Re-init tracker on current frame
+        tracking = False
+        tracker = None
+        tracker_local = cv2.TrackerCSRT_create()
+        tracker_local.init(current_frame, bbox_new)
+        tracker = tracker_local
+        bbox = bbox_new
+        tracking = True
+
+        print(f"[INFO] Nudged bbox by ({dx},{dy}) -> {bbox}")
+        return "OK", 200
+    except Exception as e:
+        print(f"[ERROR] Nudge failed: {e}")
+        return f"Error: {e}", 400
+
+
 # === Launch Flask in separate thread ===
 flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
 flask_thread.daemon = True
@@ -299,50 +346,140 @@ WEBRTC_HTML = """
     <meta charset="utf-8">
     <title>WebRTC Viewer</title>
     <style>
-      body { font-family: sans-serif; text-align:center; background:#f0f0f0; }
-      video { width:640px; height:480px; background:#000; border:4px solid #333; cursor:crosshair; }
-      button { margin-top:12px; padding:10px 16px; }
+      :root { --w: 640px; --h: 480px; }
+      body { font-family: sans-serif; text-align:center; background:#f0f0f0; margin:0; padding:24px; }
+      h1 { margin: 0 0 10px 0; }
+      #video { width: var(--w); height: var(--h); background:#000; border:4px solid #333; cursor:crosshair; }
+      .controls { margin: 12px 0; display: inline-flex; gap: 10px; flex-wrap: wrap; align-items: center; justify-content: center; }
+      button {
+        padding: 10px 14px; border: 0; border-radius: 8px; font-size: 15px; cursor: pointer;
+        background:#4CAF50; color:white; box-shadow: 0 2px 6px rgba(0,0,0,.15);
+      }
+      button.secondary { background:#607D8B; }
+      button.quit { background:#f44336; }
+      button:active { transform: translateY(1px); }
+
+      /* D-pad */
+      .dpad { display: inline-grid; grid-template-columns: 48px 48px 48px; grid-template-rows: 48px 48px 48px; gap:6px; margin-left: 8px; }
+      .dpad button { width:48px; height:48px; background:#9E9E9E; }
+      .dpad .blank { visibility:hidden; }
+
+      #status { margin-top: 8px; color:#444; font-size: 14px; min-height: 1.2em; }
+      .hint { margin-top:6px; color:#666; font-size: 12px; }
+      .hint kbd { background:#eee; border:1px solid #ccc; border-bottom-width:2px; padding:2px 6px; border-radius:4px;}
     </style>
   </head>
   <body>
     <h1>WebRTC Live Video</h1>
-    <video id="v" autoplay playsinline></video><br/>
-    <button id="start">Start</button>
+    <video id="video" autoplay playsinline></video>
+
+    <div class="controls">
+      <button id="startBtn" class="secondary">Start</button>
+      <button onclick="sendCmd('r')">Reset (R)</button>
+      <button onclick="sendCmd('s')">Stop (S)</button>
+      <button class="quit" onclick="sendCmd('q')">Quit (Q)</button>
+
+      <!-- D-pad -->
+      <div class="dpad">
+        <span class="blank"></span>
+        <button title="Up"    onclick="nudge(0,-5)">▲</button>
+        <span class="blank"></span>
+        <button title="Left"  onclick="nudge(-5,0)">◀</button>
+        <span class="blank"></span>
+        <button title="Right" onclick="nudge(5,0)">▶</button>
+        <span class="blank"></span>
+        <button title="Down"  onclick="nudge(0,5)">▼</button>
+        <span class="blank"></span>
+      </div>
+    </div>
+
+    <div id="status"></div>
+    <div class="hint">
+      Click the video to select a target. Use arrow keys to nudge by 5px
+      (<kbd>Shift</kbd>=10px, <kbd>Alt</kbd>=1px). R/S/Q for Reset/Stop/Quit.
+    </div>
 
     <script>
-      const video = document.getElementById('v');
-      const startBtn = document.getElementById('start');
+      const video = document.getElementById('video');
+      const startBtn = document.getElementById('startBtn');
+      const statusEl = document.getElementById('status');
 
-      // Click-to-select using your existing Flask endpoint on :5000
-      video.addEventListener('click', (e) => {
+      function setStatus(msg) { statusEl.textContent = msg; }
+
+      async function sendCmd(cmd) {
+        try {
+          const resp = await fetch('http://' + location.hostname + ':5000/command', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'cmd=' + encodeURIComponent(cmd)
+          });
+          setStatus(resp.ok ? 'Sent command: ' + cmd : 'Command failed: ' + cmd);
+        } catch (e) { setStatus('Command error: ' + e); }
+      }
+
+      // Nudge API
+      async function nudge(dx, dy) {
+        try {
+          const resp = await fetch('http://' + location.hostname + ':5000/nudge', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `dx=${dx}&dy=${dy}`
+          });
+          setStatus(resp.ok ? `Nudged (${dx}, ${dy})` : `Nudge failed (${dx}, ${dy})`);
+        } catch (e) { setStatus('Nudge error: ' + e); }
+      }
+
+      // Click-to-select absolute point
+      video.addEventListener('click', async (e) => {
         const r = video.getBoundingClientRect();
         const x = Math.floor(e.clientX - r.left);
         const y = Math.floor(e.clientY - r.top);
-        fetch('http://' + location.hostname + ':5000/select_point', {
-          method:'POST',
-          headers:{'Content-Type':'application/x-www-form-urlencoded'},
-          body:`x=${x}&y=${y}`
-        });
+        try {
+          const resp = await fetch('http://' + location.hostname + ':5000/select_point', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `x=${x}&y=${y}`
+          });
+          setStatus(resp.ok ? `Selected (${x}, ${y})` : `Select failed (${x}, ${y})`);
+        } catch (e) { setStatus('Select error: ' + e); }
       });
 
+      // Keyboard: arrows nudge; Shift=10px, Alt=1px (default 5px)
+      window.addEventListener('keydown', (e) => {
+        const step = e.shiftKey ? 10 : (e.altKey ? 1 : 5);
+        if (e.key === 'ArrowRight') { nudge(step, 0);  e.preventDefault(); }
+        if (e.key === 'ArrowLeft')  { nudge(-step, 0); e.preventDefault(); }
+        if (e.key === 'ArrowUp')    { nudge(0, -step); e.preventDefault(); }
+        if (e.key === 'ArrowDown')  { nudge(0, step);  e.preventDefault(); }
+        if (e.key === 'r' || e.key === 'R') sendCmd('r');
+        if (e.key === 's' || e.key === 'S') sendCmd('s');
+        if (e.key === 'q' || e.key === 'Q') sendCmd('q');
+      });
+
+      // WebRTC start
       async function start() {
-        const pc = new RTCPeerConnection();
-        pc.ontrack = (ev) => { video.srcObject = ev.streams[0]; };
-        const offer = await pc.createOffer({ offerToReceiveVideo: true });
-        await pc.setLocalDescription(offer);
-        const resp = await fetch('/offer', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({sdp: pc.localDescription.sdp, type: pc.localDescription.type})
-        });
-        const answer = await resp.json();
-        await pc.setRemoteDescription(answer);
+        try {
+          const pc = new RTCPeerConnection();
+          pc.ontrack = (ev) => { video.srcObject = ev.streams[0]; setStatus('Streaming…'); };
+          const offer = await pc.createOffer({ offerToReceiveVideo: true });
+          await pc.setLocalDescription(offer);
+          const resp = await fetch('/offer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+          });
+          const answer = await resp.json();
+          await pc.setRemoteDescription(answer);
+          setStatus('Connected via WebRTC');
+        } catch (e) { setStatus('WebRTC error: ' + e); }
       }
-      startBtn.onclick = start;
+      startBtn.addEventListener('click', start);
     </script>
   </body>
 </html>
 """
+
+
 
 class GlobalFrameTrack(MediaStreamTrack):
     kind = "video"
