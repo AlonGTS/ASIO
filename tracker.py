@@ -190,6 +190,85 @@ else:
     picam2.start()
     time.sleep(0.3)
 
+
+def make_csrt_params(moving: bool):
+    p = cv2.TrackerCSRT_Params()
+
+    # Robust appearance features (keep on for both; turn off only if starving for CPU)
+    for name, val in dict(
+        use_hog=True,
+        use_color_names=True,
+        use_gray=False,
+        use_rgb=True,
+        use_channel_weights=True,
+        use_segmentation=False,  # turn True if your build supports it and you want more robustness
+        window_function="hann",
+        kaiser_alpha=3.2,  # used if window_function='kaiser'
+        hog_clip=2.0,
+        histogram_bins=16,
+        background_ratio=2  # smaller = tighter background sampling
+    ).items():
+        if hasattr(p, name): setattr(p, name, val)
+
+    # Scale space & adaptation (key for motion vs fixed)
+    if moving:
+        suggested = dict(
+            number_of_scales=55,       # more scales → wider search
+            scale_step=1.02,           # finer steps
+            scale_lr=0.65,             # faster scale learning
+            scale_sigma_factor=0.30,   # wider scale kernel
+            scale_model_max_area=1024  # allow larger scale model if available
+        )
+    else:
+        suggested = dict(
+            number_of_scales=33,       # fewer scales → less jitter
+            scale_step=1.03,           # slightly coarser
+            scale_lr=0.15,             # slow scale learning (stable size)
+            scale_sigma_factor=0.25,
+            scale_model_max_area=512
+        )
+    for name, val in suggested.items():
+        if hasattr(p, name): setattr(p, name, val)
+
+    # Optimization / discrimination
+    # More ADMM iterations = better discrimination (slower).
+    if hasattr(p, "admm_iterations"):
+        p.admm_iterations = 6 if moving else 9
+
+    # Template / search behaviour
+    # (Some builds expose template_size, we keep modest to avoid big CPU)
+    if hasattr(p, "template_size"):
+        p.template_size = 200 if moving else 160
+
+    # Some OpenCV builds expose 'filter_lr' (general model learning rate); if present, use it.
+    if hasattr(p, "filter_lr"):
+        p.filter_lr = 0.25 if moving else 0.08
+
+    return p
+
+def create_csrt_tracker(moving: bool):
+    try:
+        params = make_csrt_params(moving)
+        return cv2.TrackerCSRT_create(params)
+    except TypeError:
+        # Fallback if this OpenCV build doesn't accept params in the ctor
+        t = cv2.TrackerCSRT_create()
+        # Some builds allow setting attributes on t.params; guarded just in case.
+        if hasattr(t, "set"):
+            params = make_csrt_params(moving)
+            for k, v in params.__dict__.items():
+                try:
+                    getattr(t, k)  # touch
+                    setattr(t, k, v)
+                except Exception:
+                    pass
+        return t
+
+
+
+
+
+
 # === Video Recording Setup ===
 writer = None
 record_start_time = None
@@ -207,15 +286,21 @@ if SHOW_LOCAL:
 
 # === Mouse callback for Pi GUI tracker selection ===
 def draw_rectangle(event, x, y, flags, param):
-    global bbox, tracking, tracker, current_frame
+    global bbox, tracking, tracker, current_frame, bMoovingTgt
     if event == cv2.EVENT_LBUTTONDOWN and current_frame is not None:
         frame_for_init = current_frame.copy()
-        w, h = 60, 60
+        if bMoovingTgt:
+            w, h = 30, 30   # smaller box for moving target
+        else:
+            w, h = 80, 80   # larger box for stationary target
         bbox = (max(0, x - w//2), max(0, y - h//2), w, h)
-        tracker = cv2.TrackerCSRT_create()
+        tracker = create_csrt_tracker(bMoovingTgt)
+
+#        tracker = cv2.TrackerCSRT_create()
         tracker.init(frame_for_init, bbox)
         tracking = True
-        print(f"[INFO] Tracker initialized from Pi click at ({x}, {y})")
+        print(f"[INFO] Tracker initialized ({'MOVING' if bMoovingTgt else 'FIXED'}) at ({x}, {y}), box {w}x{h}")
+
 
 # Bind mouse callback only if showing local window
 if SHOW_LOCAL:
@@ -267,24 +352,30 @@ def command():
 
 @app.route('/select_point', methods=['POST'])
 def select_point():
-    global bbox, tracking, tracker, current_frame
+    global bbox, tracking, tracker, current_frame, bMoovingTgt
     try:
         x = int(request.form.get("x"))
         y = int(request.form.get("y"))
-        w, h = 60, 60
         if current_frame is None:
             return "No frame", 400
+        if bMoovingTgt:
+            w, h = 30, 30
+        else:
+            w, h = 80, 80
         tracking = False
         bbox = None
         tracker = None
         bbox = (max(0, x - w//2), max(0, y - h//2), w, h)
-        tracker = cv2.TrackerCSRT_create()
+        tracker = create_csrt_tracker(bMoovingTgt)
+
+#        tracker = cv2.TrackerCSRT_create()
         tracker.init(current_frame, bbox)
         tracking = True
-        print(f"[INFO] Tracker initialized from remote click at ({x}, {y})")
+        print(f"[INFO] Tracker initialized ({'MOVING' if bMoovingTgt else 'FIXED'}) from remote click at ({x}, {y}), box {w}x{h}")
         return "OK", 200
     except Exception as e:
         return f"Error: {e}", 400
+
 
 @app.route('/nudge', methods=['POST'])
 def nudge():
@@ -320,7 +411,9 @@ def nudge():
         # Re-init tracker on current frame
         tracking = False
         tracker = None
-        tracker_local = cv2.TrackerCSRT_create()
+        tracker_local = create_csrt_tracker(bMoovingTgt)
+
+        #tracker_local = cv2.TrackerCSRT_create()
         tracker_local.init(current_frame, bbox_new)
         tracker = tracker_local
         bbox = bbox_new
@@ -331,6 +424,18 @@ def nudge():
     except Exception as e:
         print(f"[ERROR] Nudge failed: {e}")
         return f"Error: {e}", 400
+   
+# Toggle state (ברירת מחדל: מטרה קבועה)
+bMoovingTgt = False  # שים לב לשם בדיוק כפי שביקשת
+
+@app.route('/set_target_mode', methods=['POST'])
+def set_target_mode():
+    global bMoovingTgt
+    val = request.form.get("bMoovingTgt", "0")
+    bMoovingTgt = (val == "1")
+    print(f"[INFO] Target mode set to: {'MOVING' if bMoovingTgt else 'FIXED'}")
+    return "OK", 200
+
 
 
 # === Launch Flask in separate thread ===
@@ -338,7 +443,6 @@ flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded
 flask_thread.daemon = True
 flask_thread.start()
 
-# === WebRTC (aiortc + aiohttp) ===
 WEBRTC_HTML = """
 <!doctype html>
 <html>
@@ -357,6 +461,7 @@ WEBRTC_HTML = """
       }
       button.secondary { background:#607D8B; }
       button.quit { background:#f44336; }
+      button.toggle { background:#2196F3; }
       button:active { transform: translateY(1px); }
 
       /* D-pad */
@@ -379,6 +484,9 @@ WEBRTC_HTML = """
       <button onclick="sendCmd('s')">Stop (S)</button>
       <button class="quit" onclick="sendCmd('q')">Quit (Q)</button>
 
+      <!-- Toggle target type -->
+      <button id="tgtBtn" class="toggle" onclick="toggleTarget()">Target: Fixed (M)</button>
+
       <!-- D-pad -->
       <div class="dpad">
         <span class="blank"></span>
@@ -396,13 +504,15 @@ WEBRTC_HTML = """
     <div id="status"></div>
     <div class="hint">
       Click the video to select a target. Use arrow keys to nudge by 5px
-      (<kbd>Shift</kbd>=10px, <kbd>Alt</kbd>=1px). R/S/Q for Reset/Stop/Quit.
+      (<kbd>Shift</kbd>=10px, <kbd>Alt</kbd>=1px). <kbd>M</kbd> toggles Fixed/Moving.
+      R/S/Q for Reset/Stop/Quit.
     </div>
 
     <script>
       const video = document.getElementById('video');
       const startBtn = document.getElementById('startBtn');
       const statusEl = document.getElementById('status');
+      const tgtBtn = document.getElementById('tgtBtn');
 
       function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -444,13 +554,29 @@ WEBRTC_HTML = """
         } catch (e) { setStatus('Select error: ' + e); }
       });
 
-      // Keyboard: arrows nudge; Shift=10px, Alt=1px (default 5px)
+      // Moving/Fixed toggle
+      let movingTgt = false; // default: Fixed
+      async function toggleTarget() {
+        movingTgt = !movingTgt;
+        tgtBtn.textContent = 'Target: ' + (movingTgt ? 'Moving' : 'Fixed') + ' (M)';
+        try {
+          const resp = await fetch('http://' + location.hostname + ':5000/set_target_mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'bMoovingTgt=' + (movingTgt ? 1 : 0)
+          });
+          setStatus(resp.ok ? ('Mode: ' + (movingTgt ? 'MOVING' : 'FIXED')) : 'Mode set failed');
+        } catch (e) { setStatus('Mode error: ' + e); }boun
+      }
+
+      // Keyboard: arrows nudge; Shift=10px, Alt=1px (default 5px); M toggles mode
       window.addEventListener('keydown', (e) => {
         const step = e.shiftKey ? 10 : (e.altKey ? 1 : 5);
         if (e.key === 'ArrowRight') { nudge(step, 0);  e.preventDefault(); }
         if (e.key === 'ArrowLeft')  { nudge(-step, 0); e.preventDefault(); }
         if (e.key === 'ArrowUp')    { nudge(0, -step); e.preventDefault(); }
         if (e.key === 'ArrowDown')  { nudge(0, step);  e.preventDefault(); }
+        if (e.key === 'm' || e.key === 'M') toggleTarget();
         if (e.key === 'r' || e.key === 'R') sendCmd('r');
         if (e.key === 's' || e.key === 'S') sendCmd('s');
         if (e.key === 'q' || e.key === 'Q') sendCmd('q');
@@ -478,7 +604,6 @@ WEBRTC_HTML = """
   </body>
 </html>
 """
-
 
 
 class GlobalFrameTrack(MediaStreamTrack):
