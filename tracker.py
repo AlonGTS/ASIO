@@ -264,11 +264,6 @@ def create_csrt_tracker(moving: bool):
                     pass
         return t
 
-
-
-
-
-
 # === Video Recording Setup ===
 writer = None
 record_start_time = None
@@ -295,8 +290,6 @@ def draw_rectangle(event, x, y, flags, param):
             w, h = 80, 80   # larger box for stationary target
         bbox = (max(0, x - w//2), max(0, y - h//2), w, h)
         tracker = create_csrt_tracker(bMoovingTgt)
-
-#        tracker = cv2.TrackerCSRT_create()
         tracker.init(frame_for_init, bbox)
         tracking = True
         print(f"[INFO] Tracker initialized ({'MOVING' if bMoovingTgt else 'FIXED'}) at ({x}, {y}), box {w}x{h}")
@@ -367,8 +360,6 @@ def select_point():
         tracker = None
         bbox = (max(0, x - w//2), max(0, y - h//2), w, h)
         tracker = create_csrt_tracker(bMoovingTgt)
-
-#        tracker = cv2.TrackerCSRT_create()
         tracker.init(current_frame, bbox)
         tracking = True
         print(f"[INFO] Tracker initialized ({'MOVING' if bMoovingTgt else 'FIXED'}) from remote click at ({x}, {y}), box {w}x{h}")
@@ -413,7 +404,6 @@ def nudge():
         tracker = None
         tracker_local = create_csrt_tracker(bMoovingTgt)
 
-        #tracker_local = cv2.TrackerCSRT_create()
         tracker_local.init(current_frame, bbox_new)
         tracker = tracker_local
         bbox = bbox_new
@@ -451,61 +441,134 @@ WEBRTC_HTML = """
     <title>WebRTC Viewer</title>
     <style>
       :root { --w: 640px; --h: 480px; }
-      body { font-family: sans-serif; text-align:center; background:#f0f0f0; margin:0; padding:24px; }
-      h1 { margin: 0 0 10px 0; }
-      #video { width: var(--w); height: var(--h); background:#000; border:4px solid #333; cursor:crosshair; }
-      .controls { margin: 12px 0; display: inline-flex; gap: 10px; flex-wrap: wrap; align-items: center; justify-content: center; }
-      button {
-        padding: 10px 14px; border: 0; border-radius: 8px; font-size: 15px; cursor: pointer;
-        background:#4CAF50; color:white; box-shadow: 0 2px 6px rgba(0,0,0,.15);
+
+      * { box-sizing: border-box; }
+      body {
+        font-family: sans-serif;
+        background:#f0f0f0;
+        margin:0;
+        padding:24px;
       }
-      button.secondary { background:#607D8B; }
-      button.quit { background:#f44336; }
-      button.toggle { background:#2196F3; }
-      button:active { transform: translateY(1px); }
+      h1 { margin:0 0 14px 0; text-align:center; }
+
+      /* Layout: video centered, vertical control rail on the right */
+      .layout {
+        display:grid;
+        grid-template-columns: minmax(var(--w), 1fr) 220px;
+        gap:18px;
+        align-items:start;
+        justify-content:center;    /* centers the grid as a block */
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+
+      /* Video panel */
+      .video-panel {
+        display:flex;
+        flex-direction:column;
+        align-items:center;        /* centers the video horizontally */
+      }
+      #video {
+        width: var(--w);
+        height: var(--h);
+        background:#000;
+        border:4px solid #333;
+        cursor:crosshair;
+      }
+      #status {
+        margin-top:8px; color:#444; font-size:14px; min-height:1.2em;
+      }
+      .hint {
+        margin-top:6px; color:#666; font-size:12px; text-align:center;
+      }
+      .hint kbd {
+        background:#eee; border:1px solid #ccc; border-bottom-width:2px;
+        padding:2px 6px; border-radius:4px;
+      }
+
+      /* Right rail: vertical controls */
+      .rail {
+        display:flex;
+        flex-direction:column;
+        align-items:stretch;
+        gap:10px;
+      }
+      .btn {
+        padding:10px 14px; border:0; border-radius:8px; font-size:15px; cursor:pointer;
+        color:white; box-shadow:0 2px 6px rgba(0,0,0,.15);
+      }
+      .btn.secondary { background:#607D8B; }
+      .btn.go        { background:#4CAF50; }
+      .btn.stop      { background:#4CAF50; opacity:.9; }
+      .btn.quit      { background:#f44336; }
+      .btn.toggle    { background:#2196F3; }
+      .btn:active { transform: translateY(1px); }
 
       /* D-pad */
-      .dpad { display: inline-grid; grid-template-columns: 48px 48px 48px; grid-template-rows: 48px 48px 48px; gap:6px; margin-left: 8px; }
-      .dpad button { width:48px; height:48px; background:#9E9E9E; }
+      .dpad {
+        margin-top:8px;
+        display:grid;
+        grid-template-columns: 56px 56px 56px;
+        grid-template-rows: 56px 56px 56px;
+        gap:8px;
+        justify-content:center;
+      }
+      .dpad button {
+        width:56px; height:56px; background:#9E9E9E; border:0; border-radius:10px;
+        color:#fff; font-size:18px; cursor:pointer; box-shadow:0 2px 6px rgba(0,0,0,.15);
+      }
       .dpad .blank { visibility:hidden; }
 
-      #status { margin-top: 8px; color:#444; font-size: 14px; min-height: 1.2em; }
-      .hint { margin-top:6px; color:#666; font-size: 12px; }
-      .hint kbd { background:#eee; border:1px solid #ccc; border-bottom-width:2px; padding:2px 6px; border-radius:4px;}
+      /* Responsive: stack rail below video on narrow screens */
+      @media (max-width: 980px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+        .rail {
+          flex-direction:row;
+          flex-wrap:wrap;
+          justify-content:center;
+        }
+        .dpad { margin-left:0; }
+      }
     </style>
   </head>
   <body>
     <h1>WebRTC Live Video</h1>
-    <video id="video" autoplay playsinline></video>
 
-    <div class="controls">
-      <button id="startBtn" class="secondary">Start</button>
-      <button onclick="sendCmd('r')">Reset (R)</button>
-      <button onclick="sendCmd('s')">Stop (S)</button>
-      <button class="quit" onclick="sendCmd('q')">Quit (Q)</button>
-
-      <!-- Toggle target type -->
-      <button id="tgtBtn" class="toggle" onclick="toggleTarget()">Target: Fixed (M)</button>
-
-      <!-- D-pad -->
-      <div class="dpad">
-        <span class="blank"></span>
-        <button title="Up"    onclick="nudge(0,-5)">▲</button>
-        <span class="blank"></span>
-        <button title="Left"  onclick="nudge(-5,0)">◀</button>
-        <span class="blank"></span>
-        <button title="Right" onclick="nudge(5,0)">▶</button>
-        <span class="blank"></span>
-        <button title="Down"  onclick="nudge(0,5)">▼</button>
-        <span class="blank"></span>
+    <div class="layout">
+      <!-- Left: video centered -->
+      <div class="video-panel">
+        <video id="video" autoplay playsinline></video>
+        <div id="status"></div>
+        <div class="hint">
+          Click the video to select a target. Use arrow keys to nudge by 5px
+          (<kbd>Shift</kbd>=10px, <kbd>Alt</kbd>=1px). <kbd>M</kbd> toggles Fixed/Moving.
+          R/S/Q for Reset/Stop/Quit.
+        </div>
       </div>
-    </div>
 
-    <div id="status"></div>
-    <div class="hint">
-      Click the video to select a target. Use arrow keys to nudge by 5px
-      (<kbd>Shift</kbd>=10px, <kbd>Alt</kbd>=1px). <kbd>M</kbd> toggles Fixed/Moving.
-      R/S/Q for Reset/Stop/Quit.
+      <!-- Right: vertical control rail -->
+      <div class="rail">
+        <button id="startBtn" class="btn secondary">Start</button>
+        <button class="btn go"   onclick="sendCmd('r')">Reset (R)</button>
+        <button class="btn stop" onclick="sendCmd('s')">Stop (S)</button>
+        <button class="btn quit" onclick="sendCmd('q')">Quit (Q)</button>
+        <button id="tgtBtn" class="btn toggle" onclick="toggleTarget()">Target: Fixed (M)</button>
+
+        <!-- D-pad -->
+        <div class="dpad">
+          <span class="blank"></span>
+          <button title="Up"    onclick="nudge(0,-5)">▲</button>
+          <span class="blank"></span>
+          <button title="Left"  onclick="nudge(-5,0)">◀</button>
+          <span class="blank"></span>
+          <button title="Right" onclick="nudge(5,0)">▶</button>
+          <span class="blank"></span>
+          <button title="Down"  onclick="nudge(0,5)">▼</button>
+          <span class="blank"></span>
+        </div>
+      </div>
     </div>
 
     <script>
@@ -527,7 +590,6 @@ WEBRTC_HTML = """
         } catch (e) { setStatus('Command error: ' + e); }
       }
 
-      // Nudge API
       async function nudge(dx, dy) {
         try {
           const resp = await fetch('http://' + location.hostname + ':5000/nudge', {
@@ -539,7 +601,6 @@ WEBRTC_HTML = """
         } catch (e) { setStatus('Nudge error: ' + e); }
       }
 
-      // Click-to-select absolute point
       video.addEventListener('click', async (e) => {
         const r = video.getBoundingClientRect();
         const x = Math.floor(e.clientX - r.left);
@@ -554,7 +615,6 @@ WEBRTC_HTML = """
         } catch (e) { setStatus('Select error: ' + e); }
       });
 
-      // Moving/Fixed toggle
       let movingTgt = false; // default: Fixed
       async function toggleTarget() {
         movingTgt = !movingTgt;
@@ -566,10 +626,9 @@ WEBRTC_HTML = """
             body: 'bMoovingTgt=' + (movingTgt ? 1 : 0)
           });
           setStatus(resp.ok ? ('Mode: ' + (movingTgt ? 'MOVING' : 'FIXED')) : 'Mode set failed');
-        } catch (e) { setStatus('Mode error: ' + e); }boun
+        } catch (e) { setStatus('Mode error: ' + e); }
       }
 
-      // Keyboard: arrows nudge; Shift=10px, Alt=1px (default 5px); M toggles mode
       window.addEventListener('keydown', (e) => {
         const step = e.shiftKey ? 10 : (e.altKey ? 1 : 5);
         if (e.key === 'ArrowRight') { nudge(step, 0);  e.preventDefault(); }
@@ -582,7 +641,6 @@ WEBRTC_HTML = """
         if (e.key === 'q' || e.key === 'Q') sendCmd('q');
       });
 
-      // WebRTC start
       async function start() {
         try {
           const pc = new RTCPeerConnection();
@@ -604,6 +662,7 @@ WEBRTC_HTML = """
   </body>
 </html>
 """
+
 
 
 class GlobalFrameTrack(MediaStreamTrack):
@@ -723,10 +782,21 @@ while True:
                 pitch = -norm_dy * math.radians(45)
                 send_attitude(pitch, yaw)
 
-                # Draw overlay
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 0, 0), 2)
-                cv2.line(frame, (cx - 10, cy), (cx + 10, cy), (0, 255, 0), 1)
-                cv2.line(frame, (cx, cy - 10), (cx, cy + 10), (0, 255, 0), 1)
+                # Choose color based on tracking mode
+                if bMoovingTgt:
+                    box_color = (0, 0, 255)   # red for moving target
+                    cross_color = (0, 0, 255)
+                else:
+                    box_color = (255, 0, 0)   # blue for fixed target
+                    cross_color = (255, 0, 0)
+
+                # Draw bounding box
+                cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
+
+                # Draw crosshair
+                cv2.line(frame, (cx - 10, cy), (cx + 10, cy), cross_color, 1)
+                cv2.line(frame, (cx, cy - 10), (cx, cy + 10), cross_color, 1)
+
             else:
                 cv2.putText(frame, "Tracking lost", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         except Exception as e:
