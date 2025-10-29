@@ -6,6 +6,7 @@ import math
 import numpy as np
 from flask import Flask, Response, request, render_template_string
 from threading import Thread, Lock, Condition
+import threading
 import argparse
 from datetime import datetime
 import tkinter as tk
@@ -26,18 +27,66 @@ SHOW_LOCAL = True  # True only when debugging with a monitor
 app = Flask(__name__)
 CORS(app)  # allow the WebRTC page to post to /select_point on :5000
 
+# Shared state
 output_frame = None               # Frame to be streamed over HTTP / WebRTC
+current_frame = None              # Latest frame from camera/file
 command_from_remote = None        # Command from web interface (reset, stop, quit)
-current_frame = None              # Latest frame from camera
 bbox = None                       # Bounding box of tracked object
 tracking = False                  # Tracking state flag
 tracker = None                    # OpenCV tracker object
+bMoovingTgt = False               # Target type toggle (False=fixed, True=moving)
 
-# Thread sync for sharing frames with WebRTC
+# Thread sync for sharing frames with WebRTC & MJPEG
 frame_lock = Lock()
 frame_ready = Condition(frame_lock)
 
-# === HTML Page for /control ===
+# ============ Camera/File Reader (unified) ============
+cap = None
+picam2 = None
+_reader_thread = None
+_stop_reader = threading.Event()
+
+def _reader_playback(path, loop=False):
+    """Read frames from a video file and publish to current_frame/output_frame."""
+    global cap, current_frame, output_frame
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open video file: {path}")
+        return
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = fps if fps and fps > 0 else 30.0
+    delay = 1.0 / fps
+
+    print(f"[INFO] Playback reader started (fps≈{fps:.1f}, loop={loop})")
+    while not _stop_reader.is_set():
+        ok, frame = cap.read()
+        if not ok:
+            if loop:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            else:
+                print("[INFO] Playback ended")
+                break
+        with frame_ready:
+            current_frame = frame.copy()
+            output_frame = frame.copy()
+            frame_ready.notify_all()
+        time.sleep(delay)
+
+def _reader_live_picam():
+    """Read frames from PiCamera2 and publish to current_frame/output_frame."""
+    global current_frame, output_frame, picam2
+    print("[INFO] Live reader started (PiCamera2)")
+    while not _stop_reader.is_set():
+        frame = picam2.capture_array()
+        if frame is None:
+            continue
+        with frame_ready:
+            current_frame = frame.copy()
+            output_frame = frame.copy()
+            frame_ready.notify_all()
+
+# === HTML Page for /control (MJPEG) ===
 HTML_PAGE = """
 <!doctype html>
 <html>
@@ -152,6 +201,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--mode', choices=['live', 'record', 'playback'], default='live')
 parser.add_argument('--video', help='Path to video file for playback')
 parser.add_argument('--duration', type=int, help='Duration to record (seconds)')
+parser.add_argument('--loop', action='store_true', help='Loop video in playback mode')
 args = parser.parse_args()
 
 # === If recording mode and no duration provided, ask user via GUI ===
@@ -165,10 +215,10 @@ if args.mode == 'record' and not args.duration:
     args.duration = duration
     print(f"[INFO] Recording duration set to {args.duration} seconds")
 
-# === Camera or Video Input Setup ===
-from picamera2 import Picamera2
+# === Camera or Video Input Setup (start reader thread) ===
 if args.mode == 'playback':
     if not args.video:
+        # (You can keep the dialog if you want)
         root = tk.Tk()
         root.withdraw()
         args.video = filedialog.askopenfilename(
@@ -178,10 +228,13 @@ if args.mode == 'playback':
         if not args.video:
             print("[ERROR] No file selected. Exiting...")
             exit(1)
-    cap = cv2.VideoCapture(args.video)
-
+    print(f"[INFO] Playback mode from file: {args.video} (loop={args.loop})")
+    _stop_reader.clear()
+    _reader_thread = Thread(target=_reader_playback, args=(args.video, args.loop), daemon=True)
+    _reader_thread.start()
 else:
     # Initialize the Pi Camera for live capture
+    from picamera2 import Picamera2
     picam2 = Picamera2()
     picam2.preview_configuration.main.size = (640, 480)
     picam2.preview_configuration.main.format = "RGB888"
@@ -189,61 +242,53 @@ else:
     picam2.set_controls({"FrameRate": 30})  # keep latency down
     picam2.start()
     time.sleep(0.3)
+    _stop_reader.clear()
+    _reader_thread = Thread(target=_reader_live_picam, daemon=True)
+    _reader_thread.start()
 
-
+# === CSRT tracker params/tuning ===
 def make_csrt_params(moving: bool):
     p = cv2.TrackerCSRT_Params()
-
-    # Robust appearance features (keep on for both; turn off only if starving for CPU)
     for name, val in dict(
         use_hog=True,
         use_color_names=True,
         use_gray=False,
         use_rgb=True,
         use_channel_weights=True,
-        use_segmentation=False,  # turn True if your build supports it and you want more robustness
+        use_segmentation=False,
         window_function="hann",
-        kaiser_alpha=3.2,  # used if window_function='kaiser'
+        kaiser_alpha=3.2,
         hog_clip=2.0,
         histogram_bins=16,
-        background_ratio=2  # smaller = tighter background sampling
+        background_ratio=2
     ).items():
         if hasattr(p, name): setattr(p, name, val)
 
-    # Scale space & adaptation (key for motion vs fixed)
     if moving:
         suggested = dict(
-            number_of_scales=55,       # more scales → wider search
-            scale_step=1.02,           # finer steps
-            scale_lr=0.65,             # faster scale learning
-            scale_sigma_factor=0.30,   # wider scale kernel
-            scale_model_max_area=1024  # allow larger scale model if available
+            number_of_scales=55,
+            scale_step=1.02,
+            scale_lr=0.65,
+            scale_sigma_factor=0.30,
+            scale_model_max_area=1024
         )
     else:
         suggested = dict(
-            number_of_scales=33,       # fewer scales → less jitter
-            scale_step=1.03,           # slightly coarser
-            scale_lr=0.15,             # slow scale learning (stable size)
+            number_of_scales=33,
+            scale_step=1.03,
+            scale_lr=0.15,
             scale_sigma_factor=0.25,
             scale_model_max_area=512
         )
     for name, val in suggested.items():
         if hasattr(p, name): setattr(p, name, val)
 
-    # Optimization / discrimination
-    # More ADMM iterations = better discrimination (slower).
     if hasattr(p, "admm_iterations"):
         p.admm_iterations = 6 if moving else 9
-
-    # Template / search behaviour
-    # (Some builds expose template_size, we keep modest to avoid big CPU)
     if hasattr(p, "template_size"):
         p.template_size = 200 if moving else 160
-
-    # Some OpenCV builds expose 'filter_lr' (general model learning rate); if present, use it.
     if hasattr(p, "filter_lr"):
         p.filter_lr = 0.25 if moving else 0.08
-
     return p
 
 def create_csrt_tracker(moving: bool):
@@ -251,14 +296,12 @@ def create_csrt_tracker(moving: bool):
         params = make_csrt_params(moving)
         return cv2.TrackerCSRT_create(params)
     except TypeError:
-        # Fallback if this OpenCV build doesn't accept params in the ctor
         t = cv2.TrackerCSRT_create()
-        # Some builds allow setting attributes on t.params; guarded just in case.
         if hasattr(t, "set"):
             params = make_csrt_params(moving)
             for k, v in params.__dict__.items():
                 try:
-                    getattr(t, k)  # touch
+                    getattr(t, k)
                     setattr(t, k, v)
                 except Exception:
                     pass
@@ -275,27 +318,24 @@ if args.mode == 'record':
     record_start_time = time.time()
     print(f"[INFO] Recording to {video_filename}")
 
-# === Create OpenCV window for visual tracker feedback ===
+# === Local debug window ===
 if SHOW_LOCAL:
     cv2.namedWindow("Tracker")
 
-# === Mouse callback for Pi GUI tracker selection ===
 def draw_rectangle(event, x, y, flags, param):
     global bbox, tracking, tracker, current_frame, bMoovingTgt
     if event == cv2.EVENT_LBUTTONDOWN and current_frame is not None:
         frame_for_init = current_frame.copy()
         if bMoovingTgt:
-            w, h = 30, 30   # smaller box for moving target
+            w, h = 30, 30
         else:
-            w, h = 80, 80   # larger box for stationary target
+            w, h = 80, 80
         bbox = (max(0, x - w//2), max(0, y - h//2), w, h)
         tracker = create_csrt_tracker(bMoovingTgt)
         tracker.init(frame_for_init, bbox)
         tracking = True
         print(f"[INFO] Tracker initialized ({'MOVING' if bMoovingTgt else 'FIXED'}) at ({x}, {y}), box {w}x{h}")
 
-
-# Bind mouse callback only if showing local window
 if SHOW_LOCAL:
     cv2.setMouseCallback("Tracker", draw_rectangle)
 
@@ -330,6 +370,7 @@ def index():
 
 @app.route('/control')
 def control():
+    # You can allow in playback too; kept as-is per your previous code
     if args.mode == 'playback':
         return "Control not available in playback mode", 403
     return render_template_string(HTML_PAGE)
@@ -367,7 +408,6 @@ def select_point():
     except Exception as e:
         return f"Error: {e}", 400
 
-
 @app.route('/nudge', methods=['POST'])
 def nudge():
     """Nudge the current tracking box by (dx, dy) pixels and re-init the tracker."""
@@ -377,10 +417,7 @@ def nudge():
         dy = int(request.form.get("dy", 0))
         if current_frame is None:
             return "No frame", 400
-
         h, w = current_frame.shape[:2]
-
-        # If we have no bbox yet, create one centered first
         if bbox is None:
             bw = bh = 60
             cx = w // 2
@@ -389,34 +426,24 @@ def nudge():
             x, y, bw, bh = map(int, bbox)
             cx = x + bw // 2
             cy = y + bh // 2
-
-        # Apply nudge
         cx = max(bw // 2, min(w - bw // 2, cx + dx))
         cy = max(bh // 2, min(h - bh // 2, cy + dy))
-
-        # Rebuild clamped bbox
         x_new = int(max(0, min(w - bw, cx - bw // 2)))
         y_new = int(max(0, min(h - bh, cy - bh // 2)))
         bbox_new = (x_new, y_new, bw, bh)
 
-        # Re-init tracker on current frame
         tracking = False
         tracker = None
         tracker_local = create_csrt_tracker(bMoovingTgt)
-
         tracker_local.init(current_frame, bbox_new)
         tracker = tracker_local
         bbox = bbox_new
         tracking = True
-
         print(f"[INFO] Nudged bbox by ({dx},{dy}) -> {bbox}")
         return "OK", 200
     except Exception as e:
         print(f"[ERROR] Nudge failed: {e}")
         return f"Error: {e}", 400
-   
-# Toggle state (ברירת מחדל: מטרה קבועה)
-bMoovingTgt = False  # שים לב לשם בדיוק כפי שביקשת
 
 @app.route('/set_target_mode', methods=['POST'])
 def set_target_mode():
@@ -426,13 +453,12 @@ def set_target_mode():
     print(f"[INFO] Target mode set to: {'MOVING' if bMoovingTgt else 'FIXED'}")
     return "OK", 200
 
-
-
 # === Launch Flask in separate thread ===
 flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
 flask_thread.daemon = True
 flask_thread.start()
 
+# === WebRTC HTML (vertical rail) ===
 WEBRTC_HTML = """
 <!doctype html>
 <html>
@@ -441,103 +467,32 @@ WEBRTC_HTML = """
     <title>WebRTC Viewer</title>
     <style>
       :root { --w: 640px; --h: 480px; }
-
       * { box-sizing: border-box; }
-      body {
-        font-family: sans-serif;
-        background:#f0f0f0;
-        margin:0;
-        padding:24px;
-      }
+      body { font-family: sans-serif; background:#f0f0f0; margin:0; padding:24px; }
       h1 { margin:0 0 14px 0; text-align:center; }
-
-      /* Layout: video centered, vertical control rail on the right */
-      .layout {
-        display:grid;
-        grid-template-columns: minmax(var(--w), 1fr) 220px;
-        gap:18px;
-        align-items:start;
-        justify-content:center;    /* centers the grid as a block */
-        max-width: 1200px;
-        margin: 0 auto;
-      }
-
-      /* Video panel */
-      .video-panel {
-        display:flex;
-        flex-direction:column;
-        align-items:center;        /* centers the video horizontally */
-      }
-      #video {
-        width: var(--w);
-        height: var(--h);
-        background:#000;
-        border:4px solid #333;
-        cursor:crosshair;
-      }
-      #status {
-        margin-top:8px; color:#444; font-size:14px; min-height:1.2em;
-      }
-      .hint {
-        margin-top:6px; color:#666; font-size:12px; text-align:center;
-      }
-      .hint kbd {
-        background:#eee; border:1px solid #ccc; border-bottom-width:2px;
-        padding:2px 6px; border-radius:4px;
-      }
-
-      /* Right rail: vertical controls */
-      .rail {
-        display:flex;
-        flex-direction:column;
-        align-items:stretch;
-        gap:10px;
-      }
-      .btn {
-        padding:10px 14px; border:0; border-radius:8px; font-size:15px; cursor:pointer;
-        color:white; box-shadow:0 2px 6px rgba(0,0,0,.15);
-      }
+      .layout { display:grid; grid-template-columns: minmax(var(--w), 1fr) 220px; gap:18px; align-items:start; justify-content:center; max-width:1200px; margin:0 auto; }
+      .video-panel { display:flex; flex-direction:column; align-items:center; }
+      #video { width: var(--w); height: var(--h); background:#000; border:4px solid #333; cursor:crosshair; }
+      #status { margin-top:8px; color:#444; font-size:14px; min-height:1.2em; }
+      .hint { margin-top:6px; color:#666; font-size:12px; text-align:center; }
+      .hint kbd { background:#eee; border:1px solid #ccc; border-bottom-width:2px; padding:2px 6px; border-radius:4px; }
+      .rail { display:flex; flex-direction:column; align-items:stretch; gap:10px; }
+      .btn { padding:10px 14px; border:0; border-radius:8px; font-size:15px; cursor:pointer; color:white; box-shadow:0 2px 6px rgba(0,0,0,.15); }
       .btn.secondary { background:#607D8B; }
-      .btn.go        { background:#4CAF50; }
-      .btn.stop      { background:#4CAF50; opacity:.9; }
-      .btn.quit      { background:#f44336; }
-      .btn.toggle    { background:#2196F3; }
+      .btn.go { background:#4CAF50; }
+      .btn.stop { background:#4CAF50; opacity:.9; }
+      .btn.quit { background:#f44336; }
+      .btn.toggle { background:#2196F3; }
       .btn:active { transform: translateY(1px); }
-
-      /* D-pad */
-      .dpad {
-        margin-top:8px;
-        display:grid;
-        grid-template-columns: 56px 56px 56px;
-        grid-template-rows: 56px 56px 56px;
-        gap:8px;
-        justify-content:center;
-      }
-      .dpad button {
-        width:56px; height:56px; background:#9E9E9E; border:0; border-radius:10px;
-        color:#fff; font-size:18px; cursor:pointer; box-shadow:0 2px 6px rgba(0,0,0,.15);
-      }
+      .dpad { margin-top:8px; display:grid; grid-template-columns:56px 56px 56px; grid-template-rows:56px 56px 56px; gap:8px; justify-content:center; }
+      .dpad button { width:56px; height:56px; background:#9E9E9E; border:0; border-radius:10px; color:#fff; font-size:18px; cursor:pointer; box-shadow:0 2px 6px rgba(0,0,0,.15); }
       .dpad .blank { visibility:hidden; }
-
-      /* Responsive: stack rail below video on narrow screens */
-      @media (max-width: 980px) {
-        .layout {
-          grid-template-columns: 1fr;
-        }
-        .rail {
-          flex-direction:row;
-          flex-wrap:wrap;
-          justify-content:center;
-        }
-        .dpad { margin-left:0; }
-      }
+      @media (max-width:980px){ .layout{ grid-template-columns:1fr;} .rail{ flex-direction:row; flex-wrap:wrap; justify-content:center;} }
     </style>
   </head>
   <body>
     <h1>WebRTC Live Video</h1>
-
     <div class="layout">
-      <!-- Left: video centered -->
       <div class="video-panel">
         <video id="video" autoplay playsinline></video>
         <div id="status"></div>
@@ -547,16 +502,12 @@ WEBRTC_HTML = """
           R/S/Q for Reset/Stop/Quit.
         </div>
       </div>
-
-      <!-- Right: vertical control rail -->
       <div class="rail">
         <button id="startBtn" class="btn secondary">Start</button>
         <button class="btn go"   onclick="sendCmd('r')">Reset (R)</button>
         <button class="btn stop" onclick="sendCmd('s')">Stop (S)</button>
         <button class="btn quit" onclick="sendCmd('q')">Quit (Q)</button>
         <button id="tgtBtn" class="btn toggle" onclick="toggleTarget()">Target: Fixed (M)</button>
-
-        <!-- D-pad -->
         <div class="dpad">
           <span class="blank"></span>
           <button title="Up"    onclick="nudge(0,-5)">▲</button>
@@ -570,92 +521,79 @@ WEBRTC_HTML = """
         </div>
       </div>
     </div>
-
     <script>
       const video = document.getElementById('video');
       const startBtn = document.getElementById('startBtn');
       const statusEl = document.getElementById('status');
       const tgtBtn = document.getElementById('tgtBtn');
-
-      function setStatus(msg) { statusEl.textContent = msg; }
-
-      async function sendCmd(cmd) {
-        try {
+      function setStatus(msg){ statusEl.textContent = msg; }
+      async function sendCmd(cmd){
+        try{
           const resp = await fetch('http://' + location.hostname + ':5000/command', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: 'cmd=' + encodeURIComponent(cmd)
+            method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:'cmd=' + encodeURIComponent(cmd)
           });
           setStatus(resp.ok ? 'Sent command: ' + cmd : 'Command failed: ' + cmd);
-        } catch (e) { setStatus('Command error: ' + e); }
+        }catch(e){ setStatus('Command error: ' + e); }
       }
-
-      async function nudge(dx, dy) {
-        try {
+      async function nudge(dx, dy){
+        try{
           const resp = await fetch('http://' + location.hostname + ':5000/nudge', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `dx=${dx}&dy=${dy}`
+            method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:`dx=${dx}&dy=${dy}`
           });
           setStatus(resp.ok ? `Nudged (${dx}, ${dy})` : `Nudge failed (${dx}, ${dy})`);
-        } catch (e) { setStatus('Nudge error: ' + e); }
+        }catch(e){ setStatus('Nudge error: ' + e); }
       }
-
-      video.addEventListener('click', async (e) => {
+      video.addEventListener('click', async (e)=>{
         const r = video.getBoundingClientRect();
         const x = Math.floor(e.clientX - r.left);
         const y = Math.floor(e.clientY - r.top);
-        try {
+        try{
           const resp = await fetch('http://' + location.hostname + ':5000/select_point', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `x=${x}&y=${y}`
+            method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:`x=${x}&y=${y}`
           });
           setStatus(resp.ok ? `Selected (${x}, ${y})` : `Select failed (${x}, ${y})`);
-        } catch (e) { setStatus('Select error: ' + e); }
+        }catch(e){ setStatus('Select error: ' + e); }
       });
-
       let movingTgt = false; // default: Fixed
-      async function toggleTarget() {
+      async function toggleTarget(){
         movingTgt = !movingTgt;
         tgtBtn.textContent = 'Target: ' + (movingTgt ? 'Moving' : 'Fixed') + ' (M)';
-        try {
+        try{
           const resp = await fetch('http://' + location.hostname + ':5000/set_target_mode', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: 'bMoovingTgt=' + (movingTgt ? 1 : 0)
+            method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:'bMoovingTgt=' + (movingTgt ? 1 : 0)
           });
           setStatus(resp.ok ? ('Mode: ' + (movingTgt ? 'MOVING' : 'FIXED')) : 'Mode set failed');
-        } catch (e) { setStatus('Mode error: ' + e); }
+        }catch(e){ setStatus('Mode error: ' + e); }
       }
-
-      window.addEventListener('keydown', (e) => {
+      window.addEventListener('keydown', (e)=>{
         const step = e.shiftKey ? 10 : (e.altKey ? 1 : 5);
-        if (e.key === 'ArrowRight') { nudge(step, 0);  e.preventDefault(); }
-        if (e.key === 'ArrowLeft')  { nudge(-step, 0); e.preventDefault(); }
-        if (e.key === 'ArrowUp')    { nudge(0, -step); e.preventDefault(); }
-        if (e.key === 'ArrowDown')  { nudge(0, step);  e.preventDefault(); }
+        if (e.key === 'ArrowRight'){ nudge(step, 0); e.preventDefault(); }
+        if (e.key === 'ArrowLeft'){ nudge(-step, 0); e.preventDefault(); }
+        if (e.key === 'ArrowUp'){ nudge(0, -step); e.preventDefault(); }
+        if (e.key === 'ArrowDown'){ nudge(0, step); e.preventDefault(); }
         if (e.key === 'm' || e.key === 'M') toggleTarget();
         if (e.key === 'r' || e.key === 'R') sendCmd('r');
         if (e.key === 's' || e.key === 'S') sendCmd('s');
         if (e.key === 'q' || e.key === 'Q') sendCmd('q');
       });
-
-      async function start() {
-        try {
+      async function start(){
+        try{
           const pc = new RTCPeerConnection();
-          pc.ontrack = (ev) => { video.srcObject = ev.streams[0]; setStatus('Streaming…'); };
+          pc.ontrack = (ev)=>{ video.srcObject = ev.streams[0]; setStatus('Streaming…'); };
           const offer = await pc.createOffer({ offerToReceiveVideo: true });
           await pc.setLocalDescription(offer);
           const resp = await fetch('/offer', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            method:'POST', headers:{'Content-Type':'application/json'},
             body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
           });
           const answer = await resp.json();
           await pc.setRemoteDescription(answer);
           setStatus('Connected via WebRTC');
-        } catch (e) { setStatus('WebRTC error: ' + e); }
+        }catch(e){ setStatus('WebRTC error: ' + e); }
       }
       startBtn.addEventListener('click', start);
     </script>
@@ -663,8 +601,7 @@ WEBRTC_HTML = """
 </html>
 """
 
-
-
+# === WebRTC track over global output_frame ===
 class GlobalFrameTrack(MediaStreamTrack):
     kind = "video"
     def __init__(self, target_fps=30):
@@ -672,7 +609,6 @@ class GlobalFrameTrack(MediaStreamTrack):
         self.time_base = Fraction(1, 90000)  # 90 kHz clock
         self.frame_interval = 1.0 / target_fps
         self._last_ts = 0.0
-
     async def recv(self) -> VideoFrame:
         global output_frame
         now = time.time()
@@ -681,16 +617,12 @@ class GlobalFrameTrack(MediaStreamTrack):
             if to_sleep > 0:
                 await asyncio.sleep(to_sleep)
         self._last_ts = time.time()
-
         with frame_ready:
             if output_frame is None:
                 frame_ready.wait(timeout=0.05)
             frame = None if output_frame is None else output_frame.copy()
-
         if frame is None:
             raise MediaStreamError("No frame available")
-
-        # output_frame is BGR already; use bgr24 (no extra conversion)
         vf = VideoFrame.from_ndarray(frame, format="bgr24")
         vf.pts = int(self._last_ts * 90000)
         vf.time_base = self.time_base
@@ -729,28 +661,27 @@ def start_webrtc_server():
     app_webrtc.on_shutdown.append(on_webrtc_shutdown)
     app_webrtc.router.add_get("/", webrtc_index)
     app_webrtc.router.add_post("/offer", webrtc_offer)
-    #web.run_app(app_webrtc, host="0.0.0.0", port=8080)
+    # Avoid signal handling in non-main thread
     web.run_app(app_webrtc, host="0.0.0.0", port=8080, handle_signals=False)
-
 
 # Launch the WebRTC server in a background thread
 webrtc_thread = Thread(target=start_webrtc_server, daemon=True)
 webrtc_thread.start()
 
-# === Main Loop ===
+# === Main Loop (no direct capture here; frames come from reader thread) ===
 while True:
-    # Capture frame from video or camera
-    if args.mode == 'playback':
-        ret, frame = cap.read()
-        if not ret:
-            break
-    else:
-        frame = picam2.capture_array()
-
+    # Wait until we have a frame
+    with frame_ready:
+        if current_frame is None:
+            frame_ready.wait(timeout=0.02)
+        frame = None if current_frame is None else current_frame.copy()
     if frame is None:
+        # allow UI/keyboard
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
         continue
 
-    current_frame = frame.copy()
     h, w = frame.shape[:2]
 
     # Handle commands from remote control
@@ -778,7 +709,7 @@ while True:
                 dy = cy - h // 2
                 norm_dx = dx / w
                 norm_dy = dy / h
-                yaw = norm_dx * math.radians(60)
+                yaw   =  norm_dx * math.radians(60)
                 pitch = -norm_dy * math.radians(45)
                 send_attitude(pitch, yaw)
 
@@ -792,11 +723,9 @@ while True:
 
                 # Draw bounding box
                 cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
-
                 # Draw crosshair
                 cv2.line(frame, (cx - 10, cy), (cx + 10, cy), cross_color, 1)
                 cv2.line(frame, (cx, cy - 10), (cx, cy + 10), cross_color, 1)
-
             else:
                 cv2.putText(frame, "Tracking lost", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         except Exception as e:
@@ -810,7 +739,7 @@ while True:
             print("[INFO] Reached recording duration, exiting.")
             break
 
-    # Optional: timestamp overlay (helps eyeball latency on both outputs)
+    # Optional: timestamp overlay (helps eyeball latency)
     cv2.putText(frame, datetime.now().strftime('%H:%M:%S.%f')[:-3],
                 (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
@@ -823,7 +752,7 @@ while True:
     if SHOW_LOCAL:
         cv2.imshow("Tracker", frame)
 
-    # Keyboard handling (safe even if no window; returns -1)
+    # Keyboard handling
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
@@ -835,7 +764,12 @@ while True:
 
 # === Cleanup ===
 cv2.destroyAllWindows()
+_stop_reader.set()
+if _reader_thread and _reader_thread.is_alive():
+    _reader_thread.join(timeout=1.0)
+if cap:
+    cap.release()
+if args.mode != 'playback' and picam2 is not None:
+    picam2.close()
 if args.mode == 'record' and writer:
     writer.release()
-if args.mode != 'playback':
-    picam2.close()
