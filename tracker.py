@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 # === Imports ===
+# Core vision / math / utils
 import cv2
 import time
 import math
 import numpy as np
+
+# Web server (control API + MJPEG page)
 from flask import Flask, Response, request, render_template_string
+from flask_cors import CORS  # allow calls from the WebRTC page
+
+# Concurrency primitives
 from threading import Thread, Lock, Condition
 import threading
+
+# CLI args / timestamps / small GUI dialogs for file/duration picking
 import argparse
 from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, simpledialog
-from flask_cors import CORS
 
-# WebRTC / aiohttp deps
+# WebRTC stack (aiortc) for low-latency viewing
 import asyncio
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
@@ -21,38 +28,52 @@ from aiortc.mediastreams import MediaStreamError
 from av import VideoFrame
 from fractions import Fraction
 
+# If you connect a local HDMI monitor to the Pi, set this True to see a window
 SHOW_LOCAL = True  # True only when debugging with a monitor
 
 # === Flask App Initialization ===
+# Flask hosts the MJPEG stream (:5000/stream.mjpg), the control UI (:5000/control),
+# and simple control endpoints (/command, /select_point, /nudge, /set_target_mode).
 app = Flask(__name__)
-CORS(app)  # allow the WebRTC page to post to /select_point on :5000
+CORS(app)  # allow the WebRTC page (on :8080) to POST to :5000 endpoints
 
-# Shared state
-output_frame = None               # Frame to be streamed over HTTP / WebRTC
-current_frame = None              # Latest frame from camera/file
-command_from_remote = None        # Command from web interface (reset, stop, quit)
-bbox = None                       # Bounding box of tracked object
-tracking = False                  # Tracking state flag
+# === Global shared state (protected by frame_ready) ===
+# IMPORTANT CONCURRENCY RULE:
+#   Reader threads (camera/file) update ONLY current_frame.
+#   The main loop renders overlays → THEN publishes output_frame.
+#   WebRTC & MJPEG read output_frame. This avoids flicker.
+output_frame = None               # Final frame after overlays → served to MJPEG / WebRTC
+current_frame = None              # Raw latest frame from camera/file (no overlays)
+command_from_remote = None        # One-letter command from web UI: 'r','s','q'
+bbox = None                       # Current CSRT tracking box (x, y, w, h)
+tracking = False                  # Tracking on/off flag
 tracker = None                    # OpenCV tracker object
-bMoovingTgt = False               # Target type toggle (False=fixed, True=moving)
+bMoovingTgt = False               # Target type (False=fixed/large box, True=moving/small box)
 
-# Thread sync for sharing frames with WebRTC & MJPEG
+# Thread sync for frame sharing between producer (reader) and consumers (MJPEG/WebRTC)
 frame_lock = Lock()
 frame_ready = Condition(frame_lock)
 
 # ============ Camera/File Reader (unified) ============
+# We run a dedicated reader thread for either: file playback OR live camera.
+# It only sets current_frame and notifies frame_ready. Never touches output_frame.
 cap = None
 picam2 = None
 _reader_thread = None
 _stop_reader = threading.Event()
 
 def _reader_playback(path, loop=False):
-    """Read frames from a video file and publish to current_frame/output_frame."""
-    global cap, current_frame, output_frame
+    """
+    Continuously read frames from a video file and publish into current_frame.
+    Do not modify output_frame here (to avoid render/flicker races).
+    """
+    global cap, current_frame
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open video file: {path}")
         return
+
+    # Use file FPS if available; otherwise fall back to ~30 FPS pacing
     fps = cap.get(cv2.CAP_PROP_FPS)
     fps = fps if fps and fps > 0 else 30.0
     delay = 1.0 / fps
@@ -67,50 +88,41 @@ def _reader_playback(path, loop=False):
             else:
                 print("[INFO] Playback ended")
                 break
+        # Publish raw frame (no overlays)
         with frame_ready:
-            current_frame = frame.copy()
-            output_frame = frame.copy()
+            current_frame = frame  # <-- intentionally not touching output_frame here
             frame_ready.notify_all()
-        time.sleep(delay)
+        time.sleep(delay)  # simple pace control for playback
 
 def _reader_live_picam():
-    """Read frames from PiCamera2 and publish to current_frame/output_frame."""
-    global current_frame, output_frame, picam2
+    """
+    Continuously read frames from PiCamera2 and publish into current_frame.
+    Avoid any overlay work here; overlays happen in the main loop.
+    """
+    global current_frame, picam2
     print("[INFO] Live reader started (PiCamera2)")
     while not _stop_reader.is_set():
         frame = picam2.capture_array()
         if frame is None:
             continue
         with frame_ready:
-            current_frame = frame.copy()
-            output_frame = frame.copy()
+            current_frame = frame  # <-- raw frame only
             frame_ready.notify_all()
 
 # === HTML Page for /control (MJPEG) ===
+# Lightweight page to 1) watch MJPEG stream and 2) send commands/select points.
+# For lowest latency viewing use the WebRTC page served on :8080.
 HTML_PAGE = """
 <!doctype html>
 <html>
   <head>
     <title>Tracker Control</title>
     <style>
-      body {
-        font-family: sans-serif;
-        text-align: center;
-        background-color: #f0f0f0;
-      }
+      body { font-family: sans-serif; text-align: center; background-color: #f0f0f0; }
       h1 { margin-top: 20px; }
-      #video {
-        margin-top: 20px;
-        border: 4px solid #333;
-        width: 640px;
-        height: 480px;
-        cursor: crosshair;
-      }
-      button {
-        padding: 10px 20px; margin: 10px;
-        font-size: 16px; background-color: #4CAF50;
-        color: white; border: none; border-radius: 5px; cursor: pointer;
-      }
+      #video { margin-top: 20px; border: 4px solid #333; width: 640px; height: 480px; cursor: crosshair; }
+      button { padding: 10px 20px; margin: 10px; font-size: 16px; background-color: #4CAF50;
+               color: white; border: none; border-radius: 5px; cursor: pointer; }
       button.quit { background-color: #f44336; }
       button:hover { opacity: 0.8; }
       .note { margin-top: 10px; color: #555; font-size: 14px; }
@@ -119,7 +131,7 @@ HTML_PAGE = """
   <body>
     <h1>Tracker Remote Control</h1>
 
-    <!-- Persistent MJPEG stream -->
+    <!-- Persistent MJPEG stream (higher latency than WebRTC, but trivial to view) -->
     <img id="video" src="/stream.mjpg" width="640" height="480" />
 
     <div>
@@ -136,7 +148,7 @@ HTML_PAGE = """
     <script>
       const img = document.getElementById('video');
 
-      // Send click coordinates to the server
+      // Send click coordinates to the server (selects a new bbox around that point)
       img.addEventListener('click', (event) => {
         const rect = img.getBoundingClientRect();
         const x = Math.floor(event.clientX - rect.left);
@@ -148,7 +160,7 @@ HTML_PAGE = """
         });
       });
 
-      // Send control commands (reset, stop, quit)
+      // Send control commands (reset, stop, quit) to the Flask app
       function sendCommand(cmd) {
         fetch('/command', {
           method: 'POST',
@@ -162,12 +174,14 @@ HTML_PAGE = """
 """
 
 # === MAVLink Setup ===
-mavlink_enabled = False  # True if MAVLink connection is established
+# If connected, we send normalized pitch/yaw as RC overrides.
+# If not present, we just print debug values.
+mavlink_enabled = False
 try:
     from pymavlink import mavutil
     connection = mavutil.mavlink_connection('/dev/serial0', baud=57600)
     connection.wait_heartbeat(timeout=5)
-    connection.arducopter_arm()  # Attempt to arm the autopilot
+    connection.arducopter_arm()  # Attempt to arm the autopilot (safe to remove if undesired)
     connection.mav.set_mode_send(
         connection.target_system,
         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
@@ -179,17 +193,21 @@ except Exception as e:
     print(f"[WARNING] MAVLink not connected: {e}")
     connection = None
 
-# === Send pitch/yaw as MAVLink override or debug print ===
 def send_attitude(pitch, yaw):
+    """
+    Push pitch/yaw commands via MAVLink (RC override).
+    When MAVLink isn't connected, prints debug for tuning.
+    pitch/yaw are in radians; mapping to PWM is heuristic and may need tuning.
+    """
     if not mavlink_enabled:
         print(f"[DEBUG] Pitch: {math.degrees(pitch):.2f}deg, Yaw: {math.degrees(yaw):.2f}deg")
         return
     try:
+        # Map small angles to PWM deltas (±~500 around 1500). Adjust to your vehicle.
         pitch_pwm = int(1500 + pitch * 500)
-        yaw_pwm = int(1500 + yaw * 500)
+        yaw_pwm   = int(1500 + yaw   * 500)
         connection.mav.rc_channels_override_send(
-            connection.target_system,
-            connection.target_component,
+            connection.target_system, connection.target_component,
             pitch_pwm, yaw_pwm, 0, 0, 0, 0, 0, 0
         )
         print(f"[MAVLink] Sent pitch PWM: {pitch_pwm}, yaw PWM: {yaw_pwm}")
@@ -197,6 +215,10 @@ def send_attitude(pitch, yaw):
         print(f"[MAVLink] Failed to send attitude: {e}")
 
 # === Command-line arguments setup ===
+# mode:
+#   live     → use PiCamera2
+#   record   → record live camera to AVI for given duration
+#   playback → play from a file (optionally loop)
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', choices=['live', 'record', 'playback'], default='live')
 parser.add_argument('--video', help='Path to video file for playback')
@@ -204,21 +226,22 @@ parser.add_argument('--duration', type=int, help='Duration to record (seconds)')
 parser.add_argument('--loop', action='store_true', help='Loop video in playback mode')
 args = parser.parse_args()
 
-# === If recording mode and no duration provided, ask user via GUI ===
+# If recording and duration not provided on CLI, ask with a small dialog (Tk)
 if args.mode == 'record' and not args.duration:
     root = tk.Tk()
-    root.withdraw()  # Hide root Tkinter window
-    duration = simpledialog.askinteger("Recording Duration", "How many seconds to record?", minvalue=1, maxvalue=3600)
+    root.withdraw()
+    duration = simpledialog.askinteger("Recording Duration", "How many seconds to record?",
+                                       minvalue=1, maxvalue=3600)
     if not duration:
         print("[ERROR] No duration selected. Exiting.")
         exit(1)
     args.duration = duration
     print(f"[INFO] Recording duration set to {args.duration} seconds")
 
-# === Camera or Video Input Setup (start reader thread) ===
+# === Input Setup: file playback or live camera (each spawns a reader thread) ===
 if args.mode == 'playback':
     if not args.video:
-        # (You can keep the dialog if you want)
+        # Optional file-pick dialog for convenience when not given on CLI
         root = tk.Tk()
         root.withdraw()
         args.video = filedialog.askopenfilename(
@@ -233,11 +256,11 @@ if args.mode == 'playback':
     _reader_thread = Thread(target=_reader_playback, args=(args.video, args.loop), daemon=True)
     _reader_thread.start()
 else:
-    # Initialize the Pi Camera for live capture
+    # Live Pi camera (tuned for 640x480 @ ~30 FPS to keep latency & CPU in check)
     from picamera2 import Picamera2
     picam2 = Picamera2()
     picam2.preview_configuration.main.size = (640, 480)
-    picam2.preview_configuration.main.format = "RGB888"
+    picam2.preview_configuration.main.format = "RGB888"  # gets you BGR after capture_array
     picam2.configure("preview")
     picam2.set_controls({"FrameRate": 30})  # keep latency down
     picam2.start()
@@ -247,20 +270,25 @@ else:
     _reader_thread.start()
 
 # === CSRT tracker params/tuning ===
+# We bias parameters depending on moving vs fixed target:
+#  - moving: more scales, faster scale learning, wider search
+#  - fixed:  fewer scales, slower adaptation (reduces jitter)
 def make_csrt_params(moving: bool):
     p = cv2.TrackerCSRT_Params()
+
+    # Appearance features (robustness vs CPU)
     for name, val in dict(
         use_hog=True,
         use_color_names=True,
         use_gray=False,
         use_rgb=True,
         use_channel_weights=True,
-        use_segmentation=False,
+        use_segmentation=False,     # turn True if supported and you want more robustness
         window_function="hann",
         kaiser_alpha=3.2,
         hog_clip=2.0,
         histogram_bins=16,
-        background_ratio=2
+        background_ratio=2          # smaller = tighter background sampling
     ).items():
         if hasattr(p, name): setattr(p, name, val)
 
@@ -283,6 +311,7 @@ def make_csrt_params(moving: bool):
     for name, val in suggested.items():
         if hasattr(p, name): setattr(p, name, val)
 
+    # Discrimination vs speed
     if hasattr(p, "admm_iterations"):
         p.admm_iterations = 6 if moving else 9
     if hasattr(p, "template_size"):
@@ -292,6 +321,10 @@ def make_csrt_params(moving: bool):
     return p
 
 def create_csrt_tracker(moving: bool):
+    """
+    Create a CSRT tracker with tuned params. Some OpenCV builds don't accept
+    params in the constructor, so we gracefully fall back.
+    """
     try:
         params = make_csrt_params(moving)
         return cv2.TrackerCSRT_create(params)
@@ -301,28 +334,34 @@ def create_csrt_tracker(moving: bool):
             params = make_csrt_params(moving)
             for k, v in params.__dict__.items():
                 try:
-                    getattr(t, k)
+                    getattr(t, k)  # probe
                     setattr(t, k, v)
                 except Exception:
                     pass
         return t
 
-# === Video Recording Setup ===
+# === Video Recording Setup (mode=record) ===
 writer = None
 record_start_time = None
 if args.mode == 'record':
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     video_filename = f"RecordingsMahat/recording_{timestamp}.avi"
-    writer = cv2.VideoWriter(video_filename, fourcc, 60.0, (640, 480))
+    writer = cv2.VideoWriter(video_filename, fourcc, 60.0, (640, 480))  # 60 fps container OK
     record_start_time = time.time()
     print(f"[INFO] Recording to {video_filename}")
 
-# === Local debug window ===
+# === Local debug window (optional) ===
 if SHOW_LOCAL:
     cv2.namedWindow("Tracker")
 
 def draw_rectangle(event, x, y, flags, param):
+    """
+    Local GUI selection: left-click initializes a new tracker centered at (x,y).
+    Box size depends on target mode:
+      moving  → 30x30
+      fixed   → 80x80
+    """
     global bbox, tracking, tracker, current_frame, bMoovingTgt
     if event == cv2.EVENT_LBUTTONDOWN and current_frame is not None:
         frame_for_init = current_frame.copy()
@@ -339,11 +378,15 @@ def draw_rectangle(event, x, y, flags, param):
 if SHOW_LOCAL:
     cv2.setMouseCallback("Tracker", draw_rectangle)
 
-# Tune JPEG quality for faster encode (50–70 is a good range)
+# JPEG quality for MJPEG streaming (lower → faster encode; WebRTC ignores this)
 JPEG_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
 
-# === Stream generator for video feed (MJPEG) ===
+# === MJPEG generator ===
 def generate_stream():
+    """
+    Yields a multipart/x-mixed-replace JPEG stream from output_frame.
+    This is the higher-latency legacy view; useful as a fallback.
+    """
     global output_frame
     while True:
         with frame_ready:
@@ -358,7 +401,7 @@ def generate_stream():
         chunk = buffer.tobytes()
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + chunk + b'\r\n')
 
-# === Flask routes ===
+# === Flask routes (control + MJPEG) ===
 @app.route('/stream.mjpg')
 def mjpeg():
     return Response(generate_stream(),
@@ -366,17 +409,21 @@ def mjpeg():
 
 @app.route('/')
 def index():
+    # simple alias to MJPEG stream
     return Response(generate_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/control')
 def control():
-    # You can allow in playback too; kept as-is per your previous code
+    # You can enable in playback too; currently blocked by choice.
     if args.mode == 'playback':
         return "Control not available in playback mode", 403
     return render_template_string(HTML_PAGE)
 
 @app.route('/command', methods=['POST'])
 def command():
+    """
+    Accepts 'r' (reset), 's' (stop), 'q' (quit). One-character commands.
+    """
     global command_from_remote
     cmd = request.form.get("cmd")
     if cmd in ['r', 's', 'q']:
@@ -386,6 +433,10 @@ def command():
 
 @app.route('/select_point', methods=['POST'])
 def select_point():
+    """
+    Initialize a new tracker around a clicked point from the web UI.
+    Box size depends on target mode (moving/fixed).
+    """
     global bbox, tracking, tracker, current_frame, bMoovingTgt
     try:
         x = int(request.form.get("x"))
@@ -396,9 +447,11 @@ def select_point():
             w, h = 30, 30
         else:
             w, h = 80, 80
+
         tracking = False
         bbox = None
         tracker = None
+
         bbox = (max(0, x - w//2), max(0, y - h//2), w, h)
         tracker = create_csrt_tracker(bMoovingTgt)
         tracker.init(current_frame, bbox)
@@ -410,14 +463,20 @@ def select_point():
 
 @app.route('/nudge', methods=['POST'])
 def nudge():
-    """Nudge the current tracking box by (dx, dy) pixels and re-init the tracker."""
+    """
+    Nudge current bbox by (dx,dy) pixels and re-init the tracker on the current frame.
+    This gives precise keyboard/GUI micro-adjustments without reselecting.
+    """
     global bbox, tracking, tracker, current_frame
     try:
         dx = int(request.form.get("dx", 0))
         dy = int(request.form.get("dy", 0))
         if current_frame is None:
             return "No frame", 400
+
         h, w = current_frame.shape[:2]
+
+        # If no bbox yet, create a small centered box to nudge from
         if bbox is None:
             bw = bh = 60
             cx = w // 2
@@ -426,12 +485,15 @@ def nudge():
             x, y, bw, bh = map(int, bbox)
             cx = x + bw // 2
             cy = y + bh // 2
+
+        # Apply and clamp
         cx = max(bw // 2, min(w - bw // 2, cx + dx))
         cy = max(bh // 2, min(h - bh // 2, cy + dy))
         x_new = int(max(0, min(w - bw, cx - bw // 2)))
         y_new = int(max(0, min(h - bh, cy - bh // 2)))
         bbox_new = (x_new, y_new, bw, bh)
 
+        # Re-init tracker on the *current* frame for immediate feedback
         tracking = False
         tracker = None
         tracker_local = create_csrt_tracker(bMoovingTgt)
@@ -447,6 +509,10 @@ def nudge():
 
 @app.route('/set_target_mode', methods=['POST'])
 def set_target_mode():
+    """
+    Toggle between fixed vs moving target.
+    The UI button posts bMoovingTgt=1/0 to this endpoint.
+    """
     global bMoovingTgt
     val = request.form.get("bMoovingTgt", "0")
     bMoovingTgt = (val == "1")
@@ -454,11 +520,14 @@ def set_target_mode():
     return "OK", 200
 
 # === Launch Flask in separate thread ===
+# NOTE: we run Flask (control + MJPEG) on :5000 in a background thread.
 flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
 flask_thread.daemon = True
 flask_thread.start()
 
 # === WebRTC HTML (vertical rail) ===
+# This is the low-latency viewing page (served by aiohttp on :8080).
+# It uses aiortc to negotiate a peer connection and receive a live MediaStreamTrack.
 WEBRTC_HTML = """
 <!doctype html>
 <html>
@@ -522,11 +591,15 @@ WEBRTC_HTML = """
       </div>
     </div>
     <script>
+      // Minimal single-page app for low-latency viewing and control
       const video = document.getElementById('video');
       const startBtn = document.getElementById('startBtn');
       const statusEl = document.getElementById('status');
       const tgtBtn = document.getElementById('tgtBtn');
+
       function setStatus(msg){ statusEl.textContent = msg; }
+
+      // Control API to Flask (:5000)
       async function sendCmd(cmd){
         try{
           const resp = await fetch('http://' + location.hostname + ':5000/command', {
@@ -536,6 +609,7 @@ WEBRTC_HTML = """
           setStatus(resp.ok ? 'Sent command: ' + cmd : 'Command failed: ' + cmd);
         }catch(e){ setStatus('Command error: ' + e); }
       }
+
       async function nudge(dx, dy){
         try{
           const resp = await fetch('http://' + location.hostname + ':5000/nudge', {
@@ -545,6 +619,8 @@ WEBRTC_HTML = """
           setStatus(resp.ok ? `Nudged (${dx}, ${dy})` : `Nudge failed (${dx}, ${dy})`);
         }catch(e){ setStatus('Nudge error: ' + e); }
       }
+
+      // Click-to-select absolute point (server creates a bbox around it)
       video.addEventListener('click', async (e)=>{
         const r = video.getBoundingClientRect();
         const x = Math.floor(e.clientX - r.left);
@@ -557,6 +633,8 @@ WEBRTC_HTML = """
           setStatus(resp.ok ? `Selected (${x}, ${y})` : `Select failed (${x}, ${y})`);
         }catch(e){ setStatus('Select error: ' + e); }
       });
+
+      // Toggle target mode (fixed/moving)
       let movingTgt = false; // default: Fixed
       async function toggleTarget(){
         movingTgt = !movingTgt;
@@ -569,6 +647,8 @@ WEBRTC_HTML = """
           setStatus(resp.ok ? ('Mode: ' + (movingTgt ? 'MOVING' : 'FIXED')) : 'Mode set failed');
         }catch(e){ setStatus('Mode error: ' + e); }
       }
+
+      // Keyboard shortcuts
       window.addEventListener('keydown', (e)=>{
         const step = e.shiftKey ? 10 : (e.altKey ? 1 : 5);
         if (e.key === 'ArrowRight'){ nudge(step, 0); e.preventDefault(); }
@@ -580,6 +660,8 @@ WEBRTC_HTML = """
         if (e.key === 's' || e.key === 'S') sendCmd('s');
         if (e.key === 'q' || e.key === 'Q') sendCmd('q');
       });
+
+      // WebRTC handshake with aiohttp server (:8080)
       async function start(){
         try{
           const pc = new RTCPeerConnection();
@@ -603,37 +685,58 @@ WEBRTC_HTML = """
 
 # === WebRTC track over global output_frame ===
 class GlobalFrameTrack(MediaStreamTrack):
+    """
+    A media track that pulls from output_frame at a fixed target FPS.
+    NOTE: WebRTC is pull-based; recv() is awaited each frame.
+    """
     kind = "video"
+
     def __init__(self, target_fps=30):
         super().__init__()
-        self.time_base = Fraction(1, 90000)  # 90 kHz clock
+        self.time_base = Fraction(1, 90000)  # 90 kHz clock (standard for video pts)
         self.frame_interval = 1.0 / target_fps
-        self._last_ts = 0.0
+        self._last_ts = 0.0  # last send time (seconds, wall clock)
+
     async def recv(self) -> VideoFrame:
         global output_frame
-        now = time.time()
+        # Pace frames roughly to target_fps
+        now = time.time()  # TIP: switch to time.monotonic() if you want immunity to clock jumps
         if self._last_ts:
             to_sleep = self.frame_interval - (now - self._last_ts)
             if to_sleep > 0:
                 await asyncio.sleep(to_sleep)
         self._last_ts = time.time()
+
+        # Grab latest rendered frame
         with frame_ready:
             if output_frame is None:
                 frame_ready.wait(timeout=0.05)
             frame = None if output_frame is None else output_frame.copy()
+
         if frame is None:
+            # No frame available → signal upstream to try again
             raise MediaStreamError("No frame available")
+
+        # Construct an AV VideoFrame (BGR24) with proper timestamps
         vf = VideoFrame.from_ndarray(frame, format="bgr24")
         vf.pts = int(self._last_ts * 90000)
         vf.time_base = self.time_base
         return vf
 
+# Active peer connections (for cleanup on shutdown)
 pcs = set()
 
 async def webrtc_index(request):
+    # Serve the WebRTC HTML page
     return web.Response(text=WEBRTC_HTML, content_type="text/html")
 
 async def webrtc_offer(request):
+    """
+    Standard WebRTC offer/answer exchange:
+      - Create RTCPeerConnection
+      - Attach our GlobalFrameTrack
+      - Set remote offer, create and return local answer
+    """
     params = await request.json()
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
     pc = RTCPeerConnection()
@@ -652,31 +755,37 @@ async def webrtc_offer(request):
     return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
 async def on_webrtc_shutdown(app):
+    # Close any lingering peer connections on server stop
     await asyncio.gather(*[pc.close() for pc in pcs])
 
 def start_webrtc_server():
+    """
+    aiohttp-based WebRTC signaling server running in a background thread on :8080.
+    handle_signals=False is required because signals can only be registered in main thread.
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app_webrtc = web.Application()
     app_webrtc.on_shutdown.append(on_webrtc_shutdown)
     app_webrtc.router.add_get("/", webrtc_index)
     app_webrtc.router.add_post("/offer", webrtc_offer)
-    # Avoid signal handling in non-main thread
     web.run_app(app_webrtc, host="0.0.0.0", port=8080, handle_signals=False)
 
 # Launch the WebRTC server in a background thread
 webrtc_thread = Thread(target=start_webrtc_server, daemon=True)
 webrtc_thread.start()
 
-# === Main Loop (no direct capture here; frames come from reader thread) ===
+# === Main Loop (render & publish) ===
+# Wait for frames from the reader thread, run tracking, draw overlays, publish to output_frame.
 while True:
-    # Wait until we have a frame
+    # Wait for a new current_frame from reader
     with frame_ready:
         if current_frame is None:
             frame_ready.wait(timeout=0.02)
         frame = None if current_frame is None else current_frame.copy()
+
     if frame is None:
-        # allow UI/keyboard
+        # Still allow key handling if local window is open
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -684,7 +793,7 @@ while True:
 
     h, w = frame.shape[:2]
 
-    # Handle commands from remote control
+    # Handle one-letter commands from the web control
     if command_from_remote == 'r':
         tracking = False
         bbox = None
@@ -698,61 +807,69 @@ while True:
         print("[INFO] Quit requested from remote")
         break
 
-    # Update tracker
+    # === Tracker update & overlay ===
     if tracking and tracker is not None:
         try:
             success, bbox = tracker.update(frame)
             if success:
                 x, y, bw, bh = map(int, bbox)
                 cx, cy = x + bw // 2, y + bh // 2
+
+                # Center offsets for attitude mapping
                 dx = cx - w // 2
                 dy = cy - h // 2
                 norm_dx = dx / w
                 norm_dy = dy / h
-                yaw   =  norm_dx * math.radians(60)
-                pitch = -norm_dy * math.radians(45)
+
+                # Simple FOV→angle mapping (heuristic; tune to your camera FOV)
+                yaw   =  norm_dx * math.radians(60)   # assume ~60° HFOV
+                pitch = -norm_dy * math.radians(45)   # assume ~45° VFOV
                 send_attitude(pitch, yaw)
 
-                # Choose color based on tracking mode
+                # Choose colors by target mode (just for quick visual cue)
                 if bMoovingTgt:
-                    box_color = (0, 0, 255)   # red for moving target
+                    box_color = (0, 0, 255)   # Red for moving target
                     cross_color = (0, 0, 255)
                 else:
-                    box_color = (255, 0, 0)   # blue for fixed target
+                    box_color = (255, 0, 0)   # Blue for fixed target
                     cross_color = (255, 0, 0)
 
-                # Draw bounding box
+                # Draw bbox & crosshair
                 cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
-                # Draw crosshair
                 cv2.line(frame, (cx - 10, cy), (cx + 10, cy), cross_color, 1)
                 cv2.line(frame, (cx, cy - 10), (cx, cy + 10), cross_color, 1)
             else:
-                cv2.putText(frame, "Tracking lost", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                # Tracking lost → keep frame visible and annotate
+                cv2.putText(frame, "Tracking lost", (10, 140),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         except Exception as e:
+            # Fail-safe: drop tracking on any exception (e.g., tracker internal error)
             print(f"[ERROR] Tracker update failed: {e}")
             tracking = False
 
-    # Write frame if recording
+    # === Optional: write to file if in record mode ===
     if args.mode == 'record' and writer is not None:
         writer.write(frame)
         if args.duration and (time.time() - record_start_time >= args.duration):
             print("[INFO] Reached recording duration, exiting.")
             break
 
-    # Optional: timestamp overlay (helps eyeball latency)
+    # Timestamp overlay (useful to eyeball latency across paths)
     cv2.putText(frame, datetime.now().strftime('%H:%M:%S.%f')[:-3],
-                (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (255, 255, 255), 2, cv2.LINE_AA)
 
-    # Publish the latest frame for MJPEG & WebRTC
+    # === Publish the final frame ===
+    # Only here do we set output_frame (after overlays), preventing WebRTC/MJPEG flicker.
     with frame_ready:
         output_frame = frame.copy()
         frame_ready.notify_all()
 
-    # Local debug window
+    # Local debug preview window (safe even if no window; waitKey returns -1)
     if SHOW_LOCAL:
         cv2.imshow("Tracker", frame)
 
-    # Keyboard handling
+    # Keyboard shortcuts at the Pi (optional duplicate of web controls)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
@@ -760,7 +877,7 @@ while True:
         tracking = False
         bbox = None
         tracker = None
-        print("[INFO] Tracker reset from Pi")
+        print("[INFO] Tracker reset from Pi]")
 
 # === Cleanup ===
 cv2.destroyAllWindows()
