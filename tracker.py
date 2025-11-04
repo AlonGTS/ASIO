@@ -39,7 +39,7 @@ CORS(app)  # allow the WebRTC page (on :8080) to POST to :5000 endpoints
 
 # === Global shared state (protected by frame_ready) ===
 # IMPORTANT CONCURRENCY RULE:
-#   Reader threads (camera/file) update ONLY current_frame.
+#   Reader threads (camera/file) update ONLY current_frame (+ playback telemetry).
 #   The main loop renders overlays → THEN publishes output_frame.
 #   WebRTC & MJPEG read output_frame. This avoids flicker.
 output_frame = None               # Final frame after overlays → served to MJPEG / WebRTC
@@ -50,13 +50,29 @@ tracking = False                  # Tracking on/off flag
 tracker = None                    # OpenCV tracker object
 bMoovingTgt = False               # Target type (False=fixed/large box, True=moving/small box)
 
+# --- Bounding-box size clamp (prevents explosion when target gets close) ---
+MAX_BB_WIDTH = 120
+MAX_BB_HEIGHT = 120
+
+# Playback controls (used only in playback mode)
+playback_rate = 1.0     # 0.25, 0.5, 1.0, 2.0, 4.0 ...
+seek_to_msec = None     # when set (int), reader seeks to this timestamp (ms) ASAP
+playback_ctrl_lock = Lock()
+
+# Playback telemetry (reader updates; main loop reads to sync trackbars)
+playback_duration_ms = 0.0
+playback_pos_ms = 0.0
+
+# Local-UI (OpenCV) trackbar flags (playback-only)
+_trackbar_ready = False
+_suppress_trackbar_cb = False
+
 # Thread sync for frame sharing between producer (reader) and consumers (MJPEG/WebRTC)
 frame_lock = Lock()
 frame_ready = Condition(frame_lock)
 
 # ============ Camera/File Reader (unified) ============
-# We run a dedicated reader thread for either: file playback OR live camera.
-# It only sets current_frame and notifies frame_ready. Never touches output_frame.
+# It only sets current_frame & playback telemetry and notifies frame_ready.
 cap = None
 picam2 = None
 _reader_thread = None
@@ -64,22 +80,31 @@ _stop_reader = threading.Event()
 
 def _reader_playback(path, loop=False):
     """
-    Continuously read frames from a video file and publish into current_frame.
-    Do not modify output_frame here (to avoid render/flicker races).
+    Video file reader that respects playback_rate and seek_to_msec globals.
+    Updates playback_pos_ms and playback_duration_ms for UI sync.
     """
-    global cap, current_frame
+    global cap, current_frame, playback_rate, seek_to_msec
+    global playback_duration_ms, playback_pos_ms
+
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open video file: {path}")
         return
 
-    # Use file FPS if available; otherwise fall back to ~30 FPS pacing
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = fps if fps and fps > 0 else 30.0
-    delay = 1.0 / fps
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    base_delay = 1.0 / fps
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    playback_duration_ms = (total_frames / fps * 1000.0) if total_frames > 0 else 0.0
 
-    print(f"[INFO] Playback reader started (fps≈{fps:.1f}, loop={loop})")
+    print(f"[INFO] Playback started ({fps:.1f} fps) duration≈{playback_duration_ms/1000:.2f}s")
+
     while not _stop_reader.is_set():
+        with playback_ctrl_lock:
+            if seek_to_msec is not None:
+                cap.set(cv2.CAP_PROP_POS_MSEC, float(seek_to_msec))
+                seek_to_msec = None
+            rate = max(0.1, float(playback_rate))
+
         ok, frame = cap.read()
         if not ok:
             if loop:
@@ -88,11 +113,22 @@ def _reader_playback(path, loop=False):
             else:
                 print("[INFO] Playback ended")
                 break
-        # Publish raw frame (no overlays)
+
+        playback_pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+
         with frame_ready:
-            current_frame = frame  # <-- intentionally not touching output_frame here
+            current_frame = frame
             frame_ready.notify_all()
-        time.sleep(delay)  # simple pace control for playback
+
+        # Adjust pacing
+        if rate > 1.0:
+            # skip frames for >1×
+            frames_to_skip = int(rate) - 1
+            for _ in range(frames_to_skip):
+                cap.grab()
+            time.sleep(base_delay * 0.25)
+        else:
+            time.sleep(base_delay / rate)
 
 def _reader_live_picam():
     """
@@ -106,7 +142,7 @@ def _reader_live_picam():
         if frame is None:
             continue
         with frame_ready:
-            current_frame = frame  # <-- raw frame only
+            current_frame = frame  # raw frame only
             frame_ready.notify_all()
 
 # === HTML Page for /control (MJPEG) ===
@@ -355,6 +391,31 @@ if args.mode == 'record':
 if SHOW_LOCAL:
     cv2.namedWindow("Tracker")
 
+# ---- Trackbar callbacks (playback-only) ----
+def _on_seek_trackbar(pos):
+    """Trackbar 'position' callback: pos is 0..1000 → absolute ms in file."""
+    global seek_to_msec, _suppress_trackbar_cb
+    if _suppress_trackbar_cb or playback_duration_ms <= 0:
+        return
+    frac = pos / 1000.0
+    with playback_ctrl_lock:
+        seek_to_msec = int(frac * playback_duration_ms)
+
+def _on_rate_trackbar(val):
+    """Trackbar 'rate x0.01' callback: val is 10..800 → 0.10x..8.00x."""
+    global playback_rate, _suppress_trackbar_cb
+    if _suppress_trackbar_cb:
+        return
+    r = max(0.1, min(8.0, val / 100.0))
+    with playback_ctrl_lock:
+        playback_rate = r
+
+# Create playback trackbars once window exists (playback-only)
+if SHOW_LOCAL and args.mode == 'playback':
+    cv2.createTrackbar('position', 'Tracker', 0, 1000, _on_seek_trackbar)
+    cv2.createTrackbar('rate x0.01', 'Tracker', int(100), 800, _on_rate_trackbar)  # start 1.00x
+    _trackbar_ready = True
+
 def draw_rectangle(event, x, y, flags, param):
     """
     Local GUI selection: left-click initializes a new tracker centered at (x,y).
@@ -526,8 +587,7 @@ flask_thread.daemon = True
 flask_thread.start()
 
 # === WebRTC HTML (vertical rail) ===
-# This is the low-latency viewing page (served by aiohttp on :8080).
-# It uses aiortc to negotiate a peer connection and receive a live MediaStreamTrack.
+# Low-latency viewer served by aiohttp on :8080 (separate from Flask).
 WEBRTC_HTML = """
 <!doctype html>
 <html>
@@ -815,6 +875,21 @@ while True:
                 x, y, bw, bh = map(int, bbox)
                 cx, cy = x + bw // 2, y + bh // 2
 
+                # === Limit bounding box size (prevent growing beyond max) ===
+                if bw > MAX_BB_WIDTH or bh > MAX_BB_HEIGHT:
+                    scale_w = MAX_BB_WIDTH / bw
+                    scale_h = MAX_BB_HEIGHT / bh
+                    scale = min(scale_w, scale_h)
+                    new_bw = int(bw * scale)
+                    new_bh = int(bh * scale)
+                    x = max(0, cx - new_bw // 2)
+                    y = max(0, cy - new_bh // 2)
+                    bw, bh = new_bw, new_bh
+                    bbox = (x, y, bw, bh)
+                    tracker = create_csrt_tracker(bMoovingTgt)
+                    tracker.init(frame, bbox)
+                    print(f"[INFO] BB limited to {bw}x{bh} (max {MAX_BB_WIDTH}x{MAX_BB_HEIGHT})")
+
                 # Center offsets for attitude mapping
                 dx = cx - w // 2
                 dy = cy - h // 2
@@ -859,8 +934,18 @@ while True:
                 (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                 (255, 255, 255), 2, cv2.LINE_AA)
 
+    # --- Local UI: keep trackbars synced (playback mode only) ---
+    if SHOW_LOCAL and args.mode == 'playback' and _trackbar_ready and playback_duration_ms > 0:
+        try:
+            _suppress_trackbar_cb = True
+            pos_frac = max(0.0, min(1.0, playback_pos_ms / playback_duration_ms))
+            cv2.setTrackbarPos('position', 'Tracker', int(pos_frac * 1000))
+            with playback_ctrl_lock:
+                cv2.setTrackbarPos('rate x0.01', 'Tracker', int(playback_rate * 100.0))
+        finally:
+            _suppress_trackbar_cb = False
+
     # === Publish the final frame ===
-    # Only here do we set output_frame (after overlays), preventing WebRTC/MJPEG flicker.
     with frame_ready:
         output_frame = frame.copy()
         frame_ready.notify_all()
@@ -869,7 +954,6 @@ while True:
     if SHOW_LOCAL:
         cv2.imshow("Tracker", frame)
 
-    # Keyboard shortcuts at the Pi (optional duplicate of web controls)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
@@ -877,7 +961,38 @@ while True:
         tracking = False
         bbox = None
         tracker = None
-        print("[INFO] Tracker reset from Pi]")
+        print("[INFO] Tracker reset from Pi")
+
+    # --- Playback keyboard controls (still available) ---
+    elif args.mode == 'playback':
+        if key == ord('f'):   # faster
+            with playback_ctrl_lock:
+                playback_rate = min(playback_rate * 2.0, 8.0)
+            print(f"[PLAYBACK] Speed {playback_rate:.1f}×")
+
+        elif key == ord('s'): # slower
+            with playback_ctrl_lock:
+                playback_rate = max(playback_rate / 2.0, 0.25)
+            print(f"[PLAYBACK] Speed {playback_rate:.2f}×")
+
+        elif key == ord('1'): # normal speed
+            with playback_ctrl_lock:
+                playback_rate = 1.0
+            print("[PLAYBACK] Speed reset to 1×")
+
+        elif key == ord('j'): # rewind ~5 s
+            if cap is not None:
+                pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+                with playback_ctrl_lock:
+                    seek_to_msec = max(0, pos - 5000)
+                print(f"[PLAYBACK] Seek −5 s")
+
+        elif key == ord('l'): # forward ~5 s
+            if cap is not None:
+                pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+                with playback_ctrl_lock:
+                    seek_to_msec = pos + 5000
+                print(f"[PLAYBACK] Seek +5 s")
 
 # === Cleanup ===
 cv2.destroyAllWindows()
