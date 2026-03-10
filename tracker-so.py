@@ -44,7 +44,7 @@ output_frame = None               # Final frame after overlays → served to MJP
 state = SimpleNamespace(
     current_frame   = None,   # Raw latest frame from camera/file (no overlays)
     command_from_remote = None,   # One-letter command from web UI: 'r','s','q'
-    bbox            = None,   # Current CSRT tracking box (MAIN coords: x, y, w, h)
+    bbox            = None,   # Current GTS tracking box (MAIN coords: x, y, w, h)
     tracking        = False,  # Tracking on/off flag
     tracker         = None,   # OpenCV tracker object (runs on LORES frame)
     bMoovingTgt     = False,  # Target type (False=fixed, True=moving)
@@ -226,7 +226,7 @@ else:
     _reader_thread.start()
 
 # === GTS Tracker (compiled module) ===
-def create_csrt_tracker(moving: bool):
+def create_gts_tracker(moving: bool):
     return GTSTracker(mode="moving" if moving else "fixed")
 
 # === Video Recording Setup (mode=record) ===
@@ -295,7 +295,7 @@ def draw_rectangle(event, x, y, flags, param):
         wb = max(2, int(w * sx)); hb = max(2, int(h * sy))
         lores_frame = cv2.resize(frame_for_init, (lw, lh), interpolation=cv2.INTER_LINEAR)
 
-        tracker_local = create_csrt_tracker(state.bMoovingTgt)
+        tracker_local = create_gts_tracker(state.bMoovingTgt)
         tracker_local.init(lores_frame, (xb, yb, wb, hb))
 
         state.tracker = tracker_local
@@ -308,7 +308,7 @@ if SHOW_LOCAL:
 
 
 import flask_app
-app = flask_app.create_app(state, create_csrt_tracker)
+app = flask_app.create_app(state, create_gts_tracker)
 
 # === Launch Flask in separate thread ===
 flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
@@ -398,7 +398,7 @@ while True:
                     bw, bh = new_bw, new_bh
                     xb = int(x * sx_m2l); yb = int(y * sy_m2l)
                     wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
-                    state.tracker = create_csrt_tracker(state.bMoovingTgt)
+                    state.tracker = create_gts_tracker(state.bMoovingTgt)
                     state.tracker.init(lores_frame, (xb, yb, wb, hb))
                     print(f"[INFO] BB limited to {bw}x{bh} (max {MAX_BB_WIDTH}x{MAX_BB_HEIGHT})")
 
