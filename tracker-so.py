@@ -37,9 +37,7 @@ LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 # Shared frame buffer for WebRTC
 frame_buffer = webrtc_server.FrameBuffer()
 
-# === Global shared state (protected by frame_ready) ===
-output_frame = None               # Final frame after overlays → served to MJPEG / WebRTC
-
+# === Global shared state ===
 # Mutable state shared between main loop, reader threads, and Flask/WebRTC
 state = SimpleNamespace(
     current_frame   = None,   # Raw latest frame from camera/file (no overlays)
@@ -342,6 +340,10 @@ def _cycle_lores(delta):
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
 
 # === Main Loop (render & publish) ===
+# Cached scale factors — recomputed only when resolution changes
+_cached_dims = (0, 0, 0, 0)   # (mw, mh, lw, lh)
+sx_m2l = sy_m2l = sx_l2m = sy_l2m = 1.0
+
 while True:
     # Wait for a new current_frame from reader
     with frame_ready:
@@ -357,10 +359,10 @@ while True:
 
     mh, mw = frame.shape[:2]
     lw, lh = state.lores_size
-    sx_m2l = lw / mw
-    sy_m2l = lh / mh
-    sx_l2m = mw / lw
-    sy_l2m = mh / lh
+    if (mw, mh, lw, lh) != _cached_dims:
+        sx_m2l = lw / mw; sy_m2l = lh / mh
+        sx_l2m = mw / lw; sy_l2m = mh / lh
+        _cached_dims = (mw, mh, lw, lh)
 
     # Handle commands
     if state.command_from_remote == 'r':
@@ -375,7 +377,7 @@ while True:
         break
 
     # Tracking on LORES
-    lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_LINEAR)
+    lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_NEAREST)
 
     if state.tracking and state.tracker is not None:
         try:
@@ -452,7 +454,7 @@ while True:
     _est_fps = _fps_alpha * _est_fps + (1.0 - _fps_alpha) * inst_fps if _est_fps > 0 else inst_fps
 
     # Overlay text
-    stamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    stamp = datetime.fromtimestamp(now).strftime('%H:%M:%S.%f')[:-3]
     overlay1 = f"{stamp}"
     overlay2 = f"MAIN {mw}x{mh} | TRACK {lw}x{lh} | {int(_est_fps)} FPS"
     cv2.putText(frame, overlay1, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
@@ -473,10 +475,7 @@ while True:
             _suppress_trackbar_cb = False
 
     # Publish final frame
-    with frame_ready:
-        output_frame = frame.copy()
-        frame_ready.notify_all()
-    frame_buffer.put(output_frame)
+    frame_buffer.put(frame)
 
     # Local window
     if SHOW_LOCAL:
