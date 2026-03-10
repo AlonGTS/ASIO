@@ -1,0 +1,13 @@
+[Unit]
+Description=ASIO Tracker
+After=network.target
+
+[Service]
+User=mahat
+WorkingDirectory=/home/mahat/ASIO
+ExecStart=/home/mahat/webrtc_venv/bin/python3 tracker.py --mode live
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

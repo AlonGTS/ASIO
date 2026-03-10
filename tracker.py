@@ -1,176 +1,212 @@
 #!/usr/bin/env python3
 # === Imports ===
+# Core vision / math / utils
 import cv2
 import time
 import math
 import numpy as np
-from flask import Flask, Response, request, render_template_string
+
+# Concurrency primitives
 from threading import Thread, Lock, Condition
+import threading
+from types import SimpleNamespace
+
+# CLI args / timestamps / small GUI dialogs for file/duration picking
+import tomllib
+from pathlib import Path
+
+_HERE = Path(__file__).parent
 import argparse
 from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, simpledialog
-from flask_cors import CORS
 
-# WebRTC / aiohttp deps
-import asyncio
-from aiohttp import web
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
-from aiortc.mediastreams import MediaStreamError
-from av import VideoFrame
-from fractions import Fraction
+import webrtc_server
 
-SHOW_LOCAL = True  # True only when debugging with a monitor
+# Load configuration
+with open(_HERE / "config.toml", "rb") as _f:
+    _cfg = tomllib.load(_f)
 
-# === Flask App Initialization ===
-app = Flask(__name__)
-CORS(app)  # allow the WebRTC page to post to /select_point on :5000
+SHOW_LOCAL    = _cfg["display"]["show_local"]
+MAX_BB_WIDTH  = _cfg["tracking"]["max_bb_width"]
+MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
+MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
+LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 
-output_frame = None               # Frame to be streamed over HTTP / WebRTC
-command_from_remote = None        # Command from web interface (reset, stop, quit)
-current_frame = None              # Latest frame from camera
-bbox = None                       # Bounding box of tracked object
-tracking = False                  # Tracking state flag
-tracker = None                    # OpenCV tracker object
+# Shared frame buffer for WebRTC
+frame_buffer = webrtc_server.FrameBuffer()
 
-# Thread sync for sharing frames with WebRTC
+# === Global shared state (protected by frame_ready) ===
+output_frame = None               # Final frame after overlays → served to MJPEG / WebRTC
+
+# Mutable state shared between main loop, reader threads, and Flask/WebRTC
+state = SimpleNamespace(
+    current_frame   = None,   # Raw latest frame from camera/file (no overlays)
+    command_from_remote = None,   # One-letter command from web UI: 'r','s','q'
+    bbox            = None,   # Current CSRT tracking box (MAIN coords: x, y, w, h)
+    tracking        = False,  # Tracking on/off flag
+    tracker         = None,   # OpenCV tracker object (runs on LORES frame)
+    bMoovingTgt     = False,  # Target type (False=fixed, True=moving)
+    lores_size      = None,   # Filled after config load below
+)
+
+_main_idx = 0       # index into MAIN_SIZES
+_lores_idx = 0      # index into LORES_SIZES
+
+main_size = list(MAIN_SIZES[_main_idx])    # [W, H] for capture/preview/output
+lores_size = list(LORES_SIZES[_lores_idx]) # [W, H] for tracking
+state.lores_size = lores_size
+
+# Playback controls (used only in playback mode)
+playback_rate = 1.0
+seek_to_msec = None
+playback_ctrl_lock = Lock()
+
+# Playback telemetry (reader updates; main loop reads to sync trackbars)
+playback_duration_ms = 0.0
+playback_pos_ms = 0.0
+
+# Local-UI (OpenCV) trackbar flags (playback-only)
+_trackbar_ready = False
+_suppress_trackbar_cb = False
+
+# FPS meter (rough)
+_prev_ts = time.time()
+_fps_alpha = 0.9
+_est_fps = 0.0
+
+# Thread sync for frame sharing between producer (reader) and consumers (MJPEG/WebRTC)
 frame_lock = Lock()
 frame_ready = Condition(frame_lock)
 
-# === HTML Page for /control ===
-HTML_PAGE = """
-<!doctype html>
-<html>
-  <head>
-    <title>Tracker Control</title>
-    <style>
-      body {
-        font-family: sans-serif;
-        text-align: center;
-        background-color: #f0f0f0;
-      }
-      h1 { margin-top: 20px; }
-      #video {
-        margin-top: 20px;
-        border: 4px solid #333;
-        width: 640px;
-        height: 480px;
-        cursor: crosshair;
-      }
-      button {
-        padding: 10px 20px; margin: 10px;
-        font-size: 16px; background-color: #4CAF50;
-        color: white; border: none; border-radius: 5px; cursor: pointer;
-      }
-      button.quit { background-color: #f44336; }
-      button:hover { opacity: 0.8; }
-      .note { margin-top: 10px; color: #555; font-size: 14px; }
-    </style>
-  </head>
-  <body>
-    <h1>Tracker Remote Control</h1>
+# ============ Camera/File Reader (unified) ============
+cap = None
+picam2 = None
+_reader_thread = None
+_stop_reader = threading.Event()
 
-    <!-- Persistent MJPEG stream -->
-    <img id="video" src="/stream.mjpg" width="640" height="480" />
+def _reader_playback(path, loop=False):
+    """
+    Video file reader that respects playback_rate and seek_to_msec globals.
+    Updates playback_pos_ms and playback_duration_ms for UI sync.
+    """
+    global cap, playback_rate, seek_to_msec
+    global playback_duration_ms, playback_pos_ms
 
-    <div>
-      <button onclick="sendCommand('r')">Reset Tracker</button>
-      <button onclick="sendCommand('s')">Stop Tracking</button>
-      <button class="quit" onclick="sendCommand('q')">Quit</button>
-    </div>
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open video file: {path}")
+        return
 
-    <div class="note">
-      Tip: For lower latency video, open <code>http://HOST:8080/</code> (WebRTC) and click "Start".
-      Clicking video here or there selects the target.
-    </div>
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    base_delay = 1.0 / fps
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    playback_duration_ms = (total_frames / fps * 1000.0) if total_frames > 0 else 0.0
 
-    <script>
-      const img = document.getElementById('video');
+    print(f"[INFO] Playback started ({fps:.1f} fps) duration≈{playback_duration_ms/1000:.2f}s")
 
-      // Send click coordinates to the server
-      img.addEventListener('click', (event) => {
-        const rect = img.getBoundingClientRect();
-        const x = Math.floor(event.clientX - rect.left);
-        const y = Math.floor(event.clientY - rect.top);
-        fetch('/select_point', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: `x=${x}&y=${y}`
-        });
-      });
+    while not _stop_reader.is_set():
+        with playback_ctrl_lock:
+            if seek_to_msec is not None:
+                cap.set(cv2.CAP_PROP_POS_MSEC, float(seek_to_msec))
+                seek_to_msec = None
+            rate = max(0.1, float(playback_rate))
 
-      // Send control commands (reset, stop, quit)
-      function sendCommand(cmd) {
-        fetch('/command', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'cmd=' + cmd
-        });
-      }
-    </script>
-  </body>
-</html>
-"""
+        ok, frame = cap.read()
+        if not ok:
+            if loop:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            else:
+                print("[INFO] Playback ended")
+                break
+
+        playback_pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+
+        with frame_ready:
+            state.current_frame = frame
+            frame_ready.notify_all()
+
+        # Adjust pacing
+        if rate > 1.0:
+            frames_to_skip = int(rate) - 1
+            for _ in range(frames_to_skip):
+                cap.grab()
+            time.sleep(base_delay * 0.25)
+        else:
+            time.sleep(base_delay / rate)
+
+def _init_live_camera():
+    """(Re)create and start PiCamera2 with the current main_size."""
+    global picam2
+    from picamera2 import Picamera2
+    if picam2 is not None:
+        try: picam2.stop()
+        except Exception: pass
+        try: picam2.close()
+        except Exception: pass
+        picam2 = None
+
+    picam2 = Picamera2()
+    w, h = main_size
+    picam2.preview_configuration.main.size = (int(w), int(h))
+    picam2.preview_configuration.main.format = "RGB888"
+    picam2.configure("preview")
+    picam2.set_controls({"FrameRate": 30})
+    picam2.start()
+    print(f"[LIVE] Camera started MAIN={w}x{h}")
+
+def _reader_live_picam():
+    """Continuously read frames from PiCamera2 and publish into current_frame."""
+    global picam2
+    print("[INFO] Live reader started (PiCamera2)")
+    while not _stop_reader.is_set():
+        frame = picam2.capture_array()
+        if frame is None:
+            continue
+        with frame_ready:
+            state.current_frame = frame  # raw MAIN frame only
+            frame_ready.notify_all()
+
+def _restart_reader_live():
+    """Stop live reader, reinit camera (for new MAIN size), and restart reader."""
+    global _reader_thread
+    _stop_reader.set()
+    if _reader_thread and _reader_thread.is_alive():
+        _reader_thread.join(timeout=1.0)
+    _stop_reader.clear()
+    _init_live_camera()
+    _reader_thread = Thread(target=_reader_live_picam, daemon=True)
+    _reader_thread.start()
+
 
 # === MAVLink Setup ===
-mavlink_enabled = False  # True if MAVLink connection is established
-try:
-    from pymavlink import mavutil
-    connection = mavutil.mavlink_connection('/dev/serial0', baud=57600)
-    connection.wait_heartbeat(timeout=5)
-    connection.arducopter_arm()  # Attempt to arm the autopilot
-    connection.mav.set_mode_send(
-        connection.target_system,
-        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        0
-    )
-    mavlink_enabled = True
-    print("[MAVLink] Connected and heartbeat received.")
-except Exception as e:
-    print(f"[WARNING] MAVLink not connected: {e}")
-    connection = None
-
-# === Send pitch/yaw as MAVLink override or debug print ===
-def send_attitude(pitch, yaw):
-    if not mavlink_enabled:
-        print(f"[DEBUG] Pitch: {math.degrees(pitch):.2f}deg, Yaw: {math.degrees(yaw):.2f}deg")
-        return
-    try:
-        pitch_pwm = int(1500 + pitch * 500)
-        yaw_pwm = int(1500 + yaw * 500)
-        connection.mav.rc_channels_override_send(
-            connection.target_system,
-            connection.target_component,
-            pitch_pwm, yaw_pwm, 0, 0, 0, 0, 0, 0
-        )
-        print(f"[MAVLink] Sent pitch PWM: {pitch_pwm}, yaw PWM: {yaw_pwm}")
-    except Exception as e:
-        print(f"[MAVLink] Failed to send attitude: {e}")
+import mavlink_client
+mavlink_client.connect()
 
 # === Command-line arguments setup ===
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', choices=['live', 'record', 'playback'], default='live')
 parser.add_argument('--video', help='Path to video file for playback')
 parser.add_argument('--duration', type=int, help='Duration to record (seconds)')
+parser.add_argument('--loop', action='store_true', help='Loop video in playback mode')
 args = parser.parse_args()
 
-# === If recording mode and no duration provided, ask user via GUI ===
+# If recording and duration not provided on CLI, ask with a small dialog (Tk)
 if args.mode == 'record' and not args.duration:
-    root = tk.Tk()
-    root.withdraw()  # Hide root Tkinter window
-    duration = simpledialog.askinteger("Recording Duration", "How many seconds to record?", minvalue=1, maxvalue=3600)
+    root = tk.Tk(); root.withdraw()
+    duration = simpledialog.askinteger("Recording Duration", "How many seconds to record?",
+                                       minvalue=1, maxvalue=3600)
     if not duration:
         print("[ERROR] No duration selected. Exiting.")
         exit(1)
     args.duration = duration
     print(f"[INFO] Recording duration set to {args.duration} seconds")
 
-# === Camera or Video Input Setup ===
-from picamera2 import Picamera2
+# === Input Setup: file playback or live camera (each spawns a reader thread) ===
 if args.mode == 'playback':
     if not args.video:
-        root = tk.Tk()
-        root.withdraw()
+        root = tk.Tk(); root.withdraw()
         args.video = filedialog.askopenfilename(
             title="Select video file",
             filetypes=[("Video files", "*.avi *.mp4 *.mov *.mkv"), ("All files", "*.*")]
@@ -178,19 +214,51 @@ if args.mode == 'playback':
         if not args.video:
             print("[ERROR] No file selected. Exiting...")
             exit(1)
-    cap = cv2.VideoCapture(args.video)
-
+    print(f"[INFO] Playback mode from file: {args.video} (loop={args.loop})")
+    _stop_reader.clear()
+    _reader_thread = Thread(target=_reader_playback, args=(args.video, args.loop), daemon=True)
+    _reader_thread.start()
 else:
-    # Initialize the Pi Camera for live capture
-    picam2 = Picamera2()
-    picam2.preview_configuration.main.size = (640, 480)
-    picam2.preview_configuration.main.format = "RGB888"
-    picam2.configure("preview")
-    picam2.set_controls({"FrameRate": 30})  # keep latency down
-    picam2.start()
-    time.sleep(0.3)
+    _stop_reader.clear()
+    _init_live_camera()
+    _reader_thread = Thread(target=_reader_live_picam, daemon=True)
+    _reader_thread.start()
 
-# === Video Recording Setup ===
+# === CSRT tracker params/tuning ===
+def make_csrt_params(moving: bool):
+    """
+    Build and return a TrackerCSRT_Params object tuned for either a moving or fixed target.
+    Moving targets use higher scale learning rates and more scales for fast adaptation.
+    Fixed targets use lower learning rates for stability.
+    """
+    p = cv2.TrackerCSRT_Params()
+    mode_key = "moving" if moving else "fixed"
+    for name, val in {**_cfg["csrt"]["common"], **_cfg["csrt"][mode_key]}.items():
+        if hasattr(p, name): setattr(p, name, val)
+    return p
+
+def create_csrt_tracker(moving: bool):
+    """
+    Instantiate a CSRT tracker with params from make_csrt_params().
+    Falls back to a no-arg constructor if the OpenCV build doesn't accept params,
+    and tries to apply settings manually via setattr.
+    """
+    try:
+        params = make_csrt_params(moving)
+        return cv2.TrackerCSRT_create(params)
+    except TypeError:
+        t = cv2.TrackerCSRT_create()
+        if hasattr(t, "set"):
+            params = make_csrt_params(moving)
+            for k, v in params.__dict__.items():
+                try:
+                    getattr(t, k)
+                    setattr(t, k, v)
+                except Exception:
+                    pass
+        return t
+
+# === Video Recording Setup (mode=record) ===
 writer = None
 record_start_time = None
 if args.mode == 'record':
@@ -201,309 +269,291 @@ if args.mode == 'record':
     record_start_time = time.time()
     print(f"[INFO] Recording to {video_filename}")
 
-# === Create OpenCV window for visual tracker feedback ===
+# === Local debug window (optional) ===
 if SHOW_LOCAL:
     cv2.namedWindow("Tracker")
 
-# === Mouse callback for Pi GUI tracker selection ===
-def draw_rectangle(event, x, y, flags, param):
-    global bbox, tracking, tracker, current_frame
-    if event == cv2.EVENT_LBUTTONDOWN and current_frame is not None:
-        frame_for_init = current_frame.copy()
-        w, h = 60, 60
-        bbox = (max(0, x - w//2), max(0, y - h//2), w, h)
-        tracker = cv2.TrackerCSRT_create()
-        tracker.init(frame_for_init, bbox)
-        tracking = True
-        print(f"[INFO] Tracker initialized from Pi click at ({x}, {y})")
+# ---- Trackbar callbacks (playback-only) ----
+def _on_seek_trackbar(pos):
+    """
+    OpenCV trackbar callback for playback seek.
+    Converts the trackbar position (0–1000) to a millisecond timestamp
+    and stores it in seek_to_msec for the reader thread to act on.
+    Suppressed while the main loop is updating the trackbar programmatically.
+    """
+    global seek_to_msec, _suppress_trackbar_cb
+    if _suppress_trackbar_cb or playback_duration_ms <= 0:
+        return
+    frac = pos / 1000.0
+    with playback_ctrl_lock:
+        seek_to_msec = int(frac * playback_duration_ms)
 
-# Bind mouse callback only if showing local window
+def _on_rate_trackbar(val):
+    """
+    OpenCV trackbar callback for playback speed.
+    Maps the trackbar integer value to a playback rate in the range [0.1, 8.0]×.
+    Suppressed while the main loop is syncing the trackbar to the current rate.
+    """
+    global playback_rate, _suppress_trackbar_cb
+    if _suppress_trackbar_cb:
+        return
+    r = max(0.1, min(8.0, val / 100.0))
+    with playback_ctrl_lock:
+        playback_rate = r
+
+if SHOW_LOCAL and args.mode == 'playback':
+    cv2.createTrackbar('position', 'Tracker', 0, 1000, _on_seek_trackbar)
+    cv2.createTrackbar('rate x0.01', 'Tracker', int(100), 800, _on_rate_trackbar)
+    _trackbar_ready = True
+
+# === Mouse callback (local window) ===
+def draw_rectangle(event, x, y, flags, param):
+    """
+    Local GUI selection: left-click initializes a new tracker centered at (x,y) in MAIN coords.
+    """
+    if event == cv2.EVENT_LBUTTONDOWN and state.current_frame is not None:
+        frame_for_init = state.current_frame.copy()
+        w, h = (30, 30) if state.bMoovingTgt else (80, 80)
+        x0 = max(0, x - w//2); y0 = max(0, y - h//2)
+        bbox_main = (x0, y0, w, h)
+        # Convert MAIN → LORES
+        mw, mh = frame_for_init.shape[1], frame_for_init.shape[0]
+        lw, lh = state.lores_size
+        sx = lw / mw; sy = lh / mh
+        xb = int(x0 * sx); yb = int(y0 * sy)
+        wb = max(2, int(w * sx)); hb = max(2, int(h * sy))
+        lores_frame = cv2.resize(frame_for_init, (lw, lh), interpolation=cv2.INTER_LINEAR)
+
+        tracker_local = create_csrt_tracker(state.bMoovingTgt)
+        tracker_local.init(lores_frame, (xb, yb, wb, hb))
+
+        state.tracker = tracker_local
+        state.bbox = bbox_main
+        state.tracking = True
+        print(f"[INFO] Tracker init (MAIN) at ({x},{y}), box {w}x{h} | LORES {lw}x{lh}")
+
 if SHOW_LOCAL:
     cv2.setMouseCallback("Tracker", draw_rectangle)
 
-# Tune JPEG quality for faster encode (50–70 is a good range)
-JPEG_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
 
-# === Stream generator for video feed (MJPEG) ===
-def generate_stream():
-    global output_frame
-    while True:
-        with frame_ready:
-            if output_frame is None:
-                frame_ready.wait(timeout=0.05)
-            frame = None if output_frame is None else output_frame.copy()
-        if frame is None:
-            continue
-        ok, buffer = cv2.imencode('.jpg', frame, JPEG_PARAMS)
-        if not ok:
-            continue
-        chunk = buffer.tobytes()
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + chunk + b'\r\n')
-
-# === Flask routes ===
-@app.route('/stream.mjpg')
-def mjpeg():
-    return Response(generate_stream(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/')
-def index():
-    return Response(generate_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/control')
-def control():
-    if args.mode == 'playback':
-        return "Control not available in playback mode", 403
-    return render_template_string(HTML_PAGE)
-
-@app.route('/command', methods=['POST'])
-def command():
-    global command_from_remote
-    cmd = request.form.get("cmd")
-    if cmd in ['r', 's', 'q']:
-        command_from_remote = cmd
-        return "OK", 200
-    return "Invalid", 400
-
-@app.route('/select_point', methods=['POST'])
-def select_point():
-    global bbox, tracking, tracker, current_frame
-    try:
-        x = int(request.form.get("x"))
-        y = int(request.form.get("y"))
-        w, h = 60, 60
-        if current_frame is None:
-            return "No frame", 400
-        tracking = False
-        bbox = None
-        tracker = None
-        bbox = (max(0, x - w//2), max(0, y - h//2), w, h)
-        tracker = cv2.TrackerCSRT_create()
-        tracker.init(current_frame, bbox)
-        tracking = True
-        print(f"[INFO] Tracker initialized from remote click at ({x}, {y})")
-        return "OK", 200
-    except Exception as e:
-        return f"Error: {e}", 400
+import flask_app
+app = flask_app.create_app(state, create_csrt_tracker)
 
 # === Launch Flask in separate thread ===
 flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
 flask_thread.daemon = True
 flask_thread.start()
 
-# === WebRTC (aiortc + aiohttp) ===
-WEBRTC_HTML = """
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>WebRTC Viewer</title>
-    <style>
-      body { font-family: sans-serif; text-align:center; background:#f0f0f0; }
-      video { width:640px; height:480px; background:#000; border:4px solid #333; cursor:crosshair; }
-      button { margin-top:12px; padding:10px 16px; }
-    </style>
-  </head>
-  <body>
-    <h1>WebRTC Live Video</h1>
-    <video id="v" autoplay playsinline></video><br/>
-    <button id="start">Start</button>
-
-    <script>
-      const video = document.getElementById('v');
-      const startBtn = document.getElementById('start');
-
-      // Click-to-select using your existing Flask endpoint on :5000
-      video.addEventListener('click', (e) => {
-        const r = video.getBoundingClientRect();
-        const x = Math.floor(e.clientX - r.left);
-        const y = Math.floor(e.clientY - r.top);
-        fetch('http://' + location.hostname + ':5000/select_point', {
-          method:'POST',
-          headers:{'Content-Type':'application/x-www-form-urlencoded'},
-          body:`x=${x}&y=${y}`
-        });
-      });
-
-      async function start() {
-        const pc = new RTCPeerConnection();
-        pc.ontrack = (ev) => { video.srcObject = ev.streams[0]; };
-        const offer = await pc.createOffer({ offerToReceiveVideo: true });
-        await pc.setLocalDescription(offer);
-        const resp = await fetch('/offer', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({sdp: pc.localDescription.sdp, type: pc.localDescription.type})
-        });
-        const answer = await resp.json();
-        await pc.setRemoteDescription(answer);
-      }
-      startBtn.onclick = start;
-    </script>
-  </body>
-</html>
-"""
-
-class GlobalFrameTrack(MediaStreamTrack):
-    kind = "video"
-    def __init__(self, target_fps=30):
-        super().__init__()
-        self.time_base = Fraction(1, 90000)  # 90 kHz clock
-        self.frame_interval = 1.0 / target_fps
-        self._last_ts = 0.0
-
-    async def recv(self) -> VideoFrame:
-        global output_frame
-        now = time.time()
-        if self._last_ts:
-            to_sleep = self.frame_interval - (now - self._last_ts)
-            if to_sleep > 0:
-                await asyncio.sleep(to_sleep)
-        self._last_ts = time.time()
-
-        with frame_ready:
-            if output_frame is None:
-                frame_ready.wait(timeout=0.05)
-            frame = None if output_frame is None else output_frame.copy()
-
-        if frame is None:
-            raise MediaStreamError("No frame available")
-
-        # output_frame is BGR already; use bgr24 (no extra conversion)
-        vf = VideoFrame.from_ndarray(frame, format="bgr24")
-        vf.pts = int(self._last_ts * 90000)
-        vf.time_base = self.time_base
-        return vf
-
-pcs = set()
-
-async def webrtc_index(request):
-    return web.Response(text=WEBRTC_HTML, content_type="text/html")
-
-async def webrtc_offer(request):
-    params = await request.json()
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
-    pc = RTCPeerConnection()
-    pcs.add(pc)
-
-    @pc.on("connectionstatechange")
-    async def on_state_change():
-        if pc.connectionState in ("failed", "closed", "disconnected"):
-            await pc.close()
-            pcs.discard(pc)
-
-    pc.addTrack(GlobalFrameTrack(target_fps=30))
-    await pc.setRemoteDescription(offer)
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-    return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
-
-async def on_webrtc_shutdown(app):
-    await asyncio.gather(*[pc.close() for pc in pcs])
-
-def start_webrtc_server():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    app_webrtc = web.Application()
-    app_webrtc.on_shutdown.append(on_webrtc_shutdown)
-    app_webrtc.router.add_get("/", webrtc_index)
-    app_webrtc.router.add_post("/offer", webrtc_offer)
-    #web.run_app(app_webrtc, host="0.0.0.0", port=8080)
-    web.run_app(app_webrtc, host="0.0.0.0", port=8080, handle_signals=False)
-
-
-# Launch the WebRTC server in a background thread
-webrtc_thread = Thread(target=start_webrtc_server, daemon=True)
+# === WebRTC server (background thread) ===
+webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), daemon=True)
 webrtc_thread.start()
 
-# === Main Loop ===
+# === Helpers to cycle resolutions (LIVE mode only) ===
+def _cycle_main(delta):
+    """
+    Step the MAIN capture resolution up (+1) or down (-1) through MAIN_SIZES.
+    Restarts the live camera reader at the new resolution. Live mode only.
+    """
+    global _main_idx, main_size
+    _main_idx = (_main_idx + delta) % len(MAIN_SIZES)
+    main_size = list(MAIN_SIZES[_main_idx])
+    print(f"[LIVE] Reconfig MAIN → {main_size[0]}x{main_size[1]} (restart reader)")
+    _restart_reader_live()
+
+def _cycle_lores(delta):
+    """
+    Step the LORES tracking resolution up (+1) or down (-1) through LORES_SIZES.
+    Takes effect on the next tracker initialization; does not restart the camera.
+    """
+    global _lores_idx
+    _lores_idx = (_lores_idx + delta) % len(LORES_SIZES)
+    state.lores_size = list(LORES_SIZES[_lores_idx])
+    print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
+
+# === Main Loop (render & publish) ===
 while True:
-    # Capture frame from video or camera
-    if args.mode == 'playback':
-        ret, frame = cap.read()
-        if not ret:
-            break
-    else:
-        frame = picam2.capture_array()
+    # Wait for a new current_frame from reader
+    with frame_ready:
+        if state.current_frame is None:
+            frame_ready.wait(timeout=0.02)
+        frame = None if state.current_frame is None else state.current_frame.copy()
 
     if frame is None:
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
         continue
 
-    current_frame = frame.copy()
-    h, w = frame.shape[:2]
+    mh, mw = frame.shape[:2]
+    lw, lh = state.lores_size
+    sx_m2l = lw / mw
+    sy_m2l = lh / mh
+    sx_l2m = mw / lw
+    sy_l2m = mh / lh
 
-    # Handle commands from remote control
-    if command_from_remote == 'r':
-        tracking = False
-        bbox = None
-        tracker = None
+    # Handle commands
+    if state.command_from_remote == 'r':
+        state.tracking = False; state.bbox = None; state.tracker = None
         print("[INFO] Tracker reset from remote")
-        command_from_remote = None
-    elif command_from_remote == 's':
-        tracking = False
-        command_from_remote = None
-    elif command_from_remote == 'q':
+        state.command_from_remote = None
+    elif state.command_from_remote == 's':
+        state.tracking = False
+        state.command_from_remote = None
+    elif state.command_from_remote == 'q':
         print("[INFO] Quit requested from remote")
         break
 
-    # Update tracker
-    if tracking and tracker is not None:
-        try:
-            success, bbox = tracker.update(frame)
-            if success:
-                x, y, bw, bh = map(int, bbox)
-                cx, cy = x + bw // 2, y + bh // 2
-                dx = cx - w // 2
-                dy = cy - h // 2
-                norm_dx = dx / w
-                norm_dy = dy / h
-                yaw = norm_dx * math.radians(60)
-                pitch = -norm_dy * math.radians(45)
-                send_attitude(pitch, yaw)
+    # Tracking on LORES
+    lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_LINEAR)
 
-                # Draw overlay
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 0, 0), 2)
-                cv2.line(frame, (cx - 10, cy), (cx + 10, cy), (0, 255, 0), 1)
-                cv2.line(frame, (cx, cy - 10), (cx, cy + 10), (0, 255, 0), 1)
+    if state.tracking and state.tracker is not None:
+        try:
+            success, bbox_lo = state.tracker.update(lores_frame)
+            if success:
+                xl, yl, wl, hl = map(int, bbox_lo)
+                x = int(xl * sx_l2m); y = int(yl * sy_l2m)
+                bw = max(2, int(wl * sx_l2m)); bh = max(2, int(hl * sy_l2m))
+                cx, cy = x + bw // 2, y + bh // 2
+
+                # Clamp bbox growth
+                if bw > MAX_BB_WIDTH or bh > MAX_BB_HEIGHT:
+                    scale_w = MAX_BB_WIDTH / bw
+                    scale_h = MAX_BB_HEIGHT / bh
+                    scale = min(scale_w, scale_h)
+                    new_bw = max(2, int(bw * scale))
+                    new_bh = max(2, int(bh * scale))
+                    x = max(0, min(mw - new_bw, cx - new_bw // 2))
+                    y = max(0, min(mh - new_bh, cy - new_bh // 2))
+                    bw, bh = new_bw, new_bh
+                    xb = int(x * sx_m2l); yb = int(y * sy_m2l)
+                    wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
+                    state.tracker = create_csrt_tracker(state.bMoovingTgt)
+                    state.tracker.init(lores_frame, (xb, yb, wb, hb))
+                    print(f"[INFO] BB limited to {bw}x{bh} (max {MAX_BB_WIDTH}x{MAX_BB_HEIGHT})")
+
+                state.bbox = (x, y, bw, bh)
+
+                # Center offsets for attitude mapping (MAIN coords)
+                dx = cx - mw // 2
+                dy = cy - mh // 2
+                norm_dx = dx / mw
+                norm_dy = dy / mh
+
+                # Simple FOV→angle mapping (heuristic; tune to your camera FOV)
+                yaw   =  norm_dx * math.radians(60)   # ~60° HFOV
+                pitch = -norm_dy * math.radians(45)   # ~45° VFOV
+                yaw_err   =  norm_dx * math.radians(60)   # rad
+                pitch_err = -norm_dy * math.radians(45)   # rad
+
+                mavlink_client.send_vision_error(pitch_err, yaw_err)
+
+
+                # Box visuals
+                if state.bMoovingTgt:
+                    box_color = (0, 0, 255)
+                    cross_color = (0, 0, 255)
+                else:
+                    box_color = (255, 0, 0)
+                    cross_color = (255, 0, 0)
+
+                cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
+                cv2.line(frame, (cx - 10, cy), (cx + 10, cy), cross_color, 1)
+                cv2.line(frame, (cx, cy - 10), (cx, cy + 10), cross_color, 1)
             else:
-                cv2.putText(frame, "Tracking lost", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.putText(frame, "Tracking lost", (10, 140),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         except Exception as e:
             print(f"[ERROR] Tracker update failed: {e}")
-            tracking = False
+            state.tracking = False
 
-    # Write frame if recording
+    # Write to file if in record mode
     if args.mode == 'record' and writer is not None:
         writer.write(frame)
         if args.duration and (time.time() - record_start_time >= args.duration):
             print("[INFO] Reached recording duration, exiting.")
             break
 
-    # Optional: timestamp overlay (helps eyeball latency on both outputs)
-    cv2.putText(frame, datetime.now().strftime('%H:%M:%S.%f')[:-3],
-                (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    # FPS estimate
+    now = time.time()
+    dt = max(1e-6, now - _prev_ts)
+    _prev_ts = now
+    inst_fps = 1.0 / dt
+    _est_fps = _fps_alpha * _est_fps + (1.0 - _fps_alpha) * inst_fps if _est_fps > 0 else inst_fps
 
-    # Publish the latest frame for MJPEG & WebRTC
+    # Overlay text
+    stamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    overlay1 = f"{stamp}"
+    overlay2 = f"MAIN {mw}x{mh} | TRACK {lw}x{lh} | {int(_est_fps)} FPS"
+    cv2.putText(frame, overlay1, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(frame, overlay2, (8, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+    if args.mode == 'live':
+        cv2.putText(frame, "Keys: z/x MAIN -, +   c/v TRACK -, +", (8, 84),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+
+    # Playback UI sync
+    if SHOW_LOCAL and args.mode == 'playback' and _trackbar_ready and playback_duration_ms > 0:
+        try:
+            _suppress_trackbar_cb = True
+            pos_frac = max(0.0, min(1.0, playback_pos_ms / playback_duration_ms))
+            cv2.setTrackbarPos('position', 'Tracker', int(pos_frac * 1000))
+            with playback_ctrl_lock:
+                cv2.setTrackbarPos('rate x0.01', 'Tracker', int(playback_rate * 100.0))
+        finally:
+            _suppress_trackbar_cb = False
+
+    # Publish final frame
     with frame_ready:
         output_frame = frame.copy()
         frame_ready.notify_all()
+    frame_buffer.put(output_frame)
 
-    # Local debug window
+    # Local window
     if SHOW_LOCAL:
         cv2.imshow("Tracker", frame)
 
-    # Keyboard handling (safe even if no window; returns -1)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
     elif key == ord('r'):
-        tracking = False
-        bbox = None
-        tracker = None
+        state.tracking = False; state.bbox = None; state.tracker = None
         print("[INFO] Tracker reset from Pi")
+    elif args.mode == 'live':
+        if key == ord('x'):   _cycle_main(+1)
+        elif key == ord('z'): _cycle_main(-1)
+        elif key == ord('v'): _cycle_lores(+1)
+        elif key == ord('c'): _cycle_lores(-1)
+    elif args.mode == 'playback':
+        if key == ord('f'):
+            with playback_ctrl_lock: playback_rate = min(playback_rate * 2.0, 8.0)
+            print(f"[PLAYBACK] Speed {playback_rate:.1f}×")
+        elif key == ord('s'):
+            with playback_ctrl_lock: playback_rate = max(playback_rate / 2.0, 0.25)
+            print(f"[PLAYBACK] Speed {playback_rate:.2f}×")
+        elif key == ord('1'):
+            with playback_ctrl_lock: playback_rate = 1.0
+            print("[PLAYBACK] Speed reset to 1×")
+        elif key == ord('j'):
+            if cap is not None:
+                pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+                with playback_ctrl_lock: seek_to_msec = max(0, pos - 5000)
+                print(f"[PLAYBACK] Seek −5 s")
+        elif key == ord('l'):
+            if cap is not None:
+                pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+                with playback_ctrl_lock: seek_to_msec = pos + 5000
+                print(f"[PLAYBACK] Seek +5 s")
 
 # === Cleanup ===
 cv2.destroyAllWindows()
+_stop_reader.set()
+if _reader_thread and _reader_thread.is_alive():
+    _reader_thread.join(timeout=1.0)
+if cap:
+    cap.release()
+if args.mode != 'playback' and picam2 is not None:
+    try: picam2.stop()
+    except Exception: pass
+    try: picam2.close()
+    except Exception: pass
 if args.mode == 'record' and writer:
     writer.release()
-if args.mode != 'playback':
-    picam2.close()
