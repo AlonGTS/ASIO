@@ -148,12 +148,16 @@ def _init_live_camera():
 
     picam2 = Picamera2()
     w, h = main_size
-    picam2.preview_configuration.main.size = (int(w), int(h))
-    picam2.preview_configuration.main.format = "RGB888"
-    picam2.configure("preview")
+    sensor_res = picam2.sensor_resolution  # full sensor pixel array
+    # Explicitly request full-sensor mode so ISP downscales to (w,h) — consistent FOV
+    config = picam2.create_preview_configuration(
+        main={"size": (int(w), int(h)), "format": "RGB888"},
+        sensor={"output_size": sensor_res},
+    )
+    picam2.configure(config)
     picam2.set_controls({"FrameRate": 30})
     picam2.start()
-    print(f"[LIVE] Camera started MAIN={w}x{h}")
+    print(f"[LIVE] Camera started MAIN={w}x{h} sensor={sensor_res}")
 
 def _reader_live_picam():
     """Continuously read frames from PiCamera2 and publish into current_frame."""
@@ -305,18 +309,6 @@ if SHOW_LOCAL:
     cv2.setMouseCallback("Tracker", draw_rectangle)
 
 
-import flask_app
-app = flask_app.create_app(state, create_gts_tracker)
-
-# === Launch Flask in separate thread ===
-flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
-flask_thread.daemon = True
-flask_thread.start()
-
-# === WebRTC server (background thread) ===
-webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), daemon=True)
-webrtc_thread.start()
-
 # === Helpers to cycle resolutions (LIVE mode only) ===
 def _cycle_main(delta):
     """
@@ -339,6 +331,20 @@ def _cycle_lores(delta):
     state.lores_size = list(LORES_SIZES[_lores_idx])
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
 
+import flask_app
+app = flask_app.create_app(state, create_gts_tracker,
+                           cycle_main_fn=_cycle_main if args.mode == 'live' else None,
+                           cycle_lores_fn=_cycle_lores)
+
+# === Launch Flask in separate thread ===
+flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
+flask_thread.daemon = True
+flask_thread.start()
+
+# === WebRTC server (background thread) ===
+webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), daemon=True)
+webrtc_thread.start()
+
 # === Main Loop (render & publish) ===
 # Cached scale factors — recomputed only when resolution changes
 _cached_dims = (0, 0, 0, 0)   # (mw, mh, lw, lh)
@@ -360,9 +366,30 @@ while True:
     mh, mw = frame.shape[:2]
     lw, lh = state.lores_size
     if (mw, mh, lw, lh) != _cached_dims:
+        old_mw, old_mh = _cached_dims[0], _cached_dims[1]
         sx_m2l = lw / mw; sy_m2l = lh / mh
         sx_l2m = mw / lw; sy_l2m = mh / lh
         _cached_dims = (mw, mh, lw, lh)
+
+        # Reinit tracker at new resolution to prevent tracking point drift
+        if state.tracking and state.tracker is not None and state.bbox is not None and old_mw > 0:
+            ox, oy, obw, obh = map(int, state.bbox)
+            ncx = (ox + obw / 2) / old_mw
+            ncy = (oy + obh / 2) / old_mh
+            new_cx = int(ncx * mw)
+            new_cy = int(ncy * mh)
+            bw = max(2, int(obw * mw / old_mw))
+            bh = max(2, int(obh * mh / old_mh))
+            x0 = max(0, min(mw - bw, new_cx - bw // 2))
+            y0 = max(0, min(mh - bh, new_cy - bh // 2))
+            xb = int(x0 * sx_m2l); yb = int(y0 * sy_m2l)
+            wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
+            lores_reinit = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_LINEAR)
+            new_tracker = create_gts_tracker(state.bMoovingTgt)
+            new_tracker.init(lores_reinit, (xb, yb, wb, hb))
+            state.tracker = new_tracker
+            state.bbox = (x0, y0, bw, bh)
+            print(f"[INFO] Tracker reinitialized after resolution change: MAIN {mw}x{mh} LORES {lw}x{lh}")
 
     # Handle commands
     if state.command_from_remote == 'r':
