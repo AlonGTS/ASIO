@@ -12,7 +12,7 @@ from flask import Flask, request
 from flask_cors import CORS
 
 
-def create_app(state, create_tracker_fn):
+def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None):
     """
     Build and return the Flask app with all control routes bound to `state`.
     state is a SimpleNamespace with: command_from_remote, bbox, tracking,
@@ -38,10 +38,12 @@ def create_app(state, create_tracker_fn):
         Prefer normalized coords (nx, ny in [0..1]); fall back to absolute (x, y).
         """
         try:
-            if state.current_frame is None:
-                return "No frame", 400
+            with state.frame_lock:
+                if state.current_frame is None:
+                    return "No frame", 400
+                frame_snap = state.current_frame.copy()
 
-            mh, mw = state.current_frame.shape[:2]
+            mh, mw = frame_snap.shape[:2]
             nx = request.form.get("nx")
             ny = request.form.get("ny")
             if nx is not None and ny is not None:
@@ -62,7 +64,7 @@ def create_app(state, create_tracker_fn):
             xb = int(x0 * sx); yb = int(y0 * sy)
             wb = max(2, int(w * sx)); hb = max(2, int(h * sy))
 
-            lores_frame = cv2.resize(state.current_frame, (lw, lh),
+            lores_frame = cv2.resize(frame_snap, (lw, lh),
                                      interpolation=cv2.INTER_LINEAR)
             state.tracking = False
             state.bbox = None
@@ -91,10 +93,12 @@ def create_app(state, create_tracker_fn):
         try:
             dx = int(request.form.get("dx", 0))
             dy = int(request.form.get("dy", 0))
-            if state.current_frame is None:
-                return "No frame", 400
+            with state.frame_lock:
+                if state.current_frame is None:
+                    return "No frame", 400
+                frame_snap = state.current_frame.copy()
 
-            mh, mw = state.current_frame.shape[:2]
+            mh, mw = frame_snap.shape[:2]
             lw, lh = state.lores_size
             sx = lw / mw; sy = lh / mh
 
@@ -109,7 +113,7 @@ def create_app(state, create_tracker_fn):
             y = max(0, min(mh - bh, y + dy))
             bbox_main = (x, y, bw, bh)
 
-            lores_frame = cv2.resize(state.current_frame, (lw, lh),
+            lores_frame = cv2.resize(frame_snap, (lw, lh),
                                      interpolation=cv2.INTER_LINEAR)
             xb = int(x * sx); yb = int(y * sy)
             wb = max(2, int(bw * sx)); hb = max(2, int(bh * sy))
@@ -132,5 +136,29 @@ def create_app(state, create_tracker_fn):
         state.bMoovingTgt = (val == "1")
         print(f"[INFO] Target mode set to: {'MOVING' if state.bMoovingTgt else 'FIXED'}")
         return "OK", 200
+
+    @app.route('/cycle_main', methods=['POST'])
+    def cycle_main():
+        """Cycle MAIN capture resolution up (+1) or down (-1). Live mode only."""
+        if cycle_main_fn is None:
+            return "Not available", 400
+        try:
+            delta = int(request.form.get("delta", 1))
+            cycle_main_fn(delta)
+            return "OK", 200
+        except Exception as e:
+            return f"Error: {e}", 400
+
+    @app.route('/cycle_lores', methods=['POST'])
+    def cycle_lores():
+        """Cycle LORES tracking resolution up (+1) or down (-1)."""
+        if cycle_lores_fn is None:
+            return "Not available", 400
+        try:
+            delta = int(request.form.get("delta", 1))
+            cycle_lores_fn(delta)
+            return "OK", 200
+        except Exception as e:
+            return f"Error: {e}", 400
 
     return app

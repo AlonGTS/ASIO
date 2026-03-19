@@ -13,6 +13,7 @@ import time
 
 _connection = None
 _enabled = False
+DEBUG = False   # set True to print pitch/yaw values every frame
 
 
 def connect(port="/dev/serial0", baud=115200):
@@ -33,7 +34,8 @@ def connect(port="/dev/serial0", baud=115200):
 def send_vision_error(pitch_err, yaw_err):
     """Send vision-based pitch/yaw error via MAVLink DEBUG_VECT (units: radians)."""
     if not _enabled:
-        print(f"[DEBUG] pitch_err={pitch_err:.4f}, yaw_err={yaw_err:.4f}")
+        if DEBUG:
+            print(f"[DEBUG] pitch_err={pitch_err:.4f}, yaw_err={yaw_err:.4f}")
         return
     try:
         _connection.mav.debug_vect_send(
@@ -43,7 +45,8 @@ def send_vision_error(pitch_err, yaw_err):
             float(yaw_err  * 100),    # y
             3.3                        # z
         )
-        print(f"[DEBUG] pitch_err={pitch_err*100:.4f}, yaw_err={yaw_err*100:.4f}")
+        if DEBUG:
+            print(f"[DEBUG] pitch_err={pitch_err*100:.4f}, yaw_err={yaw_err*100:.4f}")
     except Exception as e:
         print(f"[MAVLink] DEBUG_VECT send failed: {e}")
 

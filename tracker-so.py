@@ -77,6 +77,7 @@ _est_fps = 0.0
 # Thread sync for frame sharing between producer (reader) and consumers (MJPEG/WebRTC)
 frame_lock = Lock()
 frame_ready = Condition(frame_lock)
+state.frame_lock = frame_lock   # expose to flask_app for safe current_frame snapshots
 
 # ============ Camera/File Reader (unified) ============
 cap = None
@@ -186,6 +187,10 @@ def _restart_reader_live():
 # === MAVLink Setup ===
 import mavlink_client
 mavlink_client.connect()
+
+# Precomputed FOV constants (avoid recomputing math.radians every frame)
+_HFOV_RAD = math.radians(60)   # ~60° horizontal FOV
+_VFOV_RAD = math.radians(45)   # ~45° vertical FOV
 
 # === Command-line arguments setup ===
 parser = argparse.ArgumentParser()
@@ -365,6 +370,8 @@ while True:
 
     mh, mw = frame.shape[:2]
     lw, lh = state.lores_size
+    lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_NEAREST)
+
     if (mw, mh, lw, lh) != _cached_dims:
         old_mw, old_mh = _cached_dims[0], _cached_dims[1]
         sx_m2l = lw / mw; sy_m2l = lh / mh
@@ -384,9 +391,8 @@ while True:
             y0 = max(0, min(mh - bh, new_cy - bh // 2))
             xb = int(x0 * sx_m2l); yb = int(y0 * sy_m2l)
             wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
-            lores_reinit = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_LINEAR)
             new_tracker = create_gts_tracker(state.bMoovingTgt)
-            new_tracker.init(lores_reinit, (xb, yb, wb, hb))
+            new_tracker.init(lores_frame, (xb, yb, wb, hb))
             state.tracker = new_tracker
             state.bbox = (x0, y0, bw, bh)
             print(f"[INFO] Tracker reinitialized after resolution change: MAIN {mw}x{mh} LORES {lw}x{lh}")
@@ -403,9 +409,7 @@ while True:
         print("[INFO] Quit requested from remote")
         break
 
-    # Tracking on LORES
-    lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_NEAREST)
-
+    # Tracking on LORES (lores_frame computed above, before dims check)
     if state.tracking and state.tracker is not None:
         try:
             success, bbox_lo = state.tracker.update(lores_frame)
@@ -440,10 +444,8 @@ while True:
                 norm_dy = dy / mh
 
                 # Simple FOV→angle mapping (heuristic; tune to your camera FOV)
-                yaw   =  norm_dx * math.radians(60)   # ~60° HFOV
-                pitch = -norm_dy * math.radians(45)   # ~45° VFOV
-                yaw_err   =  norm_dx * math.radians(60)   # rad
-                pitch_err = -norm_dy * math.radians(45)   # rad
+                yaw_err   =  norm_dx * _HFOV_RAD   # rad
+                pitch_err = -norm_dy * _VFOV_RAD   # rad
 
                 mavlink_client.send_vision_error(pitch_err, yaw_err)
 
@@ -481,7 +483,8 @@ while True:
     _est_fps = _fps_alpha * _est_fps + (1.0 - _fps_alpha) * inst_fps if _est_fps > 0 else inst_fps
 
     # Overlay text
-    stamp = datetime.fromtimestamp(now).strftime('%H:%M:%S.%f')[:-3]
+    _sec = int(now)
+    stamp = time.strftime('%H:%M:%S', time.localtime(_sec)) + f'.{int((now - _sec) * 1000):03d}'
     overlay1 = f"{stamp}"
     overlay2 = f"MAIN {mw}x{mh} | TRACK {lw}x{lh} | {int(_est_fps)} FPS"
     cv2.putText(frame, overlay1, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)

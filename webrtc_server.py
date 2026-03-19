@@ -32,17 +32,21 @@ class FrameBuffer:
         self._lock = Lock()
         self._cond = Condition(self._lock)
         self._frame = None
+        self._gen = 0   # incremented on every put(); consumers track last seen gen
 
     def put(self, frame):
         with self._cond:
             self._frame = frame
+            self._gen += 1
             self._cond.notify_all()
 
-    def get(self, timeout=0.05):
+    def get(self, last_gen=-1, timeout=0.05):
         with self._cond:
-            if self._frame is None:
+            if self._gen == last_gen:   # already delivered this frame; wait for next
                 self._cond.wait(timeout=timeout)
-            return None if self._frame is None else self._frame.copy()
+            if self._frame is None:
+                return None, self._gen
+            return self._frame.copy(), self._gen
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +62,7 @@ class GlobalFrameTrack(MediaStreamTrack):
         self.time_base = Fraction(1, 90000)
         self.frame_interval = 1.0 / target_fps
         self._last_ts = 0.0
+        self._last_gen = -1   # generation of the last delivered frame
 
     async def recv(self) -> VideoFrame:
         now = time.time()
@@ -67,7 +72,8 @@ class GlobalFrameTrack(MediaStreamTrack):
                 await asyncio.sleep(to_sleep)
         self._last_ts = time.time()
 
-        frame = self._buf.get(timeout=0.05)
+        frame, gen = self._buf.get(last_gen=self._last_gen, timeout=0.05)
+        self._last_gen = gen
         if frame is None:
             raise MediaStreamError("No frame available")
 
@@ -88,15 +94,10 @@ WEBRTC_HTML = """
     <meta charset="utf-8">
     <title>Mahat Live Video &amp; Control</title>
     <style>
-      :root {
-        /* Aspect is set dynamically by JS after metadata is available */
-        --aspect: 4/3; /* safe default */
-      }
       * { box-sizing: border-box; }
       body { font-family: sans-serif; background:#f0f0f0; margin:0; padding:24px; }
       h1 { margin:0 0 16px 0; text-align:center; }
 
-      /* Two columns: video (flex) + control rail (fixed width) */
       .layout {
         display:grid;
         grid-template-columns: minmax(0, 1fr) 280px;
@@ -106,39 +107,33 @@ WEBRTC_HTML = """
         margin: 0 auto;
       }
 
-      /* The video wrapper grows to fill available viewport space */
       .video-panel {
         display:flex;
         flex-direction:column;
         align-items:center;
         gap:10px;
-        min-width: 0; /* allow shrinking on small screens */
+        min-width: 0;
       }
 
-      /* This is the key: wrapper scales to viewport with a fixed aspect ratio */
+      /* Sized precisely by fitWrap() in JS to match stream aspect ratio */
       #wrap {
-        width: clamp(480px, calc(100vw - 360px), 1400px);
-        /* Fit vertically: leave room for header + controls */
-        height: min( calc(100vh - 190px), 85vh );
-        /* Keep correct aspect; browser computes height from width if height:auto */
-        aspect-ratio: var(--aspect);
-
         background:#000;
         border:4px solid #333;
         border-radius: 6px;
         display:block;
         position:relative;
         overflow:hidden;
+        /* Fallback before stream starts */
+        width: 640px;
+        height: 480px;
       }
 
-      /* Make the <video> fill the wrapper while preserving content box */
       #video {
         width:100%;
         height:100%;
-        object-fit: contain;
-        cursor: crosshair;
         display:block;
         background:#000;
+        cursor: crosshair;
       }
 
       #status { color:#444; font-size:14px; min-height:1.2em; text-align:center; }
@@ -158,7 +153,6 @@ WEBRTC_HTML = """
 
       @media (max-width: 980px) {
         .layout { grid-template-columns: 1fr; }
-        #wrap { width: min(96vw, 1400px); height: min( calc(100vh - 230px), 86vh ); }
       }
     </style>
   </head>
@@ -182,6 +176,13 @@ WEBRTC_HTML = """
         <button id="tgtBtn"  class="btn toggle" onclick="toggleTarget()">Target: Fixed (M)</button>
         <button id="fsBtn"   class="btn full"   onclick="toggleFullscreen()">Fullscreen</button>
 
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:4px;">
+          <button class="btn secondary" onclick="cycleMain(-1)">MAIN &minus;</button>
+          <button class="btn secondary" onclick="cycleMain(+1)">MAIN +</button>
+          <button class="btn secondary" onclick="cycleLores(-1)">TRACK &minus;</button>
+          <button class="btn secondary" onclick="cycleLores(+1)">TRACK +</button>
+        </div>
+
         <div class="dpad">
           <span class="blank"></span><button onclick="nudge(0,-5)">&#9650;</button><span class="blank"></span>
           <button onclick="nudge(-5,0)">&#9664;</button><span class="blank"></span><button onclick="nudge(5,0)">&#9654;</button>
@@ -199,13 +200,22 @@ WEBRTC_HTML = """
 
       function setStatus(m){ statusEl.textContent = m; }
 
-      // Set CSS aspect-ratio variable from real stream once metadata is known
-      function updateAspect(){
+      // Resize #wrap to exactly fit the stream's aspect ratio within the viewport
+      function fitWrap(){
         const vw = video.videoWidth, vh = video.videoHeight;
-        if (vw && vh) document.documentElement.style.setProperty('--aspect', (vw/vh));
+        if (!vw || !vh) return;
+        const isNarrow = window.innerWidth <= 980;
+        const maxW = isNarrow
+          ? Math.min(window.innerWidth * 0.96, 1400)
+          : Math.min(window.innerWidth - 360, 1400);
+        const maxH = window.innerHeight - (isNarrow ? 230 : 190);
+        const scale = Math.min(maxW / vw, maxH / vh);
+        wrap.style.width  = Math.round(vw * scale) + 'px';
+        wrap.style.height = Math.round(vh * scale) + 'px';
       }
-      video.addEventListener('loadedmetadata', updateAspect);
-      video.addEventListener('resize', updateAspect);
+      video.addEventListener('loadedmetadata', fitWrap);
+      video.addEventListener('resize', fitWrap);
+      window.addEventListener('resize', fitWrap);
 
       async function sendCmd(cmd){
         try{
@@ -226,28 +236,15 @@ WEBRTC_HTML = """
         }catch(e){ setStatus('Nudge error: ' + e); }
       }
 
-      // Letterbox-aware click mapping
+      // Click mapping: wrap is sized to exact aspect ratio so pixels map 1:1 to stream coords
       video.addEventListener('click', async (e)=>{
-        const rect  = video.getBoundingClientRect();
-        const style = getComputedStyle(video);
-        const bl = parseFloat(style.borderLeftWidth)||0, bt = parseFloat(style.borderTopWidth)||0;
-        const br = parseFloat(style.borderRightWidth)||0, bb = parseFloat(style.borderBottomWidth)||0;
-        const boxW = rect.width - bl - br, boxH = rect.height - bt - bb;
-        const xInBox = Math.max(0, Math.min(boxW, e.clientX - rect.left - bl));
-        const yInBox = Math.max(0, Math.min(boxH, e.clientY - rect.top  - bt));
-
         const vw = video.videoWidth, vh = video.videoHeight;
         if (!vw || !vh){ setStatus('No video metadata yet'); return; }
-
-        const scale = Math.min(boxW / vw, boxH / vh);
-        const drawnW = vw * scale, drawnH = vh * scale;
-        const offX = (boxW - drawnW) / 2.0, offY = (boxH - drawnH) / 2.0;
-
-        if (xInBox < offX || xInBox > offX+drawnW || yInBox < offY || yInBox > offY+drawnH){
-          setStatus('Click inside the video area'); return;
-        }
-        const x = Math.round((xInBox - offX) / scale);
-        const y = Math.round((yInBox - offY) / scale);
+        const rect = video.getBoundingClientRect();
+        const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        const ny = Math.max(0, Math.min(1, (e.clientY - rect.top)  / rect.height));
+        const x = Math.round(nx * (vw - 1));
+        const y = Math.round(ny * (vh - 1));
 
         try{
           const r = await fetch('http://' + location.hostname + ':5000/select_point', {
@@ -271,6 +268,25 @@ WEBRTC_HTML = """
         }catch(e){ setStatus('Mode error: ' + e); }
       }
 
+      async function cycleMain(delta){
+        try{
+          const r = await fetch('http://' + location.hostname + ':5000/cycle_main', {
+            method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:'delta='+delta
+          });
+          setStatus(r.ok ? 'MAIN res ' + (delta>0?'+':'-') : 'MAIN cycle failed');
+        }catch(e){ setStatus('MAIN error: ' + e); }
+      }
+      async function cycleLores(delta){
+        try{
+          const r = await fetch('http://' + location.hostname + ':5000/cycle_lores', {
+            method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:'delta='+delta
+          });
+          setStatus(r.ok ? 'TRACK res ' + (delta>0?'+':'-') : 'TRACK cycle failed');
+        }catch(e){ setStatus('TRACK error: ' + e); }
+      }
+
       // Keyboard shortcuts
       window.addEventListener('keydown', (e)=>{
         const step = e.shiftKey ? 10 : (e.altKey ? 1 : 5);
@@ -282,6 +298,10 @@ WEBRTC_HTML = """
         if (e.key === 'r' || e.key === 'R') sendCmd('r');
         if (e.key === 's' || e.key === 'S') sendCmd('s');
         if (e.key === 'q' || e.key === 'Q') sendCmd('q');
+        if (e.key === 'x' || e.key === 'X') cycleMain(+1);
+        if (e.key === 'z' || e.key === 'Z') cycleMain(-1);
+        if (e.key === 'v' || e.key === 'V') cycleLores(+1);
+        if (e.key === 'c' || e.key === 'C') cycleLores(-1);
       });
 
       // WebRTC handshake
