@@ -12,7 +12,7 @@ from flask import Flask, request
 from flask_cors import CORS
 
 
-def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None):
+def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None):
     """
     Build and return the Flask app with all control routes bound to `state`.
     state is a SimpleNamespace with: command_from_remote, bbox, tracking,
@@ -148,6 +148,14 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
             return "OK", 200
         except Exception as e:
             return f"Error: {e}", 400
+
+    @app.route('/launch', methods=['POST'])
+    def launch():
+        """Trigger launch: z switches from -1 to 100 in debug_vect."""
+        if launch_fn is None:
+            return "Not available", 400
+        launch_fn()
+        return "OK", 200
 
     @app.route('/cycle_lores', methods=['POST'])
     def cycle_lores():

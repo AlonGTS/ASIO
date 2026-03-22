@@ -38,6 +38,13 @@ admm_iterations     = 6
 template_size       = 200
 filter_lr           = 0.25
 
+[mavlink]
+pixhawk_port  = "/dev/ttyACM0"
+pixhawk_baud  = 115200
+gcs_ip        = "192.168.1.37"   # replace with your ground station IP
+gcs_port      = 14550
+local_port    = 14551
+
 [camera]
 # Safe/default resolutions for IMX708 path
 main_sizes  = [[640, 480], [960, 540], [1280, 720], [1640, 1232]]

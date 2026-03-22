@@ -184,9 +184,18 @@ def _restart_reader_live():
     _reader_thread.start()
 
 
-# === MAVLink Setup ===
+# === MAVLink / Serial Setup ===
 import mavlink_client
-mavlink_client.connect()
+_mav_cfg = _cfg["mavlink"]
+mavlink_client.start_mavproxy(
+    pixhawk_port = _mav_cfg["pixhawk_port"],
+    pixhawk_baud = _mav_cfg["pixhawk_baud"],
+    gcs_ip       = _mav_cfg["gcs_ip"],
+    gcs_port     = _mav_cfg["gcs_port"],
+    local_port   = _mav_cfg["local_port"],
+)
+mavlink_client.connect(url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}")                                                      
+
 
 # Precomputed FOV constants (avoid recomputing math.radians every frame)
 _HFOV_RAD = math.radians(60)   # ~60° horizontal FOV
@@ -339,7 +348,8 @@ def _cycle_lores(delta):
 import flask_app
 app = flask_app.create_app(state, create_gts_tracker,
                            cycle_main_fn=_cycle_main if args.mode == 'live' else None,
-                           cycle_lores_fn=_cycle_lores)
+                           cycle_lores_fn=_cycle_lores,
+                           launch_fn=lambda: mavlink_client.set_launch(not mavlink_client._launched))
 
 # === Launch Flask in separate thread ===
 flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
@@ -443,11 +453,11 @@ while True:
                 norm_dx = dx / mw
                 norm_dy = dy / mh
 
-                # Simple FOV→angle mapping (heuristic; tune to your camera FOV)
-                yaw_err   =  norm_dx * _HFOV_RAD   # rad
-                pitch_err = -norm_dy * _VFOV_RAD   # rad
+                # Normalize to -1..1: 0 = centred, ±1 = target at frame edge
+                pitch_norm = -norm_dy / (_VFOV_RAD / 2)
+                yaw_norm   =  norm_dx / (_HFOV_RAD / 2)
 
-                mavlink_client.send_vision_error(pitch_err, yaw_err)
+                mavlink_client.send_vision_error(pitch_norm, yaw_norm)
 
 
                 # Box visuals
@@ -489,9 +499,6 @@ while True:
     overlay2 = f"MAIN {mw}x{mh} | TRACK {lw}x{lh} | {int(_est_fps)} FPS"
     cv2.putText(frame, overlay1, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
     cv2.putText(frame, overlay2, (8, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
-    if args.mode == 'live':
-        cv2.putText(frame, "Keys: z/x MAIN -, +   c/v TRACK -, +", (8, 84),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
     # Playback UI sync
     if SHOW_LOCAL and args.mode == 'playback' and _trackbar_ready and playback_duration_ms > 0:
@@ -517,6 +524,8 @@ while True:
     elif key == ord('r'):
         state.tracking = False; state.bbox = None; state.tracker = None
         print("[INFO] Tracker reset from Pi")
+    elif key == ord('l'):
+        mavlink_client.set_launch(not mavlink_client._launched)
     elif args.mode == 'live':
         if key == ord('x'):   _cycle_main(+1)
         elif key == ord('z'): _cycle_main(-1)

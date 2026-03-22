@@ -336,18 +336,6 @@ if SHOW_LOCAL:
     cv2.setMouseCallback("Tracker", draw_rectangle)
 
 
-import flask_app
-app = flask_app.create_app(state, create_csrt_tracker)
-
-# === Launch Flask in separate thread ===
-flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
-flask_thread.daemon = True
-flask_thread.start()
-
-# === WebRTC server (background thread) ===
-webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), daemon=True)
-webrtc_thread.start()
-
 # === Helpers to cycle resolutions (LIVE mode only) ===
 def _cycle_main(delta):
     """
@@ -369,6 +357,20 @@ def _cycle_lores(delta):
     _lores_idx = (_lores_idx + delta) % len(LORES_SIZES)
     state.lores_size = list(LORES_SIZES[_lores_idx])
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
+
+import flask_app
+app = flask_app.create_app(state, create_csrt_tracker,
+                           cycle_main_fn=_cycle_main if args.mode == 'live' else None,
+                           cycle_lores_fn=_cycle_lores)
+
+# === Launch Flask in separate thread ===
+flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
+flask_thread.daemon = True
+flask_thread.start()
+
+# === WebRTC server (background thread) ===
+webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), daemon=True)
+webrtc_thread.start()
 
 # === Main Loop (render & publish) ===
 while True:

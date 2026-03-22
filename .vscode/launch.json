@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "tracker-so: live",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tracker-so.py",
+            "args": ["--mode", "live"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "tracker-so: playback",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tracker-so.py",
+            "args": ["--mode", "playback", "--loop"],
+            "console": "integratedTerminal"
+        }
+    ]
+}

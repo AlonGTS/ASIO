@@ -146,6 +146,7 @@ WEBRTC_HTML = """
       .btn.quit { background:#f44336; }
       .btn.toggle { background:#2196F3; }
       .btn.full { background:#795548; }
+      .btn.launch { background:#FF6F00; font-weight:bold; }
 
       .dpad { margin-top:4px; display:grid; grid-template-columns:64px 64px 64px; grid-template-rows:64px 64px 64px; gap:10px; justify-content:center; }
       .dpad button { width:64px; height:64px; background:#9E9E9E; border:0; border-radius:12px; color:#fff; font-size:20px; cursor:pointer; box-shadow:0 2px 6px rgba(0,0,0,.15); }
@@ -170,6 +171,7 @@ WEBRTC_HTML = """
 
       <div class="rail">
         <button id="startBtn" class="btn secondary">Start</button>
+        <button class="btn launch" onclick="sendLaunch()">Launch (L)</button>
         <button class="btn go"   onclick="sendCmd('r')">Reset (R)</button>
         <button class="btn go"   onclick="sendCmd('s')">Stop (S)</button>
         <button class="btn quit" onclick="sendCmd('q')">Quit (Q)</button>
@@ -225,6 +227,26 @@ WEBRTC_HTML = """
           });
           setStatus(r.ok ? 'Sent ' + cmd : 'Cmd failed ' + cmd);
         }catch(e){ setStatus('Cmd error: ' + e); }
+      }
+      let launched = false;
+      async function sendLaunch(){
+        try{
+          const r = await fetch('http://' + location.hostname + ':5000/launch', {
+            method:'POST'
+          });
+          if(r.ok){
+            launched = !launched;
+            const btn = document.querySelector('.btn.launch');
+            if(launched){
+              btn.textContent = 'Launched (L)';
+              btn.style.background = '#2196F3';
+            } else {
+              btn.textContent = 'Launch (L)';
+              btn.style.background = '';
+            }
+            setStatus(launched ? 'LAUNCHED' : 'Launch reset');
+          } else { setStatus('Launch failed'); }
+        }catch(e){ setStatus('Launch error: ' + e); }
       }
       async function nudge(dx,dy){
         try{
@@ -295,6 +317,7 @@ WEBRTC_HTML = """
         if (e.key === 'ArrowUp'){    nudge(0,-step); e.preventDefault(); }
         if (e.key === 'ArrowDown'){  nudge(0, step); e.preventDefault(); }
         if (e.key === 'm' || e.key === 'M') toggleTarget();
+        if (e.key === 'l' || e.key === 'L') sendLaunch();
         if (e.key === 'r' || e.key === 'R') sendCmd('r');
         if (e.key === 's' || e.key === 'S') sendCmd('s');
         if (e.key === 'q' || e.key === 'Q') sendCmd('q');
