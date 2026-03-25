@@ -11,7 +11,6 @@ Usage:
     import mavlink_client
     mavlink_client.connect()                 # call once at startup
     mavlink_client.send_vision_error(p, y)   # non-blocking, called every frame
-    mavlink_client.telemetry                 # dict updated live by reader thread
 """
 import math
 import time
@@ -27,14 +26,6 @@ _ser           = None
 _launched      = False
 _mavproxy_proc = None
 DEBUG = False   # set True to print pitch/yaw values every frame
-
-# Latest telemetry values — updated live by _telemetry_reader thread
-telemetry = {
-    "roll": None, "pitch": None, "yaw": None,
-    "lat": None,  "lon": None,  "alt": None,
-    "groundspeed": None, "airspeed": None,
-    "battery_voltage": None, "battery_remaining": None,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -83,38 +74,6 @@ _thread.start()
 
 
 # ---------------------------------------------------------------------------
-# Telemetry reader thread
-# ---------------------------------------------------------------------------
-
-def _telemetry_reader():
-    """Reads incoming MAVLink messages from MAVProxy and updates telemetry dict."""
-    while True:
-        try:
-            msg = _connection.recv_match(blocking=True, timeout=1.0)
-            if msg is None:
-                continue
-            mtype = msg.get_type()
-            if mtype == "ATTITUDE":
-                telemetry["roll"]  = msg.roll
-                telemetry["pitch"] = msg.pitch
-                telemetry["yaw"]   = msg.yaw
-            elif mtype == "GLOBAL_POSITION_INT":
-                telemetry["lat"] = msg.lat / 1e7
-                telemetry["lon"] = msg.lon / 1e7
-                telemetry["alt"] = msg.alt / 1e3
-            elif mtype == "VFR_HUD":
-                telemetry["groundspeed"] = msg.groundspeed
-                telemetry["airspeed"]    = msg.airspeed
-            elif mtype == "SYS_STATUS":
-                telemetry["battery_voltage"]   = msg.voltage_battery / 1000.0
-                telemetry["battery_remaining"] = msg.battery_remaining
-            if DEBUG:
-                print(f"[Telemetry] {mtype}: {msg}")
-        except Exception as e:
-            print(f"[Telemetry] Read error: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Connect
 # ---------------------------------------------------------------------------
 
@@ -145,23 +104,34 @@ def _stop_mavproxy():
         _mavproxy_proc.terminate()
 
 
-def connect(url="udpin:0.0.0.0:14551"):
+def connect(url="udpin:0.0.0.0:14551", fallback_url=None):
     """
     Connect to MAVProxy via UDP and start the telemetry reader thread.
-    MAVProxy must be running with --out=udpout:127.0.0.1:14551
+    MAVProxy must be running with --out=udpout:127.0.0.1:14551.
+    If the primary connection gets no heartbeat (e.g. no USB), falls back to
+    fallback_url (e.g. udpout:GCS_IP:14550) so debug_vect still reaches the GCS.
     """
     global _connection, _enabled
+    from pymavlink import mavutil
     try:
-        from pymavlink import mavutil
         _connection = mavutil.mavlink_connection(url)
         _connection.wait_heartbeat(timeout=5)
         _enabled = True
         print(f"[MAVLink] Connected via MAVProxy ({url}), heartbeat received.")
-        threading.Thread(target=_telemetry_reader, daemon=True).start()
     except Exception as e:
-        print(f"[WARNING] MAVLink not connected: {e}")
-        _connection = None
-        _enabled    = False
+        print(f"[WARNING] MAVLink primary connection failed: {e}")
+        if fallback_url:
+            try:
+                _connection = mavutil.mavlink_connection(fallback_url)
+                _enabled = True
+                print(f"[MAVLink] Fallback connected ({fallback_url}), sending debug_vect to GCS directly.")
+            except Exception as e2:
+                print(f"[WARNING] MAVLink fallback also failed: {e2}")
+                _connection = None
+                _enabled    = False
+        else:
+            _connection = None
+            _enabled    = False
 
 
 def connect_serial(port="/dev/serial0", baud=57600):

@@ -229,21 +229,29 @@ WEBRTC_HTML = """
         }catch(e){ setStatus('Cmd error: ' + e); }
       }
       let launched = false;
+      function setLaunchBtn(state){
+        launched = state;
+        const btn = document.querySelector('.btn.launch');
+        if(launched){
+          btn.textContent = 'Launched (L)';
+          btn.style.background = '#2196F3';
+        } else {
+          btn.textContent = 'Launch (L)';
+          btn.style.background = '';
+        }
+      }
+      // Sync launch button with server state on page load
+      fetch('http://' + location.hostname + ':5000/status')
+        .then(r => r.json())
+        .then(d => setLaunchBtn(d.launched))
+        .catch(() => {});
       async function sendLaunch(){
         try{
           const r = await fetch('http://' + location.hostname + ':5000/launch', {
             method:'POST'
           });
           if(r.ok){
-            launched = !launched;
-            const btn = document.querySelector('.btn.launch');
-            if(launched){
-              btn.textContent = 'Launched (L)';
-              btn.style.background = '#2196F3';
-            } else {
-              btn.textContent = 'Launch (L)';
-              btn.style.background = '';
-            }
+            setLaunchBtn(!launched);
             setStatus(launched ? 'LAUNCHED' : 'Launch reset');
           } else { setStatus('Launch failed'); }
         }catch(e){ setStatus('Launch error: ' + e); }

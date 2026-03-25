@@ -1,0 +1,98 @@
+GTS Tracker - How to Build and Distribute
+==========================================
+
+GOAL
+----
+Wrap the OpenCV CSRT tracker in a compiled native binary (gts_tracker.so)
+so customers can use "GTSTracker" without seeing the implementation.
+
+
+STEP 1 - Create gts_tracker.pyx
+--------------------------------
+Write a Cython file that wraps make_csrt_params(), create_csrt_tracker(),
+and exposes a clean GTSTracker class:
+
+    class GTSTracker:
+        def __init__(self, mode="fixed")   # "fixed" or "moving"
+        def init(self, frame, bbox)        # bbox = (x, y, w, h)
+        def update(self, frame)            # returns (success, bbox)
+        def reset(self)
+
+Move the CSRT tuning parameters (currently in config.toml [csrt.*])
+inside this file so they are compiled into the binary and hidden.
+
+
+STEP 2 - Create setup.py
+-------------------------
+Standard Cython build script:
+
+    from setuptools import setup
+    from Cython.Build import cythonize
+    import numpy
+
+    setup(
+        name="gts_tracker",
+        ext_modules=cythonize("gts_tracker.pyx"),
+        include_dirs=[numpy.get_include()]
+    )
+
+
+STEP 3 - Install Cython on the Pi
+-----------------------------------
+    pip install cython
+    sudo apt install python3-dev
+
+
+STEP 4 - Compile on the Pi
+----------------------------
+    python3 setup.py build_ext --inplace
+
+This produces:
+    gts_tracker.cpython-311-aarch64-linux-gnu.so
+
+This is the file you distribute. It is a native ARM binary.
+The .pyx source is NOT needed by the customer.
+
+
+STEP 5 - Update tracker.py
+----------------------------
+Replace the calls to create_csrt_tracker() with GTSTracker:
+
+    from gts_tracker import GTSTracker
+    ...
+    state.tracker = GTSTracker(mode="moving" if state.bMoovingTgt else "fixed")
+    state.tracker.init(lores_frame, bbox)
+    success, bbox = state.tracker.update(lores_frame)
+
+
+STEP 6 - What to ship to the customer
+---------------------------------------
+    gts_tracker.so          <-- compiled binary (your IP, protected)
+    tracker.py              <-- main loop (can be source or also compiled)
+    flask_app.py            <-- Flask routes
+    webrtc_server.py        <-- WebRTC server
+    mavlink_client.py       <-- MAVLink client
+    config.toml             <-- configuration (omit [csrt.*] sections,
+                                they are now baked into gts_tracker.so)
+    tracker.service         <-- systemd service file
+
+Do NOT ship:
+    gts_tracker.pyx         <-- your source, keep private
+    setup.py                <-- build script, keep private
+
+
+STEP 7 - Customer installation
+--------------------------------
+    pip install opencv-python numpy
+    sudo cp tracker.service /etc/systemd/system/
+    sudo systemctl enable tracker
+    sudo systemctl start tracker
+
+
+NOTES
+------
+- Compile on the same Pi model (or same OS/arch) as the customer's device.
+  The .so is tied to the Python version and CPU architecture (aarch64).
+- If you upgrade Python or move to a different Pi model, recompile.
+- For extra protection, tracker.py can also be compiled with Cython
+  using the same process (rename to tracker.pyx, adjust setup.py).

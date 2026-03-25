@@ -12,7 +12,7 @@ from flask import Flask, request
 from flask_cors import CORS
 
 
-def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None):
+def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None):
     """
     Build and return the Flask app with all control routes bound to `state`.
     state is a SimpleNamespace with: command_from_remote, bbox, tracking,
@@ -156,6 +156,13 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
             return "Not available", 400
         launch_fn()
         return "OK", 200
+
+    @app.route('/status', methods=['GET'])
+    def status():
+        """Return current server-side state for UI initialization."""
+        from flask import jsonify
+        launched = get_launch_state_fn() if get_launch_state_fn else False
+        return jsonify({"launched": launched})
 
     @app.route('/cycle_lores', methods=['POST'])
     def cycle_lores():

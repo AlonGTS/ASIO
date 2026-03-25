@@ -194,7 +194,10 @@ mavlink_client.start_mavproxy(
     gcs_port     = _mav_cfg["gcs_port"],
     local_port   = _mav_cfg["local_port"],
 )
-mavlink_client.connect(url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}")                                                      
+mavlink_client.connect(
+    url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",
+    fallback_url=f"udpout:{_mav_cfg['gcs_ip']}:{_mav_cfg['gcs_port']}",
+)                                                      
 
 
 # Precomputed FOV constants (avoid recomputing math.radians every frame)
@@ -349,7 +352,8 @@ import flask_app
 app = flask_app.create_app(state, create_gts_tracker,
                            cycle_main_fn=_cycle_main if args.mode == 'live' else None,
                            cycle_lores_fn=_cycle_lores,
-                           launch_fn=lambda: mavlink_client.set_launch(not mavlink_client._launched))
+                           launch_fn=lambda: mavlink_client.set_launch(not mavlink_client._launched),
+                           get_launch_state_fn=lambda: mavlink_client._launched)
 
 # === Launch Flask in separate thread ===
 flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
