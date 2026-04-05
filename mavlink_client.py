@@ -25,7 +25,8 @@ _enabled       = False
 _ser           = None
 _launched      = False
 _mavproxy_proc = None
-DEBUG = False   # set True to print pitch/yaw values every frame
+DEBUG           = False  # set True to print pitch/yaw values every frame
+SHOW_TELEMETRY  = False  # set True to print incoming ATTITUDE in the console
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +150,30 @@ def connect_serial(port="/dev/serial0", baud=57600):
     except Exception as e:
         print(f"[WARNING] Serial not connected: {e}")
         _ser = None
+
+
+# ---------------------------------------------------------------------------
+# Telemetry reader thread
+# ---------------------------------------------------------------------------
+
+def _telemetry_reader():
+    while True:
+        if not _enabled or _connection is None:
+            time.sleep(0.5)
+            continue
+        try:
+            msg = _connection.recv_match(type='ATTITUDE', blocking=True, timeout=1.0)
+            if msg and SHOW_TELEMETRY:
+                import math as _math
+                print(f"[Telem] roll={_math.degrees(msg.roll):+.1f}°  "
+                      f"pitch={_math.degrees(msg.pitch):+.1f}°  "
+                      f"yaw={_math.degrees(msg.yaw):+.1f}°")
+        except Exception as e:
+            print(f"[Telem] read error: {e}")
+            time.sleep(0.5)
+
+_telem_thread = threading.Thread(target=_telemetry_reader, daemon=True)
+_telem_thread.start()
 
 
 # ---------------------------------------------------------------------------

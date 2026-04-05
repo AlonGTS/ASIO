@@ -38,10 +38,22 @@ admm_iterations     = 6
 template_size       = 200
 filter_lr           = 0.25
 
+[network]
+# "wlan0" = original network, "wlan1" = new USB dongle (MAHAT)
+interface = "wlan0"
+
+[network.wlan0]
+bind_ip = "192.168.1.45"
+gcs_ip  = "192.168.1.34"
+
+[network.wlan1]
+bind_ip = "192.168.10.2"
+gcs_ip  = "192.168.10.37"
+
 [mavlink]
 pixhawk_port  = "/dev/ttyACM0"
 pixhawk_baud  = 115200
-gcs_ip        = "192.168.1.37"   # replace with your ground station IP
+# gcs_ip is derived automatically from [network.<interface>].gcs_ip
 gcs_port      = 14550
 local_port    = 14551
 

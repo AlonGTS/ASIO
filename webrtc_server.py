@@ -16,7 +16,7 @@ from fractions import Fraction
 from threading import Condition, Lock
 
 from aiohttp import web
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCRtpSender
 from aiortc.mediastreams import MediaStreamError
 from av import VideoFrame
 
@@ -387,10 +387,18 @@ def _make_offer_handler(frame_buffer: FrameBuffer):
                 await pc.close()
                 _pcs.discard(pc)
 
-        pc.addTrack(GlobalFrameTrack(frame_buffer, target_fps=30))
+        transceiver = pc.addTransceiver(GlobalFrameTrack(frame_buffer, target_fps=30), direction="sendonly")
+        caps = RTCRtpSender.getCapabilities("video")
+        h264_codecs = [c for c in caps.codecs if c.mimeType == "video/H264"]
+        transceiver.setCodecPreferences(h264_codecs)
         await pc.setRemoteDescription(RTCSessionDescription(sdp=params["sdp"], type=params["type"]))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+        # DEBUG: print negotiated video codec (first rtpmap = chosen codec)
+        for line in pc.localDescription.sdp.splitlines():
+            if line.startswith("a=rtpmap") and any(c in line.upper() for c in ("H264", "VP8", "VP9", "AV1")):
+                print(f"[WebRTC codec] {line}")
+                break  # first one is the chosen codec
         return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
     return offer
 
@@ -399,7 +407,7 @@ async def _on_shutdown(app):
     await asyncio.gather(*[pc.close() for pc in _pcs])
 
 
-def start(frame_buffer: FrameBuffer, port=8080):
+def start(frame_buffer: FrameBuffer, port=8080, host="0.0.0.0"):
     """
     Run the aiohttp/WebRTC server in the calling thread's event loop.
     Call from a daemon Thread so it doesn't block the main loop.
@@ -410,4 +418,4 @@ def start(frame_buffer: FrameBuffer, port=8080):
     app.on_shutdown.append(_on_shutdown)
     app.router.add_get("/", _index)
     app.router.add_post("/offer", _make_offer_handler(frame_buffer))
-    web.run_app(app, host="0.0.0.0", port=port, handle_signals=False)
+    web.run_app(app, host=host, port=port, handle_signals=False)

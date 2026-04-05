@@ -34,6 +34,12 @@ MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
 MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 
+_net_iface = _cfg["network"]["interface"]
+_net       = _cfg["network"][_net_iface]
+BIND_IP    = _net["bind_ip"]
+GCS_IP     = _net["gcs_ip"]
+print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs={GCS_IP}")
+
 # Shared frame buffer for WebRTC
 frame_buffer = webrtc_server.FrameBuffer()
 
@@ -190,13 +196,13 @@ _mav_cfg = _cfg["mavlink"]
 mavlink_client.start_mavproxy(
     pixhawk_port = _mav_cfg["pixhawk_port"],
     pixhawk_baud = _mav_cfg["pixhawk_baud"],
-    gcs_ip       = _mav_cfg["gcs_ip"],
+    gcs_ip       = GCS_IP,
     gcs_port     = _mav_cfg["gcs_port"],
     local_port   = _mav_cfg["local_port"],
 )
 mavlink_client.connect(
     url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",
-    fallback_url=f"udpout:{_mav_cfg['gcs_ip']}:{_mav_cfg['gcs_port']}",
+    fallback_url=f"udpout:{GCS_IP}:{_mav_cfg['gcs_port']}",
 )                                                      
 
 
@@ -356,12 +362,14 @@ app = flask_app.create_app(state, create_gts_tracker,
                            get_launch_state_fn=lambda: mavlink_client._launched)
 
 # === Launch Flask in separate thread ===
-flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
+print(f"[Flask]  http://{BIND_IP}:5000")
+flask_thread = Thread(target=lambda: app.run(host=BIND_IP, port=5000, threaded=True))
 flask_thread.daemon = True
 flask_thread.start()
 
 # === WebRTC server (background thread) ===
-webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), daemon=True)
+print(f"[WebRTC] http://{BIND_IP}:8080")
+webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), kwargs={"host": BIND_IP}, daemon=True)
 webrtc_thread.start()
 
 # === Main Loop (render & publish) ===
