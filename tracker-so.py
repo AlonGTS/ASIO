@@ -12,6 +12,7 @@ import threading
 from types import SimpleNamespace
 
 # CLI args / timestamps / small GUI dialogs for file/duration picking
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -256,12 +257,35 @@ def create_gts_tracker(moving: bool):
 
 # === Video Recording Setup (mode=record) ===
 writer = None
+record_queue = None
+record_thread = None
 record_start_time = None
+
+def _record_worker(proc, queue):
+    while True:
+        frame_bytes = queue.get()
+        if frame_bytes is None:
+            break
+        proc.stdin.write(frame_bytes)
+    proc.stdin.close()
+    proc.wait()
+
 if args.mode == 'record':
+    import queue as _queue_mod
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    video_filename = f"RecordingsMahat/recording_{timestamp}.avi"
-    writer = cv2.VideoWriter(video_filename, fourcc, 60.0, (640, 480))
+    video_filename = f"RecordingsMahat/recording_{timestamp}.mp4"
+    writer = subprocess.Popen([
+        'ffmpeg', '-y',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', '640x480', '-pix_fmt', 'bgr24', '-r', '60',
+        '-i', '-',
+        '-vcodec', 'libx264', '-preset', 'ultrafast',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        video_filename
+    ], stdin=subprocess.PIPE)
+    record_queue = _queue_mod.Queue(maxsize=30)
+    record_thread = Thread(target=_record_worker, args=(writer, record_queue), daemon=True)
+    record_thread.start()
     record_start_time = time.time()
     print(f"[INFO] Recording to {video_filename}")
 
@@ -491,8 +515,9 @@ while True:
             state.tracking = False
 
     # Write to file if in record mode
-    if args.mode == 'record' and writer is not None:
-        writer.write(frame)
+    if args.mode == 'record' and record_queue is not None:
+        if not record_queue.full():
+            record_queue.put_nowait(frame.tobytes())
         if args.duration and (time.time() - record_start_time >= args.duration):
             print("[INFO] Reached recording duration, exiting.")
             break
@@ -576,5 +601,6 @@ if args.mode != 'playback' and picam2 is not None:
     except Exception: pass
     try: picam2.close()
     except Exception: pass
-if args.mode == 'record' and writer:
-    writer.release()
+if args.mode == 'record' and record_queue is not None:
+    record_queue.put(None)
+    record_thread.join()
