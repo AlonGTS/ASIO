@@ -90,7 +90,7 @@ def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
         f"--master={pixhawk_port}",
         f"--baud={pixhawk_baud}",
         f"--out=udpout:127.0.0.1:{local_port}",
-        f"--out=udp:{gcs_ip}:{gcs_port}",
+        f"--out=udpbcast:{gcs_ip}:{gcs_port}",
         "--daemon",
     ]
     print(f"[MAVProxy] Starting: {' '.join(cmd)}")

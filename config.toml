@@ -5,7 +5,7 @@ show_local = false  # true only when debugging with a monitor
 max_bb_width = 120
 max_bb_height = 120
 
-[csrt.common]
+[gts-track.common]
 use_hog             = true
 use_color_names     = true
 use_gray            = false
@@ -18,7 +18,7 @@ hog_clip            = 2.0
 histogram_bins      = 16
 background_ratio    = 2
 
-[csrt.fixed]
+[gts-track.fixed]
 number_of_scales    = 33
 scale_step          = 1.03
 scale_lr            = 0.15
@@ -28,7 +28,7 @@ admm_iterations     = 9
 template_size       = 160
 filter_lr           = 0.08
 
-[csrt.moving]
+[gts-track.moving]
 number_of_scales    = 55
 scale_step          = 1.02
 scale_lr            = 0.65
@@ -44,11 +44,11 @@ interface = "wlan0"
 
 [network.wlan0]
 bind_ip = "192.168.1.45"
-gcs_ip  = "192.168.1.34"
+gcs_ip  = "192.168.1.255"
 
 [network.wlan1]
 bind_ip = "192.168.10.2"
-gcs_ip  = "192.168.10.37"
+gcs_ip  = "192.168.10.255"
 
 [mavlink]
 pixhawk_port  = "/dev/ttyACM0"
