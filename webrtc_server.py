@@ -176,6 +176,7 @@ WEBRTC_HTML = """
         <button class="btn go"   onclick="sendCmd('s')">Stop (S)</button>
         <button class="btn quit" onclick="sendCmd('q')">Quit (Q)</button>
         <button id="tgtBtn"  class="btn toggle" onclick="toggleTarget()">Target: Fixed (M)</button>
+        <button id="recBtn"  class="btn go"     onclick="toggleRecord()">Record (REC)</button>
         <button id="fsBtn"   class="btn full"   onclick="toggleFullscreen()">Fullscreen</button>
 
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:4px;">
@@ -351,6 +352,45 @@ WEBRTC_HTML = """
         }catch(e){ setStatus('WebRTC error: ' + e); }
       }
       startBtn.addEventListener('click', start);
+
+      // Recording via MediaRecorder (runs entirely in the browser, zero Pi overhead)
+      let mediaRecorder = null;
+      let recChunks = [];
+      const recBtn = document.getElementById('recBtn');
+
+      function toggleRecord(){
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+          mediaRecorder.stop();
+        } else {
+          const stream = video.srcObject;
+          if (!stream){ setStatus('No stream yet — start WebRTC first'); return; }
+          recChunks = [];
+          const mimeType = MediaRecorder.isTypeSupported('video/mp4; codecs=avc1')
+            ? 'video/mp4; codecs=avc1'
+            : 'video/webm; codecs=vp8';
+          mediaRecorder = new MediaRecorder(stream, { mimeType });
+          mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recChunks.push(e.data); };
+          mediaRecorder.onstop = () => {
+            const ext  = mimeType.startsWith('video/mp4') ? 'mp4' : 'webm';
+            const blob = new Blob(recChunks, { type: mimeType });
+            const url  = URL.createObjectURL(blob);
+            const a    = document.createElement('a');
+            const ts   = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+            a.href = url; a.download = `mahat_${ts}.${ext}`; a.click();
+            URL.revokeObjectURL(url);
+            recBtn.textContent = 'Record (REC)';
+            recBtn.style.background = '';
+            setStatus('Recording saved');
+          };
+          stream.getTracks().forEach(t => {
+            t.onended = () => { if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop(); };
+          });
+          mediaRecorder.start();
+          recBtn.textContent = 'Stop Recording';
+          recBtn.style.background = '#f44336';
+          setStatus('Recording…');
+        }
+      }
 
       // Fullscreen toggle
       function toggleFullscreen(){
