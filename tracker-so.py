@@ -456,6 +456,8 @@ while True:
         break
 
     # Tracking on LORES (lores_frame computed above, before dims check)
+    _mav_x, _mav_y = 100.0, 100.0  # sentinel: not tracking
+
     if state.tracking and state.tracker is not None:
         try:
             success, bbox_lo = state.tracker.update(lores_frame)
@@ -492,9 +494,7 @@ while True:
                 # Normalize to -1..1: 0 = centred, ±1 = target at frame edge
                 pitch_norm = -norm_dy / (_VFOV_RAD / 2)
                 yaw_norm   =  norm_dx / (_HFOV_RAD / 2)
-
-                mavlink_client.send_vision_error(pitch_norm, yaw_norm)
-
+                _mav_x, _mav_y = pitch_norm, yaw_norm
 
                 # Box visuals
                 if state.bMoovingTgt:
@@ -513,6 +513,9 @@ while True:
         except Exception as e:
             print(f"[ERROR] Tracker update failed: {e}")
             state.tracking = False
+
+    is_tracking = (_mav_x != 100.0)
+    mavlink_client.send_vision_error(_mav_x, _mav_y, is_tracking)
 
     # Write to file if in record mode
     if args.mode == 'record' and record_queue is not None:

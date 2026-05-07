@@ -43,7 +43,7 @@ filter_lr           = 0.25
 interface = "wlan0"
 
 [network.wlan0]
-bind_ip = "192.168.1.45"
+bind_ip = "192.168.1.31"
 gcs_ip  = "192.168.1.255"
 
 [network.wlan1]

@@ -10,7 +10,7 @@ Start MAVProxy on the RPi before running tracker-so.py:
 Usage:
     import mavlink_client
     mavlink_client.connect()                 # call once at startup
-    mavlink_client.send_vision_error(p, y)   # non-blocking, called every frame
+    mavlink_client.send_vision_error(p, y, is_tracking)  # non-blocking, called every frame
 """
 import math
 import time
@@ -47,26 +47,30 @@ _send_queue = queue.Queue(maxsize=2)  # drop stale values if sender falls behind
 
 def _sender_thread():
     while True:
-        pitch_err, yaw_err = _send_queue.get()
+        pitch_err, yaw_err, is_tracking = _send_queue.get()
+        if not _launched:
+            x, y, z = 0.0, 0.0, -1.0
+        elif is_tracking:
+            x, y, z = float(pitch_err), float(yaw_err), 1.0
+        else:
+            x, y, z = 0.0, 0.0, 0.0
         if _enabled:
             try:
                 _connection.mav.debug_vect_send(
                     b"vision_err",
                     int(time.time() * 1e6),
-                    float(pitch_err),
-                    float(yaw_err),
-                    100.0 if _launched else -1.0
+                    x, y, z
                 )
                 if DEBUG:
-                    print(f"[MAVLink] pitch={pitch_err:.4f}, yaw={yaw_err:.4f}")
+                    print(f"[MAVLink] x={x:.4f}, y={y:.4f}, z={z:.4f}")
             except Exception as e:
                 print(f"[MAVLink] DEBUG_VECT send failed: {e}")
         if _ser is not None:
-            packet = struct.pack('<BBff', 0xAA, 0x55, float(pitch_err), float(yaw_err))
+            packet = struct.pack('<BBff', 0xAA, 0x55, x, y)
             try:
                 _ser.write(packet)
                 if DEBUG:
-                    print(f"[Serial] pitch={pitch_err:.4f}, yaw={yaw_err:.4f}")
+                    print(f"[Serial] x={x:.4f}, y={y:.4f}")
             except Exception as e:
                 print(f"[Serial] Send failed: {e}")
 
@@ -180,10 +184,10 @@ _telem_thread.start()
 # Public API
 # ---------------------------------------------------------------------------
 
-def send_vision_error(pitch_err, yaw_err):
+def send_vision_error(pitch_err, yaw_err, is_tracking=False):
     """Queue a pitch/yaw error for sending (non-blocking). Units: -1..1 normalized."""
     try:
-        _send_queue.put_nowait((pitch_err, yaw_err))
+        _send_queue.put_nowait((pitch_err, yaw_err, is_tracking))
     except queue.Full:
         pass  # drop the frame if the sender is behind
 
