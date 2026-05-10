@@ -151,10 +151,11 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
 
     @app.route('/launch', methods=['POST'])
     def launch():
-        """Trigger launch: z switches from -1 to 100 in debug_vect."""
+        """Set launch state explicitly: state=1 to launch, state=0 to reset."""
         if launch_fn is None:
             return "Not available", 400
-        launch_fn()
+        state_val = request.form.get("state")
+        launch_fn(state_val == '1' if state_val is not None else None)
         return "OK", 200
 
     @app.route('/status', methods=['GET'])

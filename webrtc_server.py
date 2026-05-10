@@ -230,6 +230,7 @@ WEBRTC_HTML = """
         }catch(e){ setStatus('Cmd error: ' + e); }
       }
       let launched = false;
+      let launchPending = false;
       function setLaunchBtn(state){
         launched = state;
         const btn = document.querySelector('.btn.launch');
@@ -247,15 +248,19 @@ WEBRTC_HTML = """
         .then(d => setLaunchBtn(d.launched))
         .catch(() => {});
       async function sendLaunch(){
+        if (launchPending) return;
+        launchPending = true;
+        const newState = !launched;
+        setLaunchBtn(newState);
         try{
           const r = await fetch('http://' + location.hostname + ':5000/launch', {
-            method:'POST'
+            method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:'state=' + (newState ? '1' : '0')
           });
-          if(r.ok){
-            setLaunchBtn(!launched);
-            setStatus(launched ? 'LAUNCHED' : 'Launch reset');
-          } else { setStatus('Launch failed'); }
-        }catch(e){ setStatus('Launch error: ' + e); }
+          if(r.ok){ setStatus(newState ? 'LAUNCHED' : 'Launch reset'); }
+          else { setLaunchBtn(!newState); setStatus('Launch failed'); }
+        }catch(e){ setLaunchBtn(!newState); setStatus('Launch error: ' + e); }
+        finally { launchPending = false; }
       }
       async function nudge(dx,dy){
         try{
@@ -326,7 +331,7 @@ WEBRTC_HTML = """
         if (e.key === 'ArrowUp'){    nudge(0,-step); e.preventDefault(); }
         if (e.key === 'ArrowDown'){  nudge(0, step); e.preventDefault(); }
         if (e.key === 'm' || e.key === 'M') toggleTarget();
-        if (e.key === 'l' || e.key === 'L') sendLaunch();
+        if ((e.key === 'l' || e.key === 'L') && !e.repeat) sendLaunch();
         if (e.key === 'r' || e.key === 'R') sendCmd('r');
         if (e.key === 's' || e.key === 'S') sendCmd('s');
         if (e.key === 'q' || e.key === 'Q') sendCmd('q');
