@@ -382,7 +382,7 @@ import flask_app
 app = flask_app.create_app(state, create_gts_tracker,
                            cycle_main_fn=_cycle_main if args.mode == 'live' else None,
                            cycle_lores_fn=_cycle_lores,
-                           launch_fn=lambda: mavlink_client.set_launch(not mavlink_client._launched),
+                           launch_fn=lambda v=None: mavlink_client.set_launch(v if v is not None else not mavlink_client._launched),
                            get_launch_state_fn=lambda: mavlink_client._launched)
 
 # === Launch Flask in separate thread ===

@@ -15,7 +15,6 @@ Usage:
 import math
 import time
 import struct
-import queue
 import threading
 import subprocess
 import atexit
@@ -33,49 +32,63 @@ SHOW_TELEMETRY  = False  # set True to print incoming ATTITUDE in the console
 # Launch state
 # ---------------------------------------------------------------------------
 
+_launch_lock = threading.Lock()
+_last_launch_change = 0.0
+
 def set_launch(value: bool):
-    global _launched
-    _launched = value
+    global _launched, _last_launch_change
+    with _launch_lock:           # Flask is threaded — lock prevents two threads
+        if _launched == value:   # racing past the debounce simultaneously
+            return
+        now = time.time()
+        if now - _last_launch_change < 0.3:
+            print(f"[Launch] debounced rapid toggle to {value}")
+            return
+        _last_launch_change = now
+        _launched = value
     print(f"[Launch] {'LAUNCHED' if value else 'RESET'}")
 
 
 # ---------------------------------------------------------------------------
-# Sender thread (non-blocking send from main loop)
+# Send (synchronous — called directly from main loop, no queue)
 # ---------------------------------------------------------------------------
 
-_send_queue = queue.Queue(maxsize=2)  # drop stale values if sender falls behind
+def send_vision_error(pitch_err, yaw_err, is_tracking=False):
+    """Send MAVLink debug messages synchronously from the main loop.
+    Both is_tracking and _launched are read at the same instant, eliminating
+    the race condition that existed when a sender thread read _launched later.
+    """
+    if is_tracking:
+        x, y, z = float(pitch_err), float(yaw_err), 1.0
+    else:
+        x, y, z = 0.0, 0.0, 0.0
 
-def _sender_thread():
-    while True:
-        pitch_err, yaw_err, is_tracking = _send_queue.get()
-        if not _launched:
-            x, y, z = 0.0, 0.0, -1.0
-        elif is_tracking:
-            x, y, z = float(pitch_err), float(yaw_err), 1.0
-        else:
-            x, y, z = 0.0, 0.0, 0.0
-        if _enabled:
-            try:
-                _connection.mav.debug_vect_send(
-                    b"vision_err",
-                    int(time.time() * 1e6),
-                    x, y, z
-                )
-                if DEBUG:
-                    print(f"[MAVLink] x={x:.4f}, y={y:.4f}, z={z:.4f}")
-            except Exception as e:
-                print(f"[MAVLink] DEBUG_VECT send failed: {e}")
-        if _ser is not None:
-            packet = struct.pack('<BBff', 0xAA, 0x55, x, y)
-            try:
-                _ser.write(packet)
-                if DEBUG:
-                    print(f"[Serial] x={x:.4f}, y={y:.4f}")
-            except Exception as e:
-                print(f"[Serial] Send failed: {e}")
+    launch_val = 1.0 if _launched else -1.0
 
-_thread = threading.Thread(target=_sender_thread, daemon=True)
-_thread.start()
+    if _enabled:
+        try:
+            _connection.mav.debug_vect_send(
+                b"vision_err",
+                int(time.time() * 1e6),
+                x, y, z
+            )
+            _connection.mav.named_value_float_send(
+                int(time.time() * 1000) & 0xFFFFFFFF,
+                b"launch",
+                launch_val
+            )
+            if DEBUG:
+                print(f"[MAVLink] x={x:.4f}, y={y:.4f}, z={z:.4f}, launch={launch_val:.0f}")
+        except Exception as e:
+            print(f"[MAVLink] send failed: {e}")
+    if _ser is not None:
+        packet = struct.pack('<BBff', 0xAA, 0x55, x, y)
+        try:
+            _ser.write(packet)
+            if DEBUG:
+                print(f"[Serial] x={x:.4f}, y={y:.4f}")
+        except Exception as e:
+            print(f"[Serial] Send failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -183,14 +196,6 @@ _telem_thread.start()
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
-def send_vision_error(pitch_err, yaw_err, is_tracking=False):
-    """Queue a pitch/yaw error for sending (non-blocking). Units: -1..1 normalized."""
-    try:
-        _send_queue.put_nowait((pitch_err, yaw_err, is_tracking))
-    except queue.Full:
-        pass  # drop the frame if the sender is behind
-
 
 def send_attitude(pitch, yaw):
     """Push pitch/yaw commands via MAVLink RC override (units: radians)."""
