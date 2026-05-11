@@ -170,7 +170,7 @@ WEBRTC_HTML = """
       </div>
 
       <div class="rail">
-        <button id="startBtn" class="btn secondary">Start</button>
+        <button id="startBtn" class="btn secondary" style="display:none">Start</button>
         <button class="btn launch" onclick="sendLaunch()">Launch (L)</button>
         <button class="btn go"   onclick="sendCmd('r')">Reset (R)</button>
         <button class="btn go"   onclick="sendCmd('s')">Stop (S)</button>
@@ -341,22 +341,124 @@ WEBRTC_HTML = """
         if (e.key === 'c' || e.key === 'C') cycleLores(-1);
       });
 
-      // WebRTC handshake
+      // WebRTC handshake with auto-start + reconnect
+      let pc = null;
+      let reconnecting = false;
+      let lastFrameTime = Date.now();
+      let watchdogStarted = false;
+
+      function cleanupPeerConnection(){
+        if (pc) {
+          try { pc.ontrack = null; } catch(e){}
+          try { pc.onconnectionstatechange = null; } catch(e){}
+          try { pc.oniceconnectionstatechange = null; } catch(e){}
+          try { pc.close(); } catch(e){}
+          pc = null;
+        }
+      }
+
+      async function reconnectWebRTC(reason){
+        if (reconnecting) return;
+        reconnecting = true;
+        setStatus('Reconnecting WebRTC: ' + reason);
+        console.log('Reconnecting WebRTC:', reason);
+
+        cleanupPeerConnection();
+        video.srcObject = null;
+
+        setTimeout(async () => {
+          reconnecting = false;
+          await start();
+        }, 1000);
+      }
+
       async function start(){
         try{
-          const pc = new RTCPeerConnection();
-          pc.ontrack = (ev)=>{ video.srcObject = ev.streams[0]; setStatus('Streaming\u2026'); };
+          cleanupPeerConnection();
+
+          pc = new RTCPeerConnection();
+
+          pc.ontrack = (ev)=>{
+            video.srcObject = ev.streams[0];
+            lastFrameTime = Date.now();
+            setStatus('Streaming\u2026');
+          };
+
+          pc.onconnectionstatechange = () => {
+            console.log('connectionState:', pc.connectionState);
+            if (pc.connectionState === 'failed' ||
+                pc.connectionState === 'disconnected' ||
+                pc.connectionState === 'closed') {
+              reconnectWebRTC(pc.connectionState);
+            }
+          };
+
+          pc.oniceconnectionstatechange = () => {
+            console.log('iceConnectionState:', pc.iceConnectionState);
+            if (pc.iceConnectionState === 'failed' ||
+                pc.iceConnectionState === 'disconnected') {
+              reconnectWebRTC('ICE ' + pc.iceConnectionState);
+            }
+          };
+
           const offer = await pc.createOffer({ offerToReceiveVideo: true });
           await pc.setLocalDescription(offer);
-          const resp   = await fetch('/offer', { method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+
+          const resp = await fetch('/offer', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({
+              sdp: pc.localDescription.sdp,
+              type: pc.localDescription.type
+            })
           });
+
           const answer = await resp.json();
           await pc.setRemoteDescription(answer);
           setStatus('Connected via WebRTC');
-        }catch(e){ setStatus('WebRTC error: ' + e); }
+
+          startFrameWatchdogOnce();
+
+        }catch(e){
+          setStatus('WebRTC error: ' + e);
+          console.log('WebRTC start error:', e);
+          reconnectWebRTC('start error');
+        }
       }
+
+      // Frame watchdog — detects frozen video even if WebRTC state still looks alive
+      function startFrameWatchdogOnce(){
+        if (watchdogStarted) return;
+        watchdogStarted = true;
+
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+          const frameLoop = () => {
+            lastFrameTime = Date.now();
+            video.requestVideoFrameCallback(frameLoop);
+          };
+          video.requestVideoFrameCallback(frameLoop);
+        } else {
+          // Fallback for older browsers: timeupdate is less accurate but still useful
+          video.addEventListener('timeupdate', () => {
+            lastFrameTime = Date.now();
+          });
+        }
+
+        setInterval(() => {
+          if (!pc || reconnecting) return;
+
+          const age = Date.now() - lastFrameTime;
+          const hasStream = !!video.srcObject;
+
+          if (hasStream && age > 3000) {
+            reconnectWebRTC('video frozen');
+          }
+        }, 1000);
+      }
+
+      // Keep manual start available if you unhide the button later, but auto-start on page load
       startBtn.addEventListener('click', start);
+      window.addEventListener('load', start);
 
       // Recording via MediaRecorder (runs entirely in the browser, zero Pi overhead)
       let mediaRecorder = null;
@@ -368,7 +470,7 @@ WEBRTC_HTML = """
           mediaRecorder.stop();
         } else {
           const stream = video.srcObject;
-          if (!stream){ setStatus('No stream yet — start WebRTC first'); return; }
+          if (!stream){ setStatus('No stream yet — reconnecting WebRTC'); reconnectWebRTC('record no stream'); return; }
           recChunks = [];
           const mimeType = MediaRecorder.isTypeSupported('video/mp4; codecs=avc1')
             ? 'video/mp4; codecs=avc1'
