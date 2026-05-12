@@ -72,10 +72,16 @@ class GlobalFrameTrack(MediaStreamTrack):
                 await asyncio.sleep(to_sleep)
         self._last_ts = time.time()
 
-        frame, gen = self._buf.get(last_gen=self._last_gen, timeout=0.05)
+        # Run blocking Condition.wait() in a thread so the asyncio event loop
+        # stays free for ICE negotiation, DTLS, etc.
+        loop = asyncio.get_running_loop()
+        frame, gen = None, self._last_gen
+        while frame is None:
+            lg = gen
+            frame, gen = await loop.run_in_executor(
+                None, lambda: self._buf.get(last_gen=lg, timeout=0.1)
+            )
         self._last_gen = gen
-        if frame is None:
-            raise MediaStreamError("No frame available")
 
         vf = VideoFrame.from_ndarray(frame, format="bgr24")
         vf.pts = int(self._last_ts * 90000)
@@ -170,7 +176,7 @@ WEBRTC_HTML = """
       </div>
 
       <div class="rail">
-        <button id="startBtn" class="btn secondary" style="display:none">Start</button>
+        <button id="startBtn" class="btn secondary">Connect</button>
         <button class="btn launch" onclick="sendLaunch()">Launch (L)</button>
         <button class="btn go"   onclick="sendCmd('r')">Reset (R)</button>
         <button class="btn go"   onclick="sendCmd('s')">Stop (S)</button>
@@ -346,6 +352,7 @@ WEBRTC_HTML = """
       let reconnecting = false;
       let lastFrameTime = Date.now();
       let watchdogStarted = false;
+      let connectStartTime = 0;   // set after setRemoteDescription; 0 = not connected
 
       function cleanupPeerConnection(){
         if (pc) {
@@ -375,34 +382,42 @@ WEBRTC_HTML = """
       async function start(){
         try{
           cleanupPeerConnection();
+          connectStartTime = 0;
 
           pc = new RTCPeerConnection();
 
           pc.ontrack = (ev)=>{
-            video.srcObject = ev.streams[0];
+            video.srcObject = ev.streams[0] ?? new MediaStream([ev.track]);
+            video.play().catch(()=>{});
             lastFrameTime = Date.now();
             setStatus('Streaming\u2026');
           };
 
           pc.onconnectionstatechange = () => {
             console.log('connectionState:', pc.connectionState);
-            if (pc.connectionState === 'failed' ||
-                pc.connectionState === 'disconnected' ||
-                pc.connectionState === 'closed') {
+            if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
               reconnectWebRTC(pc.connectionState);
             }
           };
 
           pc.oniceconnectionstatechange = () => {
             console.log('iceConnectionState:', pc.iceConnectionState);
-            if (pc.iceConnectionState === 'failed' ||
-                pc.iceConnectionState === 'disconnected') {
-              reconnectWebRTC('ICE ' + pc.iceConnectionState);
+            if (pc.iceConnectionState === 'failed') {
+              reconnectWebRTC('ICE failed');
             }
           };
 
           const offer = await pc.createOffer({ offerToReceiveVideo: true });
           await pc.setLocalDescription(offer);
+
+          // Modern Chrome gathers candidates asynchronously; wait for completion
+          // so the offer SDP has all host candidates before we send it.
+          await new Promise(resolve => {
+            if (pc.iceGatheringState === 'complete') { resolve(); return; }
+            const h = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', h); resolve(); } };
+            pc.addEventListener('icegatheringstatechange', h);
+            setTimeout(resolve, 2000);  // cap at 2 s in case gathering stalls
+          });
 
           const resp = await fetch('/offer', {
             method:'POST',
@@ -415,6 +430,7 @@ WEBRTC_HTML = """
 
           const answer = await resp.json();
           await pc.setRemoteDescription(answer);
+          connectStartTime = Date.now();
           setStatus('Connected via WebRTC');
 
           startFrameWatchdogOnce();
@@ -452,13 +468,13 @@ WEBRTC_HTML = """
 
           if (hasStream && age > 3000) {
             reconnectWebRTC('video frozen');
+          } else if (!hasStream && connectStartTime && (Date.now() - connectStartTime > 5000)) {
+            reconnectWebRTC('no track received');
           }
         }, 1000);
       }
 
-      // Keep manual start available if you unhide the button later, but auto-start on page load
       startBtn.addEventListener('click', start);
-      window.addEventListener('load', start);
 
       // Recording via MediaRecorder (runs entirely in the browser, zero Pi overhead)
       let mediaRecorder = null;
@@ -525,6 +541,14 @@ async def _index(request):
 def _make_offer_handler(frame_buffer: FrameBuffer):
     async def offer(request):
         params = await request.json()
+
+        # Close stale PCs immediately so their recv() loops stop within one
+        # 0.1 s executor timeout instead of lingering until ICE times out (~30 s).
+        old_pcs = list(_pcs)
+        _pcs.clear()
+        for old_pc in old_pcs:
+            await old_pc.close()
+
         pc = RTCPeerConnection()
         _pcs.add(pc)
 
