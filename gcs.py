@@ -23,6 +23,9 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
 """
 
 import argparse
+import atexit
+import platform
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -50,7 +53,30 @@ parser = argparse.ArgumentParser(description="Mahat GCS client")
 parser.add_argument("--pi",   default=None,  help="Pi IP (overrides config.toml)")
 parser.add_argument("--port", type=int, default=5000, help="Flask API port  (default 5000)")
 parser.add_argument("--udp",  type=int, default=5600, help="UDP video port  (default 5600)")
+parser.add_argument("--test", action="store_true",
+                    help="Local test: pipe this Mac's webcam over UDP (no Pi needed)")
 args = parser.parse_args()
+
+# ── Local webcam test mode ────────────────────────────────────────────────────
+# Start FFmpeg as a child process so it is killed automatically when gcs.py exits,
+# whether that's via Q, Ctrl-C, or the VS Code stop button.
+
+if args.test:
+    if platform.system() == "Darwin":
+        cam_args = ["-f", "avfoundation", "-framerate", "30", "-i", "0"]
+    else:
+        cam_args = ["-f", "v4l2", "-i", "/dev/video0"]
+
+    _ffmpeg = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error",
+         *cam_args,
+         "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+         "-g", "15", "-f", "mpegts", f"udp://127.0.0.1:{args.udp}"],
+        stderr=subprocess.DEVNULL,
+    )
+    atexit.register(_ffmpeg.terminate)   # killed on any exit path
+    print(f"[GCS] test mode: webcam → udp://127.0.0.1:{args.udp}  (pid {_ffmpeg.pid})")
+    time.sleep(1.5)   # give FFmpeg a moment to open the camera
 
 PI_IP    = args.pi or _load_toml() or "192.168.1.100"
 FLASK    = f"http://{PI_IP}:{args.port}"
