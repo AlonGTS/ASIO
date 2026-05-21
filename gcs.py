@@ -7,19 +7,19 @@ Usage:
     python gcs.py --pi 192.168.1.100
     python gcs.py          # reads gcs_ip from config.toml if present
 
-Keyboard shortcuts:
+Mouse  : left-click on video → select tracking target
+         left-click on buttons → same as keyboard shortcuts
+
+Keyboard shortcuts (work whether or not the mouse is in the window):
     R        Reset tracker
     S        Stop tracking
     L        Toggle launch
     M        Toggle Fixed / Moving target mode
     Arrows   Nudge target (5 px)
-    X / Z    Cycle MAIN resolution  ▲ / ▼
-    V / C    Cycle TRACK resolution ▲ / ▼
-    P        Toggle local recording (saves .mp4 next to this file)
+    X / Z    Cycle MAIN resolution  + / −
+    V / C    Cycle TRACK resolution + / −
+    P        Toggle local recording
     Q        Quit
-
-Mouse:
-    Left-click on video → select tracking target
 """
 
 import argparse
@@ -31,10 +31,9 @@ import cv2
 import numpy as np
 import requests
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 def _load_toml():
-    """Read Pi IP from config.toml if it lives next to gcs.py."""
     cfg_path = Path(__file__).parent / "config.toml"
     if cfg_path.exists():
         try:
@@ -57,23 +56,22 @@ PI_IP    = args.pi or _load_toml() or "192.168.1.100"
 FLASK    = f"http://{PI_IP}:{args.port}"
 UDP_PORT = args.udp
 
-print(f"[GCS] Pi={PI_IP}  Flask={FLASK}  UDP port={UDP_PORT}")
+print(f"[GCS] Pi={PI_IP}  Flask={FLASK}  UDP={UDP_PORT}")
+
+# ── Layout constants ──────────────────────────────────────────────────────────
+
+PANEL_W     = 210     # right-side button panel width  (px)
+PANEL_MIN_H = 560     # minimum canvas height so all buttons fit
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
 launched   = False
 moving_tgt = False
+_recording = False
+_writer    = None
 _status    = ""
 _status_ts = 0.0
-
-
-def set_status(msg, *, log=True):
-    global _status, _status_ts
-    _status    = msg
-    _status_ts = time.time()
-    if log:
-        print(f"[GCS] {msg}")
-
+_mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
 
 # ── Flask API helpers ─────────────────────────────────────────────────────────
 
@@ -90,18 +88,21 @@ def _post(endpoint, **data):
             set_status(f"API error: {e}")
     threading.Thread(target=_go, daemon=True).start()
 
-
 def _get(endpoint):
     try:
         return requests.get(f"{FLASK}/{endpoint}", timeout=2).json()
     except Exception:
         return {}
 
+def set_status(msg, *, log=True):
+    global _status, _status_ts
+    _status, _status_ts = msg, time.time()
+    if log:
+        print(f"[GCS] {msg}")
 
 def send_cmd(cmd):
     _post("command", cmd=cmd)
     set_status({"r": "Reset", "s": "Stop", "q": "Quit"}.get(cmd, cmd))
-
 
 def send_launch():
     global launched
@@ -109,208 +110,316 @@ def send_launch():
     _post("launch", state=1 if launched else 0)
     set_status("LAUNCHED" if launched else "Launch reset")
 
-
 def toggle_target():
     global moving_tgt
     moving_tgt = not moving_tgt
     _post("set_target_mode", bMoovingTgt=1 if moving_tgt else 0)
     set_status(f"Mode: {'MOVING' if moving_tgt else 'FIXED'}")
 
-
 def nudge(dx, dy):
     _post("nudge", dx=dx, dy=dy)
     set_status(f"Nudge ({dx:+d}, {dy:+d})", log=False)
-
 
 def select_point(x, y):
     _post("select_point", x=x, y=y)
     set_status(f"Selected ({x}, {y})")
 
-
 def cycle_main(delta):
     _post("cycle_main", delta=delta)
-    set_status(f"MAIN {'▲' if delta > 0 else '▼'}")
-
+    set_status(f"MAIN {'up' if delta > 0 else 'down'}")
 
 def cycle_lores(delta):
     _post("cycle_lores", delta=delta)
-    set_status(f"TRACK {'▲' if delta > 0 else '▼'}")
+    set_status(f"TRACK {'up' if delta > 0 else 'down'}")
+
+def toggle_record(frame_wh=None):
+    global _recording, _writer
+    if _recording:
+        if _writer:
+            _writer.release()
+            _writer = None
+        _recording = False
+        set_status("Recording saved")
+    else:
+        if frame_wh is None:
+            set_status("No video yet — can't start recording")
+            return
+        ts    = time.strftime('%Y%m%d_%H%M%S')
+        fname = f"gcs_{ts}.mp4"
+        w, h  = frame_wh
+        _writer = cv2.VideoWriter(
+            fname, cv2.VideoWriter_fourcc(*'mp4v'), 25, (w, h))
+        _recording = True
+        set_status(f"Recording -> {fname}")
 
 
-# ── HUD drawing ───────────────────────────────────────────────────────────────
+# ── Button widget ─────────────────────────────────────────────────────────────
 
-_FONT  = cv2.FONT_HERSHEY_SIMPLEX
-_WHITE = (255, 255, 255)
-_GREEN = (100, 255, 100)
-_AMBER = (60,  180, 255)   # BGR — looks orange on screen
-_GREY  = (160, 160, 160)
-_RED   = (60,   60, 220)
-_BLACK = (0,   0,   0)
+_FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-HINTS = [
-    "Click  select target",
-    "R      reset tracker",
-    "S      stop tracking",
-    "L      launch toggle",
-    "M      fixed/moving",
-    "Arrows nudge (5 px)",
-    "X/Z    MAIN res +/-",
-    "V/C    TRACK res +/-",
-    "P      record  (local)",
-    "Q      quit",
-]
+class Button:
+    """
+    A clickable rectangle drawn on an OpenCV image.
+    Both `label` and `bg` can be plain values or callables so toggle buttons
+    update their text/colour automatically every frame.
+    """
+    def __init__(self, label, x, y, w, h, action, bg=(55, 55, 55)):
+        self._label  = label   # str  or  () -> str
+        self._bg     = bg      # tuple or () -> tuple
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.action  = action
+
+    @property
+    def label(self):
+        return self._label() if callable(self._label) else self._label
+
+    @property
+    def bg(self):
+        return self._bg() if callable(self._bg) else self._bg
+
+    def hit(self, px, py):
+        return self.x <= px < self.x + self.w and self.y <= py < self.y + self.h
+
+    def draw(self, img, hover=False):
+        col = tuple(min(255, c + 45) for c in self.bg) if hover else self.bg
+        cv2.rectangle(img, (self.x, self.y),
+                      (self.x + self.w, self.y + self.h), col, -1)
+        cv2.rectangle(img, (self.x, self.y),
+                      (self.x + self.w, self.y + self.h), (110, 110, 110), 1)
+        lbl = self.label
+        scale = 0.48
+        (tw, th), _ = cv2.getTextSize(lbl, _FONT, scale, 1)
+        tx = self.x + (self.w - tw) // 2
+        ty = self.y + (self.h + th) // 2
+        # Black outline + white text for readability on any bg
+        cv2.putText(img, lbl, (tx, ty), _FONT, scale, (0,0,0), 3, cv2.LINE_AA)
+        cv2.putText(img, lbl, (tx, ty), _FONT, scale, (240,240,240), 1, cv2.LINE_AA)
 
 
-def _txt(img, msg, pos, scale=0.55, color=_WHITE, thick=1):
-    """Draw text with black outline for readability on any background."""
-    cv2.putText(img, msg, pos, _FONT, scale, _BLACK, thick + 2, cv2.LINE_AA)
-    cv2.putText(img, msg, pos, _FONT, scale, color,  thick,     cv2.LINE_AA)
+# ── Button layout ─────────────────────────────────────────────────────────────
+
+_buttons: list[Button] = []
+_cur_video_w = 0    # rebuilt whenever video width changes
 
 
-def draw_hud(frame, fps, recording):
+def _build_buttons(vx: int):
+    """
+    Populate _buttons for a panel that starts at x=vx.
+    Called once at startup (vx=640) and again if the stream resolution changes.
+    """
+    _buttons.clear()
+
+    bw   = PANEL_W - 16          # button width (8 px margin each side)
+    bx   = vx + 8                # button left edge
+    y    = 12
+
+    def btn(label, h, action, bg):
+        _buttons.append(Button(label, bx, y, bw, h, action, bg))
+
+    def btn2(l1, l2, h, a1, a2, bg):
+        """Two equal-width buttons side by side."""
+        w2 = (bw - 4) // 2
+        _buttons.append(Button(l1, bx,          y, w2, h, a1, bg))
+        _buttons.append(Button(l2, bx + w2 + 4, y, w2, h, a2, bg))
+
+    # ── Main controls ─────────────────────────────────────────────────────
+    btn(
+        lambda: "LAUNCHED" if launched else "Launch",
+        44, send_launch,
+        lambda: (30, 140, 50) if launched else (30, 90, 200),
+    )
+    y += 52
+
+    btn2("Reset", "Stop",  36,
+         lambda: send_cmd('r'), lambda: send_cmd('s'),
+         (35, 120, 35))
+    y += 44
+
+    btn("Quit", 36, lambda: send_cmd('q'), (40, 40, 170))
+    y += 52
+
+    # ── Target mode ────────────────────────────────────────────────────────
+    btn(
+        lambda: f"Target: {'MOVING' if moving_tgt else 'FIXED'}",
+        36, toggle_target,
+        lambda: (140, 80, 20) if moving_tgt else (60, 80, 140),
+    )
+    y += 44
+
+    # ── Record ─────────────────────────────────────────────────────────────
+    btn(
+        lambda: "Stop REC" if _recording else "Record",
+        36, lambda: toggle_record((_cur_video_w, _cur_video_h)),
+        lambda: (40, 40, 170) if _recording else (35, 120, 35),
+    )
+    y += 52
+
+    # ── D-pad ──────────────────────────────────────────────────────────────
+    dw  = dh  = 46
+    dpx = vx + (PANEL_W - dw * 3) // 2    # centre the 3-wide grid in panel
+
+    _buttons.append(Button("^",  dpx + dw,      y,          dw, dh, lambda: nudge( 0, -5), (75,75,75)))
+    _buttons.append(Button("<",  dpx,            y + dh,     dw, dh, lambda: nudge(-5,  0), (75,75,75)))
+    _buttons.append(Button(">",  dpx + dw*2,     y + dh,     dw, dh, lambda: nudge( 5,  0), (75,75,75)))
+    _buttons.append(Button("v",  dpx + dw,       y + dh*2,   dw, dh, lambda: nudge( 0,  5), (75,75,75)))
+    y += dh * 3 + 16
+
+    # ── Resolution cycling ─────────────────────────────────────────────────
+    btn2("MAIN -", "MAIN +",   32,
+         lambda: cycle_main(-1), lambda: cycle_main(+1), (55, 55, 85))
+    y += 40
+    btn2("TRACK -", "TRACK +", 32,
+         lambda: cycle_lores(-1), lambda: cycle_lores(+1), (55, 55, 85))
+
+
+# Build with default 640-wide video so buttons exist before stream arrives
+_cur_video_w = 640
+_cur_video_h = 480
+_build_buttons(640)
+
+
+# ── HUD overlay (drawn on video portion only) ─────────────────────────────────
+
+def draw_hud(frame, fps):
     h, w = frame.shape[:2]
 
-    # ── top status bar ────────────────────────────────────────────────────
+    # Top bar
     cv2.rectangle(frame, (0, 0), (w, 36), (20, 20, 20), -1)
 
-    mode_col   = _AMBER if moving_tgt else _GREEN
-    launch_col = _AMBER if launched   else _WHITE
-    rec_col    = _RED
+    mode_col   = (60, 200, 60)  if not moving_tgt else (60, 160, 255)
+    launch_col = (255,255,255)  if not launched    else (60, 160, 255)
 
-    _txt(frame, f"FPS {fps:4.1f}",                     (8,   24))
-    _txt(frame, f"Mode: {'MOVING' if moving_tgt else 'FIXED'}", (120, 24), color=mode_col)
-    _txt(frame, "LAUNCHED" if launched else "READY",   (300, 24), color=launch_col)
-    if recording:
-        _txt(frame, "REC", (w - 55, 24), color=rec_col)
+    def txt(msg, pos, color=(240,240,240), scale=0.55):
+        cv2.putText(frame, msg, pos, _FONT, scale, (0,0,0), 3, cv2.LINE_AA)
+        cv2.putText(frame, msg, pos, _FONT, scale, color,   1, cv2.LINE_AA)
 
-    # ── hint panel (right side, semi-transparent) ─────────────────────────
-    pw = 190
-    px = w - pw - 4
-    py = 42
-    row_h = 17
-    panel_h = len(HINTS) * row_h + 10
+    txt(f"FPS {fps:4.1f}",                            (8,   25))
+    txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (130, 25), color=mode_col)
+    txt("LAUNCHED" if launched else "READY",           (255, 25), color=launch_col)
+    if _recording:
+        txt("REC", (w - 45, 25), color=(80, 80, 255))
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (px, py), (w, py + panel_h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
-
-    for i, hint in enumerate(HINTS):
-        _txt(frame, hint, (px + 4, py + 14 + i * row_h), scale=0.38, color=_GREY)
-
-    # ── status bar (bottom, fades after 4 s) ─────────────────────────────
+    # Status bar (bottom, fades after 4 s)
     age = time.time() - _status_ts
     if _status and age < 4.0:
-        fade  = min(1.0, (4.0 - age) / 0.5)
-        bar   = frame.copy()
+        fade = min(1.0, (4.0 - age) / 0.5)
+        bar  = frame.copy()
         cv2.rectangle(bar, (0, h - 28), (w, h), (0, 0, 0), -1)
         cv2.addWeighted(bar, 0.55, frame, 0.45, 0, frame)
-        col = tuple(int(c * fade) for c in _GREEN)
-        _txt(frame, _status, (8, h - 9), color=col)
+        col = tuple(int(c * fade) for c in (100, 255, 100))
+        txt(_status, (8, h - 9), color=col)
 
 
 # ── Waiting screen ────────────────────────────────────────────────────────────
 
 def _waiting_frame(w=640, h=480):
     img = np.zeros((h, w, 3), np.uint8)
-    _txt(img, f"Waiting for UDP stream on port {UDP_PORT}…",
-         (max(8, w // 2 - 230), h // 2 - 12), scale=0.6)
-    _txt(img, f"Pi: {PI_IP}   Flask: {FLASK}",
-         (max(8, w // 2 - 180), h // 2 + 18), scale=0.5, color=_GREY)
+    def txt(msg, pos, scale=0.6, color=(200,200,200)):
+        cv2.putText(img, msg, pos, _FONT, scale, (0,0,0),   3, cv2.LINE_AA)
+        cv2.putText(img, msg, pos, _FONT, scale, color,     1, cv2.LINE_AA)
+    txt(f"Waiting for UDP stream on port {UDP_PORT}",
+        (max(8, w//2 - 220), h//2 - 14))
+    txt(f"Pi: {PI_IP}",
+        (max(8, w//2 - 60),  h//2 + 18), scale=0.5, color=(140,140,140))
     return img
 
 
 # ── Arrow-key detection (cross-platform) ─────────────────────────────────────
 
-# waitKeyEx returns different codes on Linux / macOS / Windows
-_ARROW_MAP = {
-    # (up,   down,  left,  right)
-    65362: (0, -1), 65364: (0, 1), 65361: (-1, 0), 65363: (1, 0),  # Linux X11
-    63232: (0, -1), 63233: (0, 1), 63234: (-1, 0), 63235: (1, 0),  # macOS
-    2490368: (0,-1), 2621440:(0,1), 2424832:(-1,0), 2555904:(1,0), # Windows
-    82:    (0, -1), 84:    (0, 1), 81:    (-1, 0), 83:    (1, 0),  # Linux waitKey fallback
+_ARROW = {
+    65362:(0,-1), 65364:(0,1), 65361:(-1,0), 65363:(1,0),   # Linux X11
+    63232:(0,-1), 63233:(0,1), 63234:(-1,0), 63235:(1,0),   # macOS
+    2490368:(0,-1), 2621440:(0,1), 2424832:(-1,0), 2555904:(1,0),  # Windows
+    82:(0,-1), 84:(0,1), 81:(-1,0), 83:(1,0),               # Linux fallback
 }
-
-
-def _arrow_dir(key):
-    return _ARROW_MAP.get(key)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    global launched
+    global launched, _cur_video_w, _cur_video_h
 
-    # Sync launch state from Pi at startup
-    data   = _get("status")
+    data     = _get("status")
     launched = data.get("launched", False)
-    set_status(f"Connected to Pi ({PI_IP})" if data else f"Pi not reachable — {PI_IP}")
+    set_status(f"Connected to {PI_IP}" if data else f"Pi not reachable — {PI_IP}")
 
-    # Open UDP stream
-    # WINDOW_AUTOSIZE keeps 1-to-1 pixel mapping so click coords need no scaling
     cap = cv2.VideoCapture(f"udp://@:{UDP_PORT}", cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # discard buffered frames → low latency
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
-    # Mouse → select tracking point
-    # WINDOW_AUTOSIZE: (x, y) from callback == frame pixel coords, no scaling needed
     def on_mouse(event, x, y, flags, _):
+        _mouse_pos[0], _mouse_pos[1] = x, y
         if event == cv2.EVENT_LBUTTONDOWN:
-            select_point(x, y)
+            if x < _cur_video_w:
+                select_point(x, y)          # click on video → track target
+            else:
+                for btn in _buttons:        # click on panel → button action
+                    if btn.hit(x, y):
+                        btn.action()
+                        break
 
     cv2.setMouseCallback("Mahat GCS", on_mouse)
 
-    # Local recording
-    writer    = None
-    recording = False
-
-    # FPS meter
-    prev_ts   = time.time()
-    est_fps   = 0.0
-    FPS_ALPHA = 0.9
-
-    last_w = last_h = 0
+    prev_ts  = time.time()
+    est_fps  = 0.0
+    FPS_A    = 0.9
 
     while True:
         ok, frame = cap.read()
 
         if not ok:
-            cv2.imshow("Mahat GCS", _waiting_frame(last_w or 640, last_h or 480))
-            cap.open(f"udp://@:{UDP_PORT}")   # keep retrying
-            key = cv2.waitKeyEx(500)
-            if key != -1 and (key & 0xFF) in (ord('q'), ord('Q')):
-                break
-            continue
+            frame = _waiting_frame(_cur_video_w, _cur_video_h)
+            cap.open(f"udp://@:{UDP_PORT}")
 
-        last_h, last_w = frame.shape[:2]
+        h, w = frame.shape[:2]
+
+        # Rebuild button layout if video width changed
+        if w != _cur_video_w:
+            _cur_video_w = w
+            _cur_video_h = h
+            _build_buttons(w)
 
         # FPS
-        now     = time.time()
-        dt      = max(1e-6, now - prev_ts)
-        prev_ts = now
-        inst    = 1.0 / dt
-        est_fps = FPS_ALPHA * est_fps + (1 - FPS_ALPHA) * inst if est_fps else inst
+        now      = time.time()
+        dt       = max(1e-6, now - prev_ts)
+        prev_ts  = now
+        inst     = 1.0 / dt
+        est_fps  = FPS_A * est_fps + (1 - FPS_A) * inst if est_fps else inst
 
-        draw_hud(frame, est_fps, recording)
+        draw_hud(frame, est_fps)
 
-        if recording and writer is not None:
-            writer.write(frame)
+        if _recording and _writer is not None:
+            _writer.write(frame)
 
-        cv2.imshow("Mahat GCS", frame)
+        # ── Composite canvas: video left + button panel right ──────────────
+        canvas_h = max(h, PANEL_MIN_H)
+        canvas   = np.zeros((canvas_h, w + PANEL_W, 3), np.uint8)
+        canvas[:h, :w] = frame
 
+        # Panel background + separator line
+        cv2.rectangle(canvas, (w, 0), (w + PANEL_W, canvas_h), (30, 30, 30), -1)
+        cv2.line(canvas, (w, 0), (w, canvas_h), (70, 70, 70), 1)
+
+        # Buttons (with hover highlight)
+        mx, my = _mouse_pos
+        for btn in _buttons:
+            btn.draw(canvas, hover=btn.hit(mx, my))
+
+        cv2.imshow("Mahat GCS", canvas)
+
+        # ── Key handling ───────────────────────────────────────────────────
         key = cv2.waitKeyEx(1)
         if key == -1:
             continue
 
-        # Arrow keys
-        direction = _arrow_dir(key)
+        direction = _ARROW.get(key)
         if direction:
             dx, dy = direction
             nudge(dx * 5, dy * 5)
             continue
 
         k = key & 0xFF
-
         if   k in (ord('q'), ord('Q')): send_cmd('q'); break
         elif k in (ord('r'), ord('R')): send_cmd('r')
         elif k in (ord('s'), ord('S')): send_cmd('s')
@@ -320,29 +429,11 @@ def main():
         elif k in (ord('z'), ord('Z')): cycle_main(-1)
         elif k in (ord('v'), ord('V')): cycle_lores(+1)
         elif k in (ord('c'), ord('C')): cycle_lores(-1)
-        elif k in (ord('p'), ord('P')):
-            if not recording:
-                ts     = time.strftime('%Y%m%d_%H%M%S')
-                fname  = f"gcs_{ts}.mp4"
-                h, w   = last_h, last_w
-                writer = cv2.VideoWriter(
-                    fname,
-                    cv2.VideoWriter_fourcc(*'mp4v'),
-                    25, (w, h)
-                )
-                recording = True
-                set_status(f"Recording → {fname}")
-            else:
-                if writer is not None:
-                    writer.release()
-                    writer = None
-                recording = False
-                set_status("Recording saved")
+        elif k in (ord('p'), ord('P')): toggle_record((_cur_video_w, _cur_video_h))
 
-    # ── Cleanup ────────────────────────────────────────────────────────────
     cap.release()
-    if writer is not None:
-        writer.release()
+    if _writer is not None:
+        _writer.release()
     cv2.destroyAllWindows()
     print("[GCS] Bye.")
 
