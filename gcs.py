@@ -208,7 +208,7 @@ def toggle_record(frame_wh=None):
         fname = f"gcs_{ts}.mp4"
         w, h  = frame_wh
         _writer = cv2.VideoWriter(
-            fname, cv2.VideoWriter_fourcc(*'mp4v'), 25, (w, h))
+            fname, cv2.VideoWriter_fourcc(*'mp4v'), 30, (w, h))
         _recording = True
         set_status(f"Recording -> {fname}")
 
