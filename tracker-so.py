@@ -396,6 +396,41 @@ print(f"[WebRTC] http://{BIND_IP}:8080")
 webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), kwargs={"host": BIND_IP}, daemon=True)
 webrtc_thread.start()
 
+# === UDP video stream for Python GCS (optional, runs alongside WebRTC) ===
+# Reads processed frames from frame_buffer and pipes them to FFmpeg which
+# sends H.264 MPEG-TS over UDP to the GCS machine.
+# GCS receives with:  cv2.VideoCapture('udp://@:5600', cv2.CAP_FFMPEG)
+_UDP_PORT = _cfg["network"].get("gcs_udp_port", 5600)
+
+def _udp_stream_worker():
+    w, h = main_size
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", "30",
+        "-i", "pipe:0",
+        "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15",          # keyframe every 0.5 s — fast GCS reconnect
+        "-f", "mpegts",
+        f"udp://{GCS_IP}:{_UDP_PORT}",
+    ]
+    print(f"[UDP]  streaming → udp://{GCS_IP}:{_UDP_PORT}")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    last_gen = -1
+    while True:
+        frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
+        if frame is None:
+            continue
+        last_gen = gen
+        try:
+            proc.stdin.write(frame.tobytes())
+        except BrokenPipeError:
+            print("[UDP]  FFmpeg pipe closed — restarting stream")
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+udp_thread = Thread(target=_udp_stream_worker, daemon=True)
+udp_thread.start()
+
 # === Main Loop (render & publish) ===
 # Cached scale factors — recomputed only when resolution changes
 _cached_dims = (0, 0, 0, 0)   # (mw, mh, lw, lh)
