@@ -26,7 +26,9 @@ import argparse
 import atexit
 import os
 import platform
+import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -35,14 +37,15 @@ import cv2
 import numpy as np
 import requests
 
-# Tell OpenCV's FFmpeg backend to avoid all internal buffering.
+# Tell OpenCV's FFmpeg backend to minimise internal buffering.
 # Must be set before any VideoCapture is created.
+# NOTE: probesize must be large enough for H.264 stream detection (~4 KB).
+#       32 bytes caused "decode_slice_header" / "first_mb_in_slice overflow" errors.
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "fflags;nobuffer"
     "|flags;low_delay"
-    "|framedrop;1"
-    "|probesize;32"
-    "|analyzeduration;0"
+    "|probesize;4096"
+    "|analyzeduration;100000"
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -87,12 +90,19 @@ if args.test:
          "-tune", "zerolatency",
          "-x264-params", "no-mbtree=1:sync-lookahead=0:rc-lookahead=0",
          "-bf", "0",                       # no B-frames — they add 2-frame delay
-         "-g", "5",                        # keyframe every 5 frames → fast artifact recovery
+         "-g", "5",                        # keyframe every 5 frames → fast recovery
          "-f", "mpegts",
-         f"udp://127.0.0.1:{args.udp}?pkt_size=1316"],
+         f"udp://127.0.0.1:{args.udp}"],
         stderr=subprocess.DEVNULL,
     )
-    atexit.register(_ffmpeg.terminate)   # killed on any exit path
+
+    def _kill_ffmpeg(*_):
+        _ffmpeg.terminate()
+
+    atexit.register(_kill_ffmpeg)                  # normal exit (Q key, end of main)
+    signal.signal(signal.SIGTERM, _kill_ffmpeg)    # VS Code stop button
+    signal.signal(signal.SIGINT,  _kill_ffmpeg)    # Ctrl-C in terminal
+
     print(f"[GCS] test mode: webcam → udp://127.0.0.1:{args.udp}  (pid {_ffmpeg.pid})")
     time.sleep(1.5)   # give FFmpeg a moment to open the camera
 
@@ -116,6 +126,7 @@ _writer    = None
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
+_quit      = threading.Event()  # set to break the main loop from any thread
 
 # ── Flask API helpers ─────────────────────────────────────────────────────────
 
@@ -147,6 +158,11 @@ def set_status(msg, *, log=True):
 def send_cmd(cmd):
     _post("command", cmd=cmd)
     set_status({"r": "Reset", "s": "Stop", "q": "Quit"}.get(cmd, cmd))
+
+def quit_gcs():
+    """Close the GCS window and tell the Pi to quit."""
+    send_cmd('q')
+    _quit.set()
 
 def send_launch():
     global launched
@@ -279,7 +295,7 @@ def _build_buttons(vx: int):
          (35, 120, 35))
     y += 44
 
-    btn("Quit", 36, lambda: send_cmd('q'), (40, 40, 170))
+    btn("Quit", 36, quit_gcs, (40, 40, 170))
     y += 52
 
     # ── Target mode ────────────────────────────────────────────────────────
@@ -453,7 +469,7 @@ def main():
     est_fps  = 0.0
     FPS_A    = 0.9
 
-    while True:
+    while not _quit.is_set():
         ok, frame = cap.read()
 
         if not ok or frame is None:
@@ -507,7 +523,7 @@ def main():
             continue
 
         k = key & 0xFF
-        if   k in (ord('q'), ord('Q')): send_cmd('q'); break
+        if   k in (ord('q'), ord('Q')): quit_gcs()
         elif k in (ord('r'), ord('R')): send_cmd('r')
         elif k in (ord('s'), ord('S')): send_cmd('s')
         elif k in (ord('l'), ord('L')): send_launch()
@@ -517,6 +533,9 @@ def main():
         elif k in (ord('v'), ord('V')): cycle_lores(+1)
         elif k in (ord('c'), ord('C')): cycle_lores(-1)
         elif k in (ord('p'), ord('P')): toggle_record((_cur_video_w, _cur_video_h))
+
+        if _quit.is_set():
+            break
 
     if _writer is not None:
         _writer.release()
