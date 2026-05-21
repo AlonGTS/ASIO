@@ -24,6 +24,7 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
 
 import argparse
 import atexit
+import os
 import platform
 import subprocess
 import threading
@@ -33,6 +34,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 import requests
+
+# Tell OpenCV's FFmpeg backend to avoid all internal buffering.
+# Must be set before any VideoCapture is created.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "fflags;nobuffer"
+    "|flags;low_delay"
+    "|framedrop;1"
+    "|probesize;32"
+    "|analyzeduration;0"
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -70,8 +81,15 @@ if args.test:
     _ffmpeg = subprocess.Popen(
         ["ffmpeg", "-loglevel", "error",
          *cam_args,
-         "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-         "-g", "15", "-f", "mpegts", f"udp://127.0.0.1:{args.udp}"],
+         "-vf", "scale=640:480",          # fixed size — avoids resolution surprises
+         "-vcodec", "libx264",
+         "-preset", "ultrafast",
+         "-tune", "zerolatency",
+         "-x264-params", "no-mbtree=1:sync-lookahead=0:rc-lookahead=0",
+         "-bf", "0",                       # no B-frames — they add 2-frame delay
+         "-g", "5",                        # keyframe every 5 frames → fast artifact recovery
+         "-f", "mpegts",
+         f"udp://127.0.0.1:{args.udp}?pkt_size=1316"],
         stderr=subprocess.DEVNULL,
     )
     atexit.register(_ffmpeg.terminate)   # killed on any exit path
@@ -360,6 +378,51 @@ _ARROW = {
 }
 
 
+# ── Live capture — background reader thread ───────────────────────────────────
+#
+# Problem: cv2.VideoCapture.read() returns frames in decode order from an internal
+# queue. When the main loop is busy (drawing, key handling), that queue grows and
+# read() starts returning frames from seconds ago — causing the delay you saw.
+#
+# Fix: a daemon thread that drains the queue as fast as the decoder produces frames
+# and only ever keeps the most recent one. The main loop always gets "now".
+
+class _LiveCapture:
+    def __init__(self, url: str):
+        self._url   = url
+        self._frame = None
+        self._ok    = False
+        self._lock  = threading.Lock()
+        self._cap   = self._open()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _open(self):
+        cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def _reader(self):
+        """Runs forever in background; reconnects automatically on failure."""
+        while True:
+            ok, frame = self._cap.read()
+            if ok:
+                with self._lock:
+                    self._frame = frame
+                    self._ok    = True
+            else:
+                with self._lock:
+                    self._ok = False
+                time.sleep(0.5)
+                self._cap = self._open()   # reconnect
+
+    def read(self):
+        """Return (ok, frame_copy).  Never blocks more than the lock."""
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return self._ok, self._frame.copy()
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -369,8 +432,7 @@ def main():
     launched = data.get("launched", False)
     set_status(f"Connected to {PI_IP}" if data else f"Pi not reachable — {PI_IP}")
 
-    cap = cv2.VideoCapture(f"udp://@:{UDP_PORT}", cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap = _LiveCapture(f"udp://@:{UDP_PORT}")
 
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
@@ -394,9 +456,8 @@ def main():
     while True:
         ok, frame = cap.read()
 
-        if not ok:
+        if not ok or frame is None:
             frame = _waiting_frame(_cur_video_w, _cur_video_h)
-            cap.open(f"udp://@:{UDP_PORT}")
 
         h, w = frame.shape[:2]
 
@@ -457,7 +518,6 @@ def main():
         elif k in (ord('c'), ord('C')): cycle_lores(-1)
         elif k in (ord('p'), ord('P')): toggle_record((_cur_video_w, _cur_video_h))
 
-    cap.release()
     if _writer is not None:
         _writer.release()
     cv2.destroyAllWindows()
