@@ -18,23 +18,15 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "GCS: UI only (no Pi)",
+            "name": "GCS: Pi (auto from config.toml)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/gcs.py",
-            "args": ["--pi", "127.0.0.1"],
+            "args": [],
             "console": "integratedTerminal"
         },
         {
-            "name": "GCS: local webcam test",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/gcs.py",
-            "args": ["--pi", "127.0.0.1", "--test"],
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "GCS: connect to Pi",
+            "name": "GCS: connect to Pi (manual IP)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/gcs.py",
@@ -47,7 +39,7 @@
             "id": "piIp",
             "type": "promptString",
             "description": "Pi IP address",
-            "default": "192.168.1.100"
+            "default": "192.168.1.34"
         }
     ]
 }
