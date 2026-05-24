@@ -120,6 +120,11 @@ def _stop_mavproxy():
     if _mavproxy_proc and _mavproxy_proc.poll() is None:
         print("[MAVProxy] Stopping...")
         _mavproxy_proc.terminate()
+        try:
+            _mavproxy_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            print("[MAVProxy] Force-killing...")
+            _mavproxy_proc.kill()
 
 
 def connect(url="udpin:0.0.0.0:14551", fallback_url=None):

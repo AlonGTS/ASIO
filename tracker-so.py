@@ -12,7 +12,9 @@ import threading
 from types import SimpleNamespace
 
 # CLI args / timestamps / small GUI dialogs for file/duration picking
+import signal
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -204,7 +206,17 @@ mavlink_client.start_mavproxy(
 mavlink_client.connect(
     url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",
     fallback_url=f"udpout:{GCS_IP}:{_mav_cfg['gcs_port']}",
-)                                                      
+)
+
+# Ensure MAVProxy is killed on SIGTERM (terminal closed) and SIGHUP,
+# not just on normal exit / Ctrl-C (which atexit already handles).
+def _shutdown(signum, frame):
+    print(f"\n[Tracker] Signal {signum} received — shutting down.")
+    mavlink_client._stop_mavproxy()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _shutdown)
+signal.signal(signal.SIGHUP, _shutdown)                                                      
 
 
 # Precomputed FOV constants (avoid recomputing math.radians every frame)
