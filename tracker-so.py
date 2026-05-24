@@ -412,9 +412,10 @@ def _udp_stream_worker():
         "-f", "rawvideo", "-vcodec", "rawvideo",
         "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", "30",
         "-i", "pipe:0",
-        "-vcodec", "h264_v4l2m2m",   # Pi hardware encoder — no CPU cost
-        "-g", "3",                   # keyframe every 3 frames (0.1 s) — fast WiFi recovery
-        "-b:v", "1M",                # cap bitrate → fewer large UDP packets → less WiFi loss
+        "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "3",           # keyframe every 3 frames (0.1 s) — fast WiFi recovery
+        "-b:v", "1M",        # cap bitrate → fewer large UDP packets → less WiFi loss
+        "-maxrate", "1M", "-bufsize", "500k",
         "-f", "mpegts",
         f"udp://{_UDP_BROADCAST}:{_UDP_PORT}?broadcast=1",
     ]
