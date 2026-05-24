@@ -422,11 +422,8 @@ import socket as _socket
 
 _UDP_PORT      = _cfg["network"].get("gcs_udp_port", 5600)
 _JPEG_QUALITY  = _cfg["network"].get("gcs_jpeg_quality", 60)
-# Subnet broadcast derived from BIND_IP (assumes /24)
-_UDP_BROADCAST = ".".join(BIND_IP.split(".")[:3]) + ".255"
 
 _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-_udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
 _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)  # 1 MB send buffer
 
 _JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
@@ -436,7 +433,7 @@ def _udp_stream_worker():
     last_gen  = -1
     _t0       = time.time()
     _sent     = 0
-    print(f"[UDP]  broadcasting JPEG → udp://{_UDP_BROADCAST}:{_UDP_PORT}  quality={_JPEG_QUALITY}")
+    print(f"[UDP]  streaming JPEG → udp://{GCS_IP}:{_UDP_PORT}  quality={_JPEG_QUALITY}")
     while True:
         frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
         if frame is None:
@@ -463,7 +460,7 @@ def _udp_stream_worker():
         if len(data) > _UDP_MAX:
             continue   # frame too large even after resize — skip rather than corrupt
         try:
-            _udp_sock.sendto(data, (_UDP_BROADCAST, _UDP_PORT))
+            _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))   # unicast to known GCS IP
         except Exception as e:
             print(f"[UDP]  send error: {e}")
 

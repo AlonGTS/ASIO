@@ -59,17 +59,13 @@ PI_IP    = args.pi or _load_toml() or "192.168.1.100"
 FLASK    = f"http://{PI_IP}:{args.port}"
 UDP_PORT = args.udp
 
-# Subnet broadcast address (derived from Pi IP, assumes /24)
-# Used for both receiving video and sending commands — works through AP isolation.
-BROADCAST    = ".".join(PI_IP.split(".")[:3]) + ".255"
-CMD_PORT     = 5601
+CMD_PORT = 5601
 
-# UDP socket for sending broadcast commands to the Pi
+# UDP socket for sending commands directly to the Pi (unicast)
 import json as _json
 _cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-_cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-print(f"[GCS] Pi={PI_IP}  broadcast={BROADCAST}  video={UDP_PORT}  cmd={CMD_PORT}")
+print(f"[GCS] Pi={PI_IP}  video={UDP_PORT}  cmd={CMD_PORT}")
 
 # ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -90,10 +86,10 @@ _quit      = threading.Event()  # set to break the main loop from any thread
 # ── Command channel (UDP broadcast → works through AP isolation) ──────────────
 
 def _post(endpoint, **data):
-    """Send command to Pi via UDP broadcast. Non-blocking, no TCP needed."""
+    """Send command to Pi via UDP unicast. Non-blocking, no TCP needed."""
     msg = _json.dumps({"endpoint": endpoint, **data}).encode()
     try:
-        _cmd_sock.sendto(msg, (BROADCAST, CMD_PORT))
+        _cmd_sock.sendto(msg, (PI_IP, CMD_PORT))
     except Exception as e:
         set_status(f"CMD error: {e}")
 
