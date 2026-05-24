@@ -470,6 +470,33 @@ def _udp_stream_worker():
 udp_thread = Thread(target=_udp_stream_worker, daemon=True)
 udp_thread.start()
 
+# === UDP command channel (broadcast-based — works through AP isolation) ===
+# Mac sends JSON command datagrams to the subnet broadcast address.
+# Pi listens on this port and forwards them to the local Flask API,
+# so all existing command logic is reused without duplication.
+import json as _json
+import requests as _req
+
+_CMD_PORT = _cfg["network"].get("gcs_cmd_port", 5601)
+_cmd_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+_cmd_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+_cmd_sock.bind(('', _CMD_PORT))
+
+def _udp_cmd_listener():
+    print(f"[CMD]  listening for broadcast commands on UDP:{_CMD_PORT}")
+    while True:
+        try:
+            data, _ = _cmd_sock.recvfrom(4096)
+            msg = _json.loads(data.decode())
+            ep  = msg.pop("endpoint", None)
+            if ep:
+                _req.post(f"http://127.0.0.1:5000/{ep}", data=msg, timeout=1)
+        except Exception as e:
+            if "timed out" not in str(e).lower():
+                print(f"[CMD]  {e}")
+
+Thread(target=_udp_cmd_listener, daemon=True).start()
+
 # === Main Loop (render & publish) ===
 # Cached scale factors — recomputed only when resolution changes
 _cached_dims = (0, 0, 0, 0)   # (mw, mh, lw, lh)

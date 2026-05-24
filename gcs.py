@@ -59,7 +59,17 @@ PI_IP    = args.pi or _load_toml() or "192.168.1.100"
 FLASK    = f"http://{PI_IP}:{args.port}"
 UDP_PORT = args.udp
 
-print(f"[GCS] Pi={PI_IP}  Flask={FLASK}  UDP={UDP_PORT}")
+# Subnet broadcast address (derived from Pi IP, assumes /24)
+# Used for both receiving video and sending commands — works through AP isolation.
+BROADCAST    = ".".join(PI_IP.split(".")[:3]) + ".255"
+CMD_PORT     = 5601
+
+# UDP socket for sending broadcast commands to the Pi
+import json as _json
+_cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+print(f"[GCS] Pi={PI_IP}  broadcast={BROADCAST}  video={UDP_PORT}  cmd={CMD_PORT}")
 
 # ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -77,24 +87,20 @@ _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
 _quit      = threading.Event()  # set to break the main loop from any thread
 
-# ── Flask API helpers ─────────────────────────────────────────────────────────
+# ── Command channel (UDP broadcast → works through AP isolation) ──────────────
 
 def _post(endpoint, **data):
-    """Fire-and-forget POST — never blocks the video loop."""
-    def _go():
-        try:
-            r = requests.post(f"{FLASK}/{endpoint}", data=data, timeout=2)
-            if not r.ok:
-                set_status(f"API {r.status_code}: /{endpoint}")
-        except requests.exceptions.ConnectionError:
-            set_status(f"Pi not reachable ({PI_IP})")
-        except Exception as e:
-            set_status(f"API error: {e}")
-    threading.Thread(target=_go, daemon=True).start()
+    """Send command to Pi via UDP broadcast. Non-blocking, no TCP needed."""
+    msg = _json.dumps({"endpoint": endpoint, **data}).encode()
+    try:
+        _cmd_sock.sendto(msg, (BROADCAST, CMD_PORT))
+    except Exception as e:
+        set_status(f"CMD error: {e}")
 
 def _get(endpoint):
+    """Try Flask HTTP for read-only status; returns {} if unreachable."""
     try:
-        return requests.get(f"{FLASK}/{endpoint}", timeout=2).json()
+        return requests.get(f"{FLASK}/{endpoint}", timeout=1).json()
     except Exception:
         return {}
 
@@ -399,7 +405,10 @@ def main():
 
     data     = _get("status")
     launched = data.get("launched", False)
-    set_status(f"Connected to {PI_IP}" if data else f"Pi not reachable — {PI_IP}")
+    if data:
+        set_status(f"Connected to {PI_IP}")
+    else:
+        set_status(f"Commands via UDP broadcast — waiting for video…")
 
     cap = _LiveCapture(UDP_PORT)
 
