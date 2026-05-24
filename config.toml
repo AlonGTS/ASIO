@@ -40,7 +40,11 @@ filter_lr           = 0.25
 
 [network]
 # "wlan0" = original network, "wlan1" = new USB dongle (MAHAT)
-interface = "wlan0"
+interface        = "wlan0"
+gcs_udp_port     = 5600
+gcs_cmd_port     = 5601
+gcs_jpeg_quality = 40     # was 60 — lower = smaller frames (~12 KB vs ~35 KB)
+gcs_stream_width = 480    # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 30fps)
 
 [network.wlan0]
 bind_ip = "192.168.1.34"

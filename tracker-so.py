@@ -422,7 +422,8 @@ webrtc_thread.start()
 import socket as _socket
 
 _UDP_PORT      = _cfg["network"].get("gcs_udp_port", 5600)
-_JPEG_QUALITY  = _cfg["network"].get("gcs_jpeg_quality", 60)
+_JPEG_QUALITY  = _cfg["network"].get("gcs_jpeg_quality", 40)
+_STREAM_WIDTH  = _cfg["network"].get("gcs_stream_width", 480)
 
 _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
 _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)  # 1 MB send buffer
@@ -450,9 +451,9 @@ def _udp_stream_worker():
 
         # Scale down wide frames so the JPEG fits in one UDP datagram
         h_f, w_f = frame.shape[:2]
-        if w_f > 640:
-            scale = 640 / w_f
-            frame = cv2.resize(frame, (640, int(h_f * scale)), interpolation=cv2.INTER_LINEAR)
+        if w_f > _STREAM_WIDTH:
+            scale = _STREAM_WIDTH / w_f
+            frame = cv2.resize(frame, (_STREAM_WIDTH, int(h_f * scale)), interpolation=cv2.INTER_LINEAR)
 
         ok, buf = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
         if not ok:
