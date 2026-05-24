@@ -44,7 +44,7 @@ def _load_toml():
             with open(cfg_path, "rb") as f:
                 cfg = tomllib.load(f)
             iface = cfg["network"]["interface"]
-            return cfg["network"][iface]["gcs_ip"]
+            return cfg["network"][iface]["bind_ip"]   # Pi's IP, not gcs_ip (that's the Mac)
         except Exception:
             pass
     return None

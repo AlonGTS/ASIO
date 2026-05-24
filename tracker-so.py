@@ -421,13 +421,22 @@ _JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
 _UDP_MAX     = 65400   # stay comfortably under 65507-byte UDP limit
 
 def _udp_stream_worker():
-    last_gen = -1
+    last_gen  = -1
+    _t0       = time.time()
+    _sent     = 0
     print(f"[UDP]  broadcasting JPEG → udp://{_UDP_BROADCAST}:{_UDP_PORT}  quality={_JPEG_QUALITY}")
     while True:
         frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
         if frame is None:
             continue
         last_gen = gen
+
+        # Log actual send rate every 5 s
+        _sent += 1
+        _now = time.time()
+        if _now - _t0 >= 5.0:
+            print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)")
+            _t0, _sent = _now, 0
 
         # Scale down wide frames so the JPEG fits in one UDP datagram
         h_f, w_f = frame.shape[:2]
