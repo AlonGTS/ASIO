@@ -486,9 +486,10 @@ def _udp_cmd_listener():
     print(f"[CMD]  listening for broadcast commands on UDP:{_CMD_PORT}")
     while True:
         try:
-            data, _ = _cmd_sock.recvfrom(4096)
+            data, addr = _cmd_sock.recvfrom(4096)
             msg = _json.loads(data.decode())
             ep  = msg.pop("endpoint", None)
+            print(f"[CMD]  ← {addr[0]}  {ep}  {msg}")
             if ep:
                 _req.post(f"http://127.0.0.1:5000/{ep}", data=msg, timeout=1)
         except Exception as e:
