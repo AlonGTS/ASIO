@@ -387,7 +387,7 @@ app = flask_app.create_app(state, create_gts_tracker,
 
 # === Launch Flask in separate thread ===
 print(f"[Flask]  http://{BIND_IP}:5000")
-flask_thread = Thread(target=lambda: app.run(host=BIND_IP, port=5000, threaded=True))
+flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
 flask_thread.daemon = True
 flask_thread.start()
 
@@ -396,42 +396,55 @@ print(f"[WebRTC] http://{BIND_IP}:8080")
 webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), kwargs={"host": BIND_IP}, daemon=True)
 webrtc_thread.start()
 
-# === UDP video stream for Python GCS (optional, runs alongside WebRTC) ===
-# Reads processed frames from frame_buffer and pipes them to FFmpeg which
-# broadcasts H.264 MPEG-TS over UDP on the local subnet.
-# Any machine on the LAN can receive with:
-#   cv2.VideoCapture('udp://@:5600', cv2.CAP_FFMPEG)
-_UDP_PORT = _cfg["network"].get("gcs_udp_port", 5600)
-# Derive subnet broadcast from BIND_IP (assumes /24, e.g. 192.168.1.34 → 192.168.1.255)
+# === UDP video stream for Python GCS ===
+# Encodes each frame as JPEG in-process (OpenCV) and sends it over a raw
+# broadcast UDP socket.  No FFmpeg subprocess → no pipe overhead → no extra
+# CPU load competing with the tracker.
+#
+# Max JPEG size at 640×480 quality-60 is ~30-50 KB, well under the 65507-byte
+# UDP payload limit.  Larger frames are scaled down to ≤640 px wide first.
+#
+# GCS receives with gcs.py (raw socket + cv2.imdecode).
+
+import socket as _socket
+
+_UDP_PORT      = _cfg["network"].get("gcs_udp_port", 5600)
+_JPEG_QUALITY  = _cfg["network"].get("gcs_jpeg_quality", 60)
+# Subnet broadcast derived from BIND_IP (assumes /24)
 _UDP_BROADCAST = ".".join(BIND_IP.split(".")[:3]) + ".255"
 
+_udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+_udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+_udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)  # 1 MB send buffer
+
+_JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
+_UDP_MAX     = 65400   # stay comfortably under 65507-byte UDP limit
+
 def _udp_stream_worker():
-    w, h = main_size
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", "30",
-        "-i", "pipe:0",
-        "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-g", "3",           # keyframe every 3 frames (0.1 s) — fast WiFi recovery
-        "-b:v", "1M",        # cap bitrate → fewer large UDP packets → less WiFi loss
-        "-maxrate", "1M", "-bufsize", "500k",
-        "-f", "mpegts",
-        f"udp://{_UDP_BROADCAST}:{_UDP_PORT}?broadcast=1",
-    ]
-    print(f"[UDP]  broadcasting → udp://{_UDP_BROADCAST}:{_UDP_PORT}")
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     last_gen = -1
+    print(f"[UDP]  broadcasting JPEG → udp://{_UDP_BROADCAST}:{_UDP_PORT}  quality={_JPEG_QUALITY}")
     while True:
         frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
         if frame is None:
             continue
         last_gen = gen
+
+        # Scale down wide frames so the JPEG fits in one UDP datagram
+        h_f, w_f = frame.shape[:2]
+        if w_f > 640:
+            scale = 640 / w_f
+            frame = cv2.resize(frame, (640, int(h_f * scale)), interpolation=cv2.INTER_LINEAR)
+
+        ok, buf = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
+        if not ok:
+            continue
+        data = buf.tobytes()
+        if len(data) > _UDP_MAX:
+            continue   # frame too large even after resize — skip rather than corrupt
         try:
-            proc.stdin.write(frame.tobytes())
-        except BrokenPipeError:
-            print("[UDP]  FFmpeg pipe closed — restarting stream")
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            _udp_sock.sendto(data, (_UDP_BROADCAST, _UDP_PORT))
+        except Exception as e:
+            print(f"[UDP]  send error: {e}")
 
 udp_thread = Thread(target=_udp_stream_worker, daemon=True)
 udp_thread.start()

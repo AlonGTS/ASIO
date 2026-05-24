@@ -23,11 +23,8 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
 """
 
 import argparse
-import atexit
 import os
-import platform
-import signal
-import subprocess
+import socket
 import sys
 import threading
 import time
@@ -36,19 +33,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import requests
-
-# Tell OpenCV's FFmpeg backend to minimise internal buffering.
-# Must be set before any VideoCapture is created.
-# NOTE: probesize must be large enough for H.264 stream detection (~4 KB).
-#       32 bytes caused "decode_slice_header" / "first_mb_in_slice overflow" errors.
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "fflags;nobuffer+discardcorrupt"  # nobuffer=no queue buildup,
-                                      # discardcorrupt=drop bad H.264 frames
-                                      # silently instead of displaying them
-    "|flags;low_delay"
-    "|probesize;4096"
-    "|analyzeduration;100000"
-)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -69,44 +53,7 @@ parser = argparse.ArgumentParser(description="Mahat GCS client")
 parser.add_argument("--pi",   default=None,  help="Pi IP (overrides config.toml)")
 parser.add_argument("--port", type=int, default=5000, help="Flask API port  (default 5000)")
 parser.add_argument("--udp",  type=int, default=5600, help="UDP video port  (default 5600)")
-parser.add_argument("--test", action="store_true",
-                    help="Local test: pipe this Mac's webcam over UDP (no Pi needed)")
 args = parser.parse_args()
-
-# ── Local webcam test mode ────────────────────────────────────────────────────
-# Start FFmpeg as a child process so it is killed automatically when gcs.py exits,
-# whether that's via Q, Ctrl-C, or the VS Code stop button.
-
-if args.test:
-    if platform.system() == "Darwin":
-        cam_args = ["-f", "avfoundation", "-framerate", "30", "-i", "0"]
-    else:
-        cam_args = ["-f", "v4l2", "-i", "/dev/video0"]
-
-    _ffmpeg = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error",
-         *cam_args,
-         "-vf", "scale=640:480",          # fixed size — avoids resolution surprises
-         "-vcodec", "libx264",
-         "-preset", "ultrafast",
-         "-tune", "zerolatency",
-         "-x264-params", "no-mbtree=1:sync-lookahead=0:rc-lookahead=0",
-         "-bf", "0",                       # no B-frames — they add 2-frame delay
-         "-g", "5",                        # keyframe every 5 frames → fast recovery
-         "-f", "mpegts",
-         f"udp://127.0.0.1:{args.udp}"],
-        stderr=subprocess.DEVNULL,
-    )
-
-    def _kill_ffmpeg(*_):
-        _ffmpeg.terminate()
-
-    atexit.register(_kill_ffmpeg)                  # normal exit (Q key, end of main)
-    signal.signal(signal.SIGTERM, _kill_ffmpeg)    # VS Code stop button
-    signal.signal(signal.SIGINT,  _kill_ffmpeg)    # Ctrl-C in terminal
-
-    print(f"[GCS] test mode: webcam → udp://127.0.0.1:{args.udp}  (pid {_ffmpeg.pid})")
-    time.sleep(1.5)   # give FFmpeg a moment to open the camera
 
 PI_IP    = args.pi or _load_toml() or "192.168.1.100"
 FLASK    = f"http://{PI_IP}:{args.port}"
@@ -404,34 +351,38 @@ _ARROW = {
 #
 # Fix: a daemon thread that drains the queue as fast as the decoder produces frames
 # and only ever keeps the most recent one. The main loop always gets "now".
+#
+# The Pi sends JPEG-encoded frames as individual UDP datagrams (broadcast).
+# Each datagram = one complete JPEG image — no stream reassembly needed.
 
 class _LiveCapture:
-    def __init__(self, url: str):
-        self._url   = url
+    def __init__(self, port: int):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)  # 1 MB
+        self._sock.bind(('', port))
+        self._sock.settimeout(1.0)
         self._frame = None
         self._ok    = False
         self._lock  = threading.Lock()
-        self._cap   = self._open()
         threading.Thread(target=self._reader, daemon=True).start()
 
-    def _open(self):
-        cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return cap
-
     def _reader(self):
-        """Runs forever in background; reconnects automatically on failure."""
+        """Receive JPEG datagrams and decode them; marks _ok=False on timeout."""
         while True:
-            ok, frame = self._cap.read()
-            if ok:
+            try:
+                data, _ = self._sock.recvfrom(1 << 16)  # 65536 bytes max UDP payload
+                arr   = np.frombuffer(data, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    with self._lock:
+                        self._frame = frame
+                        self._ok    = True
+            except socket.timeout:
                 with self._lock:
-                    self._frame = frame
-                    self._ok    = True
-            else:
-                with self._lock:
-                    self._ok = False
-                time.sleep(0.5)
-                self._cap = self._open()   # reconnect
+                    self._ok = False   # no packet for 1 s → show waiting screen
+            except Exception as e:
+                print(f"[UDP] recv: {e}")
 
     def read(self):
         """Return (ok, frame_copy).  Never blocks more than the lock."""
@@ -450,7 +401,7 @@ def main():
     launched = data.get("launched", False)
     set_status(f"Connected to {PI_IP}" if data else f"Pi not reachable — {PI_IP}")
 
-    cap = _LiveCapture(f"udp://@:{UDP_PORT}")
+    cap = _LiveCapture(UDP_PORT)
 
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
