@@ -398,9 +398,12 @@ webrtc_thread.start()
 
 # === UDP video stream for Python GCS (optional, runs alongside WebRTC) ===
 # Reads processed frames from frame_buffer and pipes them to FFmpeg which
-# sends H.264 MPEG-TS over UDP to the GCS machine.
-# GCS receives with:  cv2.VideoCapture('udp://@:5600', cv2.CAP_FFMPEG)
+# broadcasts H.264 MPEG-TS over UDP on the local subnet.
+# Any machine on the LAN can receive with:
+#   cv2.VideoCapture('udp://@:5600', cv2.CAP_FFMPEG)
 _UDP_PORT = _cfg["network"].get("gcs_udp_port", 5600)
+# Derive subnet broadcast from BIND_IP (assumes /24, e.g. 192.168.1.34 → 192.168.1.255)
+_UDP_BROADCAST = ".".join(BIND_IP.split(".")[:3]) + ".255"
 
 def _udp_stream_worker():
     w, h = main_size
@@ -417,9 +420,9 @@ def _udp_stream_worker():
         "-maxrate", "1M",    # packets = less chance of loss on WiFi
         "-bufsize", "500k",
         "-f", "mpegts",
-        f"udp://{GCS_IP}:{_UDP_PORT}",
+        f"udp://{_UDP_BROADCAST}:{_UDP_PORT}?broadcast=1",
     ]
-    print(f"[UDP]  streaming → udp://{GCS_IP}:{_UDP_PORT}")
+    print(f"[UDP]  broadcasting → udp://{_UDP_BROADCAST}:{_UDP_PORT}")
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     last_gen = -1
     while True:
