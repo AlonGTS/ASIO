@@ -197,11 +197,12 @@ def _restart_reader_live():
 import mavlink_client
 _mav_cfg = _cfg["mavlink"]
 mavlink_client.start_mavproxy(
-    pixhawk_port = _mav_cfg["pixhawk_port"],
-    pixhawk_baud = _mav_cfg["pixhawk_baud"],
-    gcs_ip       = GCS_IP,
-    gcs_port     = _mav_cfg["gcs_port"],
-    local_port   = _mav_cfg["local_port"],
+    pixhawk_port  = _mav_cfg["pixhawk_port"],
+    pixhawk_baud  = _mav_cfg["pixhawk_baud"],
+    gcs_ip        = GCS_IP,
+    gcs_port      = _mav_cfg["gcs_port"],
+    local_port    = _mav_cfg["local_port"],
+    extra_outputs = _mav_cfg.get("extra_outputs", []),
 )
 mavlink_client.connect(
     url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",

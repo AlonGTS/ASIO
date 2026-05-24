@@ -96,10 +96,15 @@ def send_vision_error(pitch_err, yaw_err, is_tracking=False):
 # ---------------------------------------------------------------------------
 
 def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
-                   gcs_ip="192.168.1.100", gcs_port=14550, local_port=14551):
+                   gcs_ip="192.168.1.100", gcs_port=14550, local_port=14551,
+                   extra_outputs=None):
     """
     Launch MAVProxy as a background subprocess.
     Automatically killed when the Python process exits.
+
+    extra_outputs: list of IP strings that each get a dedicated unicast
+                   --out=udpout:<ip>:<gcs_port> added to the MAVProxy command.
+                   Use this for QGC machines that don't receive UDP broadcast.
     """
     global _mavproxy_proc
     cmd = [
@@ -108,8 +113,11 @@ def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
         f"--baud={pixhawk_baud}",
         f"--out=udpout:127.0.0.1:{local_port}",
         f"--out=udpbcast:{gcs_ip}:{gcs_port}",
-        "--daemon",
     ]
+    for ip in (extra_outputs or []):
+        cmd.append(f"--out=udpout:{ip}:{gcs_port}")
+        print(f"[MAVProxy] Extra unicast output → {ip}:{gcs_port}")
+    cmd.append("--daemon")
     print(f"[MAVProxy] Starting: {' '.join(cmd)}")
     _mavproxy_proc = subprocess.Popen(cmd)
     atexit.register(_stop_mavproxy)

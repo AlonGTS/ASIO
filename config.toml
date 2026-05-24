@@ -53,9 +53,12 @@ gcs_ip  = "192.168.10.8"
 [mavlink]
 pixhawk_port  = "/dev/ttyACM0"
 pixhawk_baud  = 115200
-gcs_ip        = "192.168.1.26"    # QGC machine IP; also derived from [network.<interface>].gcs_ip
+gcs_ip        = "192.168.1.26"    # legacy field (kept for reference)
 gcs_port      = 14550
 local_port    = 14551
+# Dedicated unicast outputs — MAVProxy sends a copy to each IP:gcs_port
+# Add every QGC / GCS machine here that needs full telemetry
+extra_outputs = ["192.168.1.31"]
 
 [camera]
 # Safe/default resolutions for IMX708 path
