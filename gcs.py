@@ -42,7 +42,9 @@ import requests
 # NOTE: probesize must be large enough for H.264 stream detection (~4 KB).
 #       32 bytes caused "decode_slice_header" / "first_mb_in_slice overflow" errors.
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "fflags;nobuffer"
+    "fflags;nobuffer+discardcorrupt"  # nobuffer=no queue buildup,
+                                      # discardcorrupt=drop bad H.264 frames
+                                      # silently instead of displaying them
     "|flags;low_delay"
     "|probesize;4096"
     "|analyzeduration;100000"

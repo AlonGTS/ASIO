@@ -410,7 +410,12 @@ def _udp_stream_worker():
         "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", "30",
         "-i", "pipe:0",
         "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-g", "15",          # keyframe every 0.5 s — fast GCS reconnect
+        "-g", "3",           # keyframe every 3 frames (0.1 s) — if a packet is
+                             # lost over WiFi, decoder recovers within 0.1 s
+                             # instead of 0.5 s with the old -g 15
+        "-b:v", "1M",        # cap bitrate — lower bitrate = fewer large UDP
+        "-maxrate", "1M",    # packets = less chance of loss on WiFi
+        "-bufsize", "500k",
         "-f", "mpegts",
         f"udp://{GCS_IP}:{_UDP_PORT}",
     ]
