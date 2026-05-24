@@ -71,6 +71,7 @@ print(f"[GCS] Pi={PI_IP}  video={UDP_PORT}  cmd={CMD_PORT}")
 
 PANEL_W     = 210     # right-side button panel width  (px)
 PANEL_MIN_H = 560     # minimum canvas height so all buttons fit
+DISPLAY_W   = 640     # video is always stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -132,7 +133,10 @@ def nudge(dx, dy):
     set_status(f"Nudge ({dx:+d}, {dy:+d})", log=False)
 
 def select_point(x, y):
-    _post("select_point", x=x, y=y)
+    # Send normalized coords (0-1) so Pi maps correctly regardless of stream resolution
+    nx = round(x / _cur_video_w, 6)
+    ny = round(y / _cur_video_h, 6)
+    _post("select_point", nx=nx, ny=ny)
     set_status(f"Selected ({x}, {y})")
 
 def cycle_main(delta):
@@ -432,10 +436,17 @@ def main():
 
         if not ok or frame is None:
             frame = _waiting_frame(_cur_video_w, _cur_video_h)
+        else:
+            # Stretch to DISPLAY_W regardless of stream resolution
+            # so the window stays the same size even when stream is downscaled
+            fh, fw = frame.shape[:2]
+            if fw != DISPLAY_W:
+                dh = int(fh * DISPLAY_W / fw)
+                frame = cv2.resize(frame, (DISPLAY_W, dh), interpolation=cv2.INTER_LINEAR)
 
         h, w = frame.shape[:2]
 
-        # Rebuild button layout if video width changed
+        # Rebuild button layout if display width changed
         if w != _cur_video_w:
             _cur_video_w = w
             _cur_video_h = h
