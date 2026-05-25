@@ -75,14 +75,17 @@ DISPLAY_W   = 640     # video is always stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
-launched   = False
-moving_tgt = False
-_recording = False
-_writer    = None
+launched      = False
+moving_tgt    = False
+_pi_recording = False   # Pi-side recording state (optimistic: toggled on each command)
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
 _quit      = threading.Event()  # set to break the main loop from any thread
+
+# FPS baseline for performance comparison
+_fps_baseline   = None   # FPS snapshot taken when recording starts
+_fps_before_rec = 0.0    # smoothed FPS just before recording started
 
 # ── Command channel (UDP broadcast → works through AP isolation) ──────────────
 
@@ -147,25 +150,26 @@ def cycle_lores(delta):
     _post("cycle_lores", delta=delta)
     set_status(f"TRACK {'up' if delta > 0 else 'down'}")
 
-def toggle_record(frame_wh=None):
-    global _recording, _writer
-    if _recording:
-        if _writer:
-            _writer.release()
-            _writer = None
-        _recording = False
-        set_status("Recording saved")
+def toggle_pi_record(cur_fps=0.0):
+    """Tell the Pi to start or stop recording. Tracks state optimistically."""
+    global _pi_recording, _fps_baseline, _fps_before_rec
+    if _pi_recording:
+        _post("toggle_record")
+        _pi_recording = False
+        diff = cur_fps - _fps_baseline if _fps_baseline is not None else None
+        if diff is not None:
+            sign  = "+" if diff >= 0 else ""
+            color_hint = "▲" if diff > 0.5 else ("▼" if diff < -0.5 else "≈")
+            set_status(f"Pi REC stopped  |  FPS before {_fps_baseline:.1f} → now {cur_fps:.1f}  ({sign}{diff:.1f}) {color_hint}")
+        else:
+            set_status("Pi REC stopped")
+        _fps_baseline = None
     else:
-        if frame_wh is None:
-            set_status("No video yet — can't start recording")
-            return
-        ts    = time.strftime('%Y%m%d_%H%M%S')
-        fname = f"gcs_{ts}.mp4"
-        w, h  = frame_wh
-        _writer = cv2.VideoWriter(
-            fname, cv2.VideoWriter_fourcc(*'mp4v'), 30, (w, h))
-        _recording = True
-        set_status(f"Recording -> {fname}")
+        _fps_before_rec = cur_fps
+        _fps_baseline   = cur_fps      # snapshot FPS at the moment recording starts
+        _post("toggle_record")
+        _pi_recording = True
+        set_status(f"Pi REC started  (baseline FPS: {cur_fps:.1f})")
 
 
 # ── Button widget ─────────────────────────────────────────────────────────────
@@ -215,6 +219,7 @@ class Button:
 
 _buttons: list[Button] = []
 _cur_video_w = 0    # rebuilt whenever video width changes
+est_fps_ref  = [0.0]  # [0] updated each frame; readable from button lambdas
 
 
 def _build_buttons(vx: int):
@@ -261,11 +266,11 @@ def _build_buttons(vx: int):
     )
     y += 44
 
-    # ── Record ─────────────────────────────────────────────────────────────
+    # ── Pi Record ──────────────────────────────────────────────────────────
     btn(
-        lambda: "Stop REC" if _recording else "Record",
-        36, lambda: toggle_record((_cur_video_w, _cur_video_h)),
-        lambda: (40, 40, 170) if _recording else (35, 120, 35),
+        lambda: "■ Pi REC" if _pi_recording else "● Pi REC",
+        36, lambda: toggle_pi_record(est_fps_ref[0]),
+        lambda: (30, 30, 180) if _pi_recording else (35, 120, 35),
     )
     y += 52
 
@@ -311,8 +316,19 @@ def draw_hud(frame, fps):
     txt(f"FPS {fps:4.1f}",                            (8,   25))
     txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (130, 25), color=mode_col)
     txt("LAUNCHED" if launched else "READY",           (255, 25), color=launch_col)
-    if _recording:
-        txt("REC", (w - 45, 25), color=(80, 80, 255))
+
+    # Pi REC indicator — blinking every second, plus FPS delta from baseline
+    if _pi_recording:
+        # Blink: alternate dot colour each second
+        dot_col = (40, 40, 220) if int(time.time()) % 2 == 0 else (100, 100, 255)
+        cv2.circle(frame, (w - 16, 18), 7, dot_col, -1)
+        if _fps_baseline is not None:
+            delta = fps - _fps_baseline
+            sign  = "+" if delta >= 0 else ""
+            delta_col = (80, 200, 80) if delta > -0.5 else (80, 80, 220)
+            txt(f"Pi REC  ({sign}{delta:.1f})", (w - 155, 25), color=delta_col)
+        else:
+            txt("Pi REC", (w - 80, 25), color=(100, 100, 255))
 
     # Status bar (bottom, fades after 4 s)
     age = time.time() - _status_ts
@@ -401,7 +417,7 @@ class _LiveCapture:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    global launched, _cur_video_w, _cur_video_h
+    global launched, _cur_video_w, _cur_video_h, est_fps_ref
 
     data     = _get("status")
     launched = data.get("launched", False)
@@ -459,10 +475,9 @@ def main():
         inst     = 1.0 / dt
         est_fps  = FPS_A * est_fps + (1 - FPS_A) * inst if est_fps else inst
 
-        draw_hud(frame, est_fps)
+        est_fps_ref[0] = est_fps   # share live FPS with button lambdas
 
-        if _recording and _writer is not None:
-            _writer.write(frame)
+        draw_hud(frame, est_fps)
 
         # ── Composite canvas: video left + button panel right ──────────────
         canvas_h = max(h, PANEL_MIN_H)
@@ -501,13 +516,11 @@ def main():
         elif k in (ord('z'), ord('Z')): cycle_main(-1)
         elif k in (ord('v'), ord('V')): cycle_lores(+1)
         elif k in (ord('c'), ord('C')): cycle_lores(-1)
-        elif k in (ord('p'), ord('P')): toggle_record((_cur_video_w, _cur_video_h))
+        elif k in (ord('p'), ord('P')): toggle_pi_record(est_fps)
 
         if _quit.is_set():
             break
 
-    if _writer is not None:
-        _writer.release()
     cv2.destroyAllWindows()
     print("[GCS] Bye.")
 

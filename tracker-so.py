@@ -213,6 +213,10 @@ mavlink_client.connect(
 # not just on normal exit / Ctrl-C (which atexit already handles).
 def _shutdown(signum, frame):
     print(f"\n[Tracker] Signal {signum} received — shutting down.")
+    try:
+        _stop_recording()      # finalize any active recording before exit
+    except NameError:
+        pass                   # recording not yet initialised (early signal)
     mavlink_client._stop_mavproxy()
     sys.exit(0)
 
@@ -268,31 +272,96 @@ else:
 def create_gts_tracker(moving: bool):
     return GTSTracker(mode="moving" if moving else "fixed")
 
-# === Video Recording Setup (mode=record) ===
+# === Video Recording Setup (shared by 'record' mode and live toggle) ===
+import queue as _queue_mod
+
 writer = None
 record_queue = None
 record_thread = None
 record_start_time = None
 
+# Dynamic recording state (live-mode toggle)
+_recording      = False
+_rec_writer     = None
+_rec_queue      = None
+_rec_thread     = None
+_rec_start_time = None
+_rec_filename   = None
+_rec_lock       = Lock()
+
 def _record_worker(proc, queue):
+    """Drain frame bytes from *queue* into ffmpeg stdin; None sentinel stops the loop."""
     while True:
         frame_bytes = queue.get()
         if frame_bytes is None:
             break
-        proc.stdin.write(frame_bytes)
-    proc.stdin.close()
+        try:
+            proc.stdin.write(frame_bytes)
+        except BrokenPipeError:
+            print("[REC] ffmpeg pipe closed unexpectedly")
+            break
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
     proc.wait()
 
+def _start_recording():
+    """Start a new recording session (safe to call even if already recording)."""
+    global _recording, _rec_writer, _rec_queue, _rec_thread, _rec_start_time, _rec_filename
+    with _rec_lock:
+        if _recording:
+            print("[REC] Already recording")
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _rec_filename = f"RecordingsMahat/recording_{timestamp}.mp4"
+        w, h = main_size[0], main_size[1]
+        # frag_keyframe+empty_moov → every GOP is a self-contained fragment written
+        # immediately; the file is playable / recoverable even after a hard reboot.
+        _rec_writer = subprocess.Popen([
+            'ffmpeg', '-y',
+            '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', '30',
+            '-i', '-',
+            '-vcodec', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+            _rec_filename
+        ], stdin=subprocess.PIPE)
+        _rec_queue  = _queue_mod.Queue(maxsize=30)
+        _rec_thread = Thread(target=_record_worker, args=(_rec_writer, _rec_queue), daemon=True)
+        _rec_thread.start()
+        _rec_start_time = time.time()
+        _recording = True
+        print(f"[REC] ▶ Started → {_rec_filename}  ({w}x{h})")
+
+def _stop_recording():
+    """Finalize and close the current recording session."""
+    global _recording, _rec_writer, _rec_queue, _rec_thread, _rec_start_time
+    with _rec_lock:
+        if not _recording:
+            return
+        _recording = False
+        if _rec_queue is not None:
+            _rec_queue.put(None)          # signal worker to stop
+        if _rec_thread is not None:
+            _rec_thread.join(timeout=8.0) # wait for ffmpeg to finalize
+        dur = time.time() - _rec_start_time if _rec_start_time else 0
+        print(f"[REC] ■ Stopped after {dur:.1f}s → {_rec_filename}")
+        _rec_writer = None
+        _rec_queue  = None
+        _rec_thread = None
+        _rec_start_time = None
+
 if args.mode == 'record':
-    import queue as _queue_mod
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     video_filename = f"RecordingsMahat/recording_{timestamp}.mp4"
+    w, h = main_size[0], main_size[1]
     writer = subprocess.Popen([
         'ffmpeg', '-y',
         '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', '640x480', '-pix_fmt', 'bgr24', '-r', '60',
+        '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', '30',
         '-i', '-',
-        '-vcodec', 'libx264', '-preset', 'ultrafast',
+        '-vcodec', 'libx264', '-preset', 'ultrafast', '-crf', '28',
         '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
         video_filename
     ], stdin=subprocess.PIPE)
@@ -300,7 +369,7 @@ if args.mode == 'record':
     record_thread = Thread(target=_record_worker, args=(writer, record_queue), daemon=True)
     record_thread.start()
     record_start_time = time.time()
-    print(f"[INFO] Recording to {video_filename}")
+    print(f"[INFO] Recording to {video_filename}  ({w}x{h})")
 
 # === Local debug window (optional) ===
 if SHOW_LOCAL:
@@ -392,11 +461,15 @@ def _cycle_lores(delta):
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
 
 import flask_app
-app = flask_app.create_app(state, create_gts_tracker,
-                           cycle_main_fn=_cycle_main if args.mode == 'live' else None,
-                           cycle_lores_fn=_cycle_lores,
-                           launch_fn=lambda v=None: mavlink_client.set_launch(v if v is not None else not mavlink_client._launched),
-                           get_launch_state_fn=lambda: mavlink_client._launched)
+app = flask_app.create_app(
+    state, create_gts_tracker,
+    cycle_main_fn      = _cycle_main if args.mode == 'live' else None,
+    cycle_lores_fn     = _cycle_lores,
+    launch_fn          = lambda v=None: mavlink_client.set_launch(v if v is not None else not mavlink_client._launched),
+    get_launch_state_fn= lambda: mavlink_client._launched,
+    toggle_record_fn   = lambda: _stop_recording() if _recording else _start_recording(),
+    get_record_state_fn= lambda: _recording,
+)
 
 # === Launch Flask in separate thread ===
 print(f"[Flask]  http://{BIND_IP}:5000")
@@ -618,13 +691,18 @@ while True:
     is_tracking = (_mav_x != 100.0)
     mavlink_client.send_vision_error(_mav_x, _mav_y, is_tracking)
 
-    # Write to file if in record mode
+    # Write to file if in record mode (timed) or live toggle recording
     if args.mode == 'record' and record_queue is not None:
         if not record_queue.full():
             record_queue.put_nowait(frame.tobytes())
         if args.duration and (time.time() - record_start_time >= args.duration):
             print("[INFO] Reached recording duration, exiting.")
             break
+
+    if _recording and _rec_queue is not None:
+        if not _rec_queue.full():
+            _rec_queue.put_nowait(frame.tobytes())
+        # else: queue full → skip frame rather than block the main loop
 
     # FPS estimate
     now = time.time()
@@ -640,6 +718,16 @@ while True:
     overlay2 = f"MAIN {mw}x{mh} | TRACK {lw}x{lh} | {int(_est_fps)} FPS"
     cv2.putText(frame, overlay1, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
     cv2.putText(frame, overlay2, (8, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+
+    # REC indicator — blinking dot + elapsed time (only when live-toggle recording is active)
+    if _recording and _rec_start_time is not None:
+        rec_elapsed = now - _rec_start_time
+        rec_text = f"REC {int(rec_elapsed//60):02d}:{int(rec_elapsed%60):02d}"
+        # Blink: show dot every other second
+        if int(now) % 2 == 0:
+            cv2.circle(frame, (mw - 20, 20), 8, (0, 0, 255), -1)
+        cv2.putText(frame, rec_text, (mw - 130, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
 
     # Playback UI sync
     if SHOW_LOCAL and args.mode == 'playback' and _trackbar_ready and playback_duration_ms > 0:
@@ -672,6 +760,11 @@ while True:
         elif key == ord('z'): _cycle_main(-1)
         elif key == ord('v'): _cycle_lores(+1)
         elif key == ord('c'): _cycle_lores(-1)
+        elif key == ord('o'):
+            if _recording:
+                _stop_recording()
+            else:
+                _start_recording()
     elif args.mode == 'playback':
         if key == ord('f'):
             with playback_ctrl_lock: playback_rate = min(playback_rate * 2.0, 8.0)
@@ -708,3 +801,5 @@ if args.mode != 'playback' and picam2 is not None:
 if args.mode == 'record' and record_queue is not None:
     record_queue.put(None)
     record_thread.join()
+# Finalize any live-toggle recording that was still active when we exited
+_stop_recording()

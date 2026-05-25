@@ -12,7 +12,7 @@ from flask import Flask, request
 from flask_cors import CORS
 
 
-def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None):
+def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None):
     """
     Build and return the Flask app with all control routes bound to `state`.
     state is a SimpleNamespace with: command_from_remote, bbox, tracking,
@@ -158,12 +158,25 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
         launch_fn(state_val == '1' if state_val is not None else None)
         return "OK", 200
 
+    @app.route('/toggle_record', methods=['POST'])
+    def toggle_record():
+        """Toggle Pi-side recording on or off."""
+        if toggle_record_fn is None:
+            return "Not available in this mode", 400
+        try:
+            toggle_record_fn()
+            recording = get_record_state_fn() if get_record_state_fn else None
+            return {"recording": recording}, 200
+        except Exception as e:
+            return f"Error: {e}", 400
+
     @app.route('/status', methods=['GET'])
     def status():
         """Return current server-side state for UI initialization."""
         from flask import jsonify
-        launched = get_launch_state_fn() if get_launch_state_fn else False
-        return jsonify({"launched": launched})
+        launched  = get_launch_state_fn()  if get_launch_state_fn  else False
+        recording = get_record_state_fn()  if get_record_state_fn  else False
+        return jsonify({"launched": launched, "recording": recording})
 
     @app.route('/cycle_lores', methods=['POST'])
     def cycle_lores():
