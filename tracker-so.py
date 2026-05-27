@@ -53,11 +53,13 @@ class TrackingQualityMonitor:
     score ≥ SCORE_GOOD        → green  box, MAVLink control enabled
     score ≥ SCORE_UNCERTAIN   → orange box, MAVLink still enabled (visible warn)
     score <  SCORE_UNCERTAIN  → red    box, MAVLink suppressed
+    score <  SCORE_UNCERTAIN for BAD_FRAMES_LIMIT consecutive frames → tracking broken
     """
 
-    SCORE_GOOD      = 0.60
-    SCORE_UNCERTAIN = 0.40
-    _TMPL_SIZE      = (64, 64)   # canonical patch size for NCC
+    SCORE_GOOD        = 0.60
+    SCORE_UNCERTAIN   = 0.40
+    BAD_FRAMES_LIMIT  = 1      # 1 bad frame breaks tracking immediately
+    _TMPL_SIZE        = (64, 64)   # canonical patch size for NCC
 
     def __init__(self):
         self._prev_patch = None    # grayscale 64×64 from previous frame
@@ -65,6 +67,7 @@ class TrackingQualityMonitor:
         self._prev_cy    = None
         self._prev_area  = None
         self.score       = 1.0
+        self.bad_frames  = 0      # consecutive frames below SCORE_UNCERTAIN
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -142,6 +145,7 @@ class TrackingQualityMonitor:
         self._prev_cx    = self._prev_cy = None
         self._prev_area  = None
         self.score       = 1.0
+        self.bad_frames  = 0
 
     # ── helpers ───────────────────────────────────────────────────────────
 
@@ -197,6 +201,8 @@ state.lores_size = lores_size
 playback_rate = 1.0
 seek_to_msec = None
 playback_ctrl_lock = Lock()
+_playback_ended = False   # set by reader thread when video finishes (non-loop mode)
+_current_video_path = None  # last opened file — used for restart
 
 # Playback telemetry (reader updates; main loop reads to sync trackbars)
 playback_duration_ms = 0.0
@@ -255,7 +261,8 @@ def _reader_playback(path, loop=False):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
             else:
-                print("[INFO] Playback ended")
+                print("[INFO] Playback ended — press R to restart, O to open new file")
+                _playback_ended = True
                 break
 
         playback_pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
@@ -272,6 +279,35 @@ def _reader_playback(path, loop=False):
             time.sleep(base_delay * 0.25)
         else:
             time.sleep(base_delay / rate)
+
+def _restart_playback(new_path=None):
+    """
+    Stop the current playback reader thread and start a fresh one.
+    Pass new_path to switch to a different file; omit to replay the current one.
+    Resets tracking state and playback-ended flag.
+    """
+    global _reader_thread, _playback_ended, _current_video_path, seek_to_msec
+    # Stop the old reader
+    _stop_reader.set()
+    if _reader_thread and _reader_thread.is_alive():
+        _reader_thread.join(timeout=2.0)
+    _stop_reader.clear()
+
+    path = new_path or _current_video_path
+    if not path:
+        return
+    _current_video_path = path
+    _playback_ended = False
+    seek_to_msec = None
+
+    # Clear tracking so operator re-selects on the new/rewound video
+    state.tracking = False
+    state.tracker  = None
+    state.bbox     = None
+
+    _reader_thread = Thread(target=_reader_playback, args=(path, args.loop), daemon=True)
+    _reader_thread.start()
+    print(f"[PLAYBACK] Restarted: {path}")
 
 def _init_live_camera():
     """(Re)create and start PiCamera2 with the current main_size."""
@@ -387,6 +423,7 @@ if args.mode == 'playback':
             print("[ERROR] No file selected. Exiting...")
             exit(1)
     print(f"[INFO] Playback mode from file: {args.video} (loop={args.loop})")
+    _current_video_path = args.video
     _stop_reader.clear()
     _reader_thread = Thread(target=_reader_playback, args=(args.video, args.loop), daemon=True)
     _reader_thread.start()
@@ -509,6 +546,7 @@ def _on_seek_trackbar(pos):
     OpenCV trackbar callback for playback seek.
     Converts the trackbar position (0–1000) to a millisecond timestamp
     and stores it in seek_to_msec for the reader thread to act on.
+    If playback has ended, automatically restarts the reader at the new position.
     Suppressed while the main loop is updating the trackbar programmatically.
     """
     global seek_to_msec, _suppress_trackbar_cb
@@ -517,6 +555,8 @@ def _on_seek_trackbar(pos):
     frac = pos / 1000.0
     with playback_ctrl_lock:
         seek_to_msec = int(frac * playback_duration_ms)
+    if _playback_ended:
+        _restart_playback()   # reader is gone — restart it; it will seek on first iteration
 
 def _on_rate_trackbar(val):
     """
@@ -828,23 +868,43 @@ while True:
                 # Normalize to -1..1: 0 = centred, ±1 = target at frame edge
                 pitch_norm = -norm_dy / (_VFOV_RAD / 2)
                 yaw_norm   =  norm_dx / (_HFOV_RAD / 2)
-                # Only drive the drone when quality is sufficient
-                if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
-                    _mav_x, _mav_y = pitch_norm, yaw_norm
-
-                # Box color encodes quality level
-                if tq >= TrackingQualityMonitor.SCORE_GOOD:
-                    box_color = (0, 200, 0)      # green  — good
-                elif tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
-                    box_color = (0, 140, 255)    # orange — uncertain, still sending
+                # Count consecutive bad frames — break tracking if drift sustained
+                if tq < TrackingQualityMonitor.SCORE_UNCERTAIN:
+                    _tq_monitor.bad_frames += 1
                 else:
-                    box_color = (0, 0, 255)      # red    — unstable, MAVLink suppressed
+                    _tq_monitor.bad_frames = 0   # good frame resets the counter
 
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
-                cv2.line(frame, (cx - 10, cy), (cx + 10, cy), box_color, 1)
-                cv2.line(frame, (cx, cy - 10), (cx, cy + 10), box_color, 1)
-                cv2.putText(frame, f"TQ:{int(tq * 100)}%", (x, max(14, y - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2, cv2.LINE_AA)
+                if _tq_monitor.bad_frames >= TrackingQualityMonitor.BAD_FRAMES_LIMIT:
+                    print(f"[TQ]   Drift detected ({_tq_monitor.bad_frames} bad frames, "
+                          f"score={tq:.2f}) — tracking broken, re-select target")
+                    state.tracking = False
+                    state.tracker  = None
+                    _tq_monitor.reset()
+                    # Skip the rest of the draw block — show lost message instead
+                    cv2.putText(frame, "Drift — re-select target", (10, 140),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                else:
+                    # Only drive the drone when quality is sufficient
+                    if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
+                        _mav_x, _mav_y = pitch_norm, yaw_norm
+
+                    # Box color encodes quality level
+                    if tq >= TrackingQualityMonitor.SCORE_GOOD:
+                        box_color = (0, 200, 0)      # green  — good
+                    elif tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
+                        box_color = (0, 140, 255)    # orange — uncertain, still sending
+                    else:
+                        bad_left  = TrackingQualityMonitor.BAD_FRAMES_LIMIT - _tq_monitor.bad_frames
+                        box_color = (0, 0, 255)      # red    — unstable, counting down
+
+                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
+                    cv2.line(frame, (cx - 10, cy), (cx + 10, cy), box_color, 1)
+                    cv2.line(frame, (cx, cy - 10), (cx, cy + 10), box_color, 1)
+                    label = f"TQ:{int(tq * 100)}%"
+                    if _tq_monitor.bad_frames > 0:
+                        label += f" ({_tq_monitor.bad_frames}/{TrackingQualityMonitor.BAD_FRAMES_LIMIT})"
+                    cv2.putText(frame, label, (x, max(14, y - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2, cv2.LINE_AA)
             else:
                 _tq_monitor.reset()
                 cv2.putText(frame, "Tracking lost", (10, 140),
@@ -931,7 +991,25 @@ while True:
             else:
                 _start_recording()
     elif args.mode == 'playback':
-        if key == ord('f'):
+        # "Ended" overlay — shown on top of the frozen last frame
+        if _playback_ended:
+            cv2.putText(frame, "Playback ended", (10, mh // 2 - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, "R=restart  O=open new file", (10, mh // 2 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2, cv2.LINE_AA)
+            if SHOW_LOCAL:
+                cv2.imshow("Tracker", frame)
+
+        if key == ord('r') and _playback_ended:
+            _restart_playback()                      # replay current file from start
+        elif key == ord('o'):
+            new_path = filedialog.askopenfilename(
+                title="Select video file",
+                filetypes=[("Video files", "*.avi *.mp4 *.mov *.mkv"), ("All files", "*.*")]
+            )
+            if new_path:
+                _restart_playback(new_path)          # switch to new file
+        elif key == ord('f'):
             with playback_ctrl_lock: playback_rate = min(playback_rate * 2.0, 8.0)
             print(f"[PLAYBACK] Speed {playback_rate:.1f}×")
         elif key == ord('s'):
@@ -941,15 +1019,12 @@ while True:
             with playback_ctrl_lock: playback_rate = 1.0
             print("[PLAYBACK] Speed reset to 1×")
         elif key == ord('j'):
-            if cap is not None:
-                pos = cap.get(cv2.CAP_PROP_POS_MSEC)
-                with playback_ctrl_lock: seek_to_msec = max(0, pos - 5000)
-                print(f"[PLAYBACK] Seek −5 s")
-        elif key == ord('l'):
-            if cap is not None:
-                pos = cap.get(cv2.CAP_PROP_POS_MSEC)
-                with playback_ctrl_lock: seek_to_msec = pos + 5000
-                print(f"[PLAYBACK] Seek +5 s")
+            with playback_ctrl_lock: seek_to_msec = max(0, playback_pos_ms - 5000)
+            if _playback_ended: _restart_playback()  # slider seek also restarts if ended
+            print(f"[PLAYBACK] Seek −5 s")
+        elif key == ord('k'):
+            with playback_ctrl_lock: seek_to_msec = playback_pos_ms + 5000
+            print(f"[PLAYBACK] Seek +5 s")
 
 # === Cleanup ===
 cv2.destroyAllWindows()
