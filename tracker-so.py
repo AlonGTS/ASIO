@@ -40,8 +40,8 @@ LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 _net_iface = _cfg["network"]["interface"]
 _net       = _cfg["network"][_net_iface]
 BIND_IP    = _net["bind_ip"]
-GCS_IP     = _net["gcs_ip"]
-print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs={GCS_IP}")
+GCS_IP     = None   # learned dynamically when GCS announces itself over the command channel
+print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs=<waiting for GCS hello>")
 
 # Shared frame buffer for WebRTC
 frame_buffer = webrtc_server.FrameBuffer()
@@ -508,18 +508,21 @@ def _udp_stream_worker():
     last_gen  = -1
     _t0       = time.time()
     _sent     = 0
-    print(f"[UDP]  streaming JPEG → udp://{GCS_IP}:{_UDP_PORT}  quality={_JPEG_QUALITY}")
+    print(f"[UDP]  stream worker ready — waiting for GCS to announce on :{_CMD_PORT}")
     while True:
         frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
         if frame is None:
             continue
         last_gen = gen
 
+        if GCS_IP is None:
+            continue   # no GCS yet — discard frame silently
+
         # Log actual send rate every 5 s
         _sent += 1
         _now = time.time()
         if _now - _t0 >= 5.0:
-            print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)")
+            print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)  → {GCS_IP}")
             _t0, _sent = _now, 0
 
         # Scale down wide frames so the JPEG fits in one UDP datagram
@@ -535,7 +538,7 @@ def _udp_stream_worker():
         if len(data) > _UDP_MAX:
             continue   # frame too large even after resize — skip rather than corrupt
         try:
-            _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))   # unicast to known GCS IP
+            _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))
         except Exception as e:
             print(f"[UDP]  send error: {e}")
 
@@ -555,14 +558,21 @@ _cmd_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
 _cmd_sock.bind(('', _CMD_PORT))
 
 def _udp_cmd_listener():
-    print(f"[CMD]  listening for broadcast commands on UDP:{_CMD_PORT}")
+    global GCS_IP
+    print(f"[CMD]  listening for commands on UDP:{_CMD_PORT}")
     while True:
         try:
             data, addr = _cmd_sock.recvfrom(4096)
+
+            # Learn / update GCS IP dynamically from sender address
+            if GCS_IP != addr[0]:
+                print(f"[NET]  GCS IP {'learned' if GCS_IP is None else 'updated'}: {addr[0]}  (was {GCS_IP})")
+                GCS_IP = addr[0]
+
             msg = _json.loads(data.decode())
             ep  = msg.pop("endpoint", None)
-            print(f"[CMD]  ← {addr[0]}  {ep}  {msg}")
-            if ep:
+            if ep:   # "hello" heartbeats have no endpoint — skip the Flask call
+                print(f"[CMD]  ← {addr[0]}  {ep}  {msg}")
                 _req.post(f"http://127.0.0.1:5000/{ep}", data=msg, timeout=1)
         except Exception as e:
             if "timed out" not in str(e).lower():

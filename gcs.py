@@ -67,6 +67,23 @@ _cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 print(f"[GCS] Pi={PI_IP}  video={UDP_PORT}  cmd={CMD_PORT}")
 
+# ── GCS discovery heartbeat ───────────────────────────────────────────────────
+# Send a small "hello" to the Pi every 3 s so the Pi learns our IP dynamically.
+# The Pi's command listener reads the sender address from every incoming packet
+# and updates its GCS_IP — no hardcoded IP needed on either side.
+
+def _heartbeat_sender():
+    import time
+    msg = _json.dumps({}).encode()   # empty payload — no endpoint → Pi ignores body
+    while True:
+        try:
+            _cmd_sock.sendto(msg, (PI_IP, CMD_PORT))
+        except Exception:
+            pass
+        time.sleep(3)
+
+threading.Thread(target=_heartbeat_sender, daemon=True).start()
+
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
