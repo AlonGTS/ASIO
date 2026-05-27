@@ -508,7 +508,7 @@ def _udp_stream_worker():
     last_gen  = -1
     _t0       = time.time()
     _sent     = 0
-    print(f"[UDP]  stream worker ready — waiting for GCS to announce on :{_CMD_PORT}")
+    print(f"[UDP]  stream worker ready — waiting for GCS to announce")
     while True:
         frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
         if frame is None:
