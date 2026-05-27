@@ -27,6 +27,134 @@ from tkinter import filedialog, simpledialog
 import webrtc_server
 from gts_tracker import GTSTracker
 
+
+# ── Tracking Quality Monitor ─────────────────────────────────────────────────
+class TrackingQualityMonitor:
+    """
+    Per-frame confidence score [0.0–1.0] computed on top of CSRT.
+
+    CSRT's internal PSR is not exposed via OpenCV's Python bindings; this
+    class approximates it from three observable signals:
+
+      • Frame-to-frame NCC (55 %)  — compares the current ROI patch to the
+        patch from the PREVIOUS frame.  Between consecutive frames the scale
+        change is tiny even when the drone is approaching the target, so NCC
+        stays high on correct tracking and drops sharply on a drift event.
+        (Comparing to the *initial* template would fail as the drone closes in.)
+
+      • Velocity gate        (30 %)  — penalises bbox-centre jumps > 15 % of
+        the frame's larger dimension in a single step (teleportation = drift).
+
+      • Size-change gate     (15 %)  — penalises sudden bbox area changes
+        larger than 4× in one frame (unphysical growth/shrink).
+
+    Thresholds
+    ----------
+    score ≥ SCORE_GOOD        → green  box, MAVLink control enabled
+    score ≥ SCORE_UNCERTAIN   → orange box, MAVLink still enabled (visible warn)
+    score <  SCORE_UNCERTAIN  → red    box, MAVLink suppressed
+    """
+
+    SCORE_GOOD      = 0.60
+    SCORE_UNCERTAIN = 0.40
+    _TMPL_SIZE      = (64, 64)   # canonical patch size for NCC
+
+    def __init__(self):
+        self._prev_patch = None    # grayscale 64×64 from previous frame
+        self._prev_cx    = None
+        self._prev_cy    = None
+        self._prev_area  = None
+        self.score       = 1.0
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def init(self, frame: np.ndarray, bbox: tuple):
+        """
+        Capture the first appearance patch and reset history.
+        Call this on the first successful update after a new tracker is
+        initialised (pass lores frame + lores bbox).
+        """
+        x, y, w, h = (int(v) for v in bbox)
+        patch = self._safe_crop(frame, x, y, w, h)
+        if patch is not None and patch.size > 0:
+            gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+            self._prev_patch = cv2.resize(gray, self._TMPL_SIZE)
+        else:
+            self._prev_patch = None
+        self._prev_cx   = x + w // 2
+        self._prev_cy   = y + h // 2
+        self._prev_area = max(1, w * h)
+        self.score      = 1.0
+
+    def update(self, frame: np.ndarray, bbox: tuple) -> float:
+        """
+        Compute confidence for this frame after a successful CSRT update.
+        frame and bbox must be in lores coordinate space.
+        Returns score ∈ [0.0, 1.0] and advances internal state.
+        """
+        if bbox is None:
+            self.score = 0.0
+            return self.score
+
+        xl, yl, wl, hl = (int(v) for v in bbox)
+        cx, cy         = xl + wl // 2, yl + hl // 2
+        curr_area      = max(1, wl * hl)
+
+        # ── Frame-to-frame NCC ────────────────────────────────────────────
+        patch = self._safe_crop(frame, xl, yl, wl, hl)
+        if patch is not None and patch.size > 0:
+            gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+            curr = cv2.resize(gray, self._TMPL_SIZE)
+            if self._prev_patch is not None:
+                res       = cv2.matchTemplate(curr, self._prev_patch, cv2.TM_CCOEFF_NORMED)
+                ncc_score = float(np.clip(res[0, 0], 0.0, 1.0))
+            else:
+                ncc_score = 0.5          # no previous patch yet → neutral
+            self._prev_patch = curr      # roll forward
+        else:
+            ncc_score = 0.5              # patch out of bounds → neutral
+
+        # ── Velocity gate ─────────────────────────────────────────────────
+        if self._prev_cx is not None:
+            fh, fw    = frame.shape[:2]
+            jump      = math.hypot(cx - self._prev_cx, cy - self._prev_cy)
+            max_jump  = max(fw, fh) * 0.15
+            vel_score = float(np.clip(1.0 - jump / max_jump, 0.0, 1.0))
+        else:
+            vel_score = 1.0
+        self._prev_cx, self._prev_cy = cx, cy
+
+        # ── Size-change gate ──────────────────────────────────────────────
+        if self._prev_area is not None:
+            ratio      = max(curr_area, self._prev_area) / min(curr_area, self._prev_area)
+            # ratio 1.0 → score 1.0 | ratio ≥ 4.0 → score 0.0 (linear)
+            size_score = float(np.clip(1.0 - (ratio - 1.0) / 3.0, 0.0, 1.0))
+        else:
+            size_score = 1.0
+        self._prev_area = curr_area
+
+        # ── Combined score ────────────────────────────────────────────────
+        self.score = 0.55 * ncc_score + 0.30 * vel_score + 0.15 * size_score
+        return self.score
+
+    def reset(self):
+        self._prev_patch = None
+        self._prev_cx    = self._prev_cy = None
+        self._prev_area  = None
+        self.score       = 1.0
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _safe_crop(frame, x, y, w, h):
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(fw, x + w), min(fh, y + h)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return frame[y1:y2, x1:x2]
+
+
 # Load configuration
 with open(_HERE / "config.toml", "rb") as _f:
     _cfg = tomllib.load(_f)
@@ -585,6 +713,11 @@ Thread(target=_udp_cmd_listener, daemon=True).start()
 _cached_dims = (0, 0, 0, 0)   # (mw, mh, lw, lh)
 sx_m2l = sy_m2l = sx_l2m = sy_l2m = 1.0
 
+# Tracking quality monitor (state persists across frames)
+_tq_monitor      = TrackingQualityMonitor()
+_last_tracker_id = None   # detect tracker replacement from ANY init path
+_tq_needs_init   = True   # capture first patch on next successful update
+
 while True:
     # Wait for a new current_frame from reader
     with frame_ready:
@@ -642,6 +775,12 @@ while True:
     # Tracking on LORES (lores_frame computed above, before dims check)
     _mav_x, _mav_y = 100.0, 100.0  # sentinel: not tracking
 
+    # Detect tracker replacement from ANY init path (flask, mouse, resolution change)
+    if state.tracker is not None and id(state.tracker) != _last_tracker_id:
+        _last_tracker_id = id(state.tracker)
+        _tq_needs_init   = True
+        _tq_monitor.reset()
+
     if state.tracking and state.tracker is not None:
         try:
             success, bbox_lo = state.tracker.update(lores_frame)
@@ -665,9 +804,20 @@ while True:
                     wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
                     state.tracker = create_gts_tracker(state.bMoovingTgt)
                     state.tracker.init(lores_frame, (xb, yb, wb, hb))
+                    _last_tracker_id = id(state.tracker)
+                    _tq_needs_init   = True      # new tracker → re-capture patch
+                    _tq_monitor.reset()
                     print(f"[INFO] BB limited to {bw}x{bh} (max {MAX_BB_WIDTH}x{MAX_BB_HEIGHT})")
 
                 state.bbox = (x, y, bw, bh)
+
+                # Tracking quality: init on first frame, update on all subsequent ones
+                if _tq_needs_init:
+                    _tq_monitor.init(lores_frame, (xl, yl, wl, hl))
+                    _tq_needs_init = False
+                else:
+                    _tq_monitor.update(lores_frame, (xl, yl, wl, hl))
+                tq = _tq_monitor.score
 
                 # Center offsets for attitude mapping (MAIN coords)
                 dx = cx - mw // 2
@@ -678,20 +828,25 @@ while True:
                 # Normalize to -1..1: 0 = centred, ±1 = target at frame edge
                 pitch_norm = -norm_dy / (_VFOV_RAD / 2)
                 yaw_norm   =  norm_dx / (_HFOV_RAD / 2)
-                _mav_x, _mav_y = pitch_norm, yaw_norm
+                # Only drive the drone when quality is sufficient
+                if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
+                    _mav_x, _mav_y = pitch_norm, yaw_norm
 
-                # Box visuals
-                if state.bMoovingTgt:
-                    box_color = (0, 0, 255)
-                    cross_color = (0, 0, 255)
+                # Box color encodes quality level
+                if tq >= TrackingQualityMonitor.SCORE_GOOD:
+                    box_color = (0, 200, 0)      # green  — good
+                elif tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
+                    box_color = (0, 140, 255)    # orange — uncertain, still sending
                 else:
-                    box_color = (255, 0, 0)
-                    cross_color = (255, 0, 0)
+                    box_color = (0, 0, 255)      # red    — unstable, MAVLink suppressed
 
                 cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
-                cv2.line(frame, (cx - 10, cy), (cx + 10, cy), cross_color, 1)
-                cv2.line(frame, (cx, cy - 10), (cx, cy + 10), cross_color, 1)
+                cv2.line(frame, (cx - 10, cy), (cx + 10, cy), box_color, 1)
+                cv2.line(frame, (cx, cy - 10), (cx, cy + 10), box_color, 1)
+                cv2.putText(frame, f"TQ:{int(tq * 100)}%", (x, max(14, y - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2, cv2.LINE_AA)
             else:
+                _tq_monitor.reset()
                 cv2.putText(frame, "Tracking lost", (10, 140),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         except Exception as e:
