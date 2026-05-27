@@ -1,5 +1,5 @@
 [display]
-show_local = false  # true only when debugging with a monitor
+show_local = true   # true for playback/debug with monitor, false for headless flight
 
 [tracking]
 max_bb_width = 120
