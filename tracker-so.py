@@ -169,9 +169,10 @@ MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
 MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 
-_net_iface = _cfg["network"]["interface"]
-_net       = _cfg["network"][_net_iface]
-BIND_IP    = _net["bind_ip"]
+_net_iface  = _cfg["network"]["interface"]
+_net        = _cfg["network"][_net_iface]
+BIND_IP     = _net["bind_ip"]
+_VIDEO_MODE = _cfg["network"].get("video_mode", "jpeg_udp")
 GCS_IP     = None   # learned dynamically when GCS announces itself over the command channel
 print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs=<waiting for GCS hello>")
 
@@ -363,7 +364,6 @@ _mav_cfg = _cfg["mavlink"]
 mavlink_client.start_mavproxy(
     pixhawk_port  = _mav_cfg["pixhawk_port"],
     pixhawk_baud  = _mav_cfg["pixhawk_baud"],
-    gcs_ip        = GCS_IP,
     gcs_port      = _mav_cfg["gcs_port"],
     local_port    = _mav_cfg["local_port"],
     extra_outputs = _mav_cfg.get("extra_outputs", []),
@@ -645,73 +645,72 @@ flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded
 flask_thread.daemon = True
 flask_thread.start()
 
-# === WebRTC server (background thread) ===
-print(f"[WebRTC] http://{BIND_IP}:8080")
-webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), kwargs={"host": BIND_IP}, daemon=True)
-webrtc_thread.start()
+# === Video stream (mode selected by config.toml video_mode) ===
 
-# === UDP video stream for Python GCS ===
-# Encodes each frame as JPEG in-process (OpenCV) and sends it over a raw
-# broadcast UDP socket.  No FFmpeg subprocess → no pipe overhead → no extra
-# CPU load competing with the tracker.
-#
-# Max JPEG size at 640×480 quality-60 is ~30-50 KB, well under the 65507-byte
-# UDP payload limit.  Larger frames are scaled down to ≤640 px wide first.
-#
-# GCS receives with gcs.py (raw socket + cv2.imdecode).
+import socket as _socket   # needed by command channel regardless of video_mode
 
-import socket as _socket
+if _VIDEO_MODE == "webrtc":
+    _webrtc_kbps = _cfg["network"].get("webrtc_bitrate_kbps", 0)
+    print(f"[WebRTC] http://{BIND_IP}:8080  bitrate={'unconstrained' if _webrtc_kbps == 0 else str(_webrtc_kbps)+'kbps'}")
+    webrtc_thread = Thread(
+        target=webrtc_server.start,
+        args=(frame_buffer,),
+        kwargs={"host": BIND_IP, "target_bitrate_kbps": _webrtc_kbps},
+        daemon=True,
+    )
+    webrtc_thread.start()
 
-_UDP_PORT      = _cfg["network"].get("gcs_udp_port", 5600)
-_JPEG_QUALITY  = _cfg["network"].get("gcs_jpeg_quality", 40)
-_STREAM_WIDTH  = _cfg["network"].get("gcs_stream_width", 480)
+elif _VIDEO_MODE == "jpeg_udp":
+    _UDP_PORT     = _cfg["network"].get("gcs_udp_port", 5600)
+    _JPEG_QUALITY = _cfg["network"].get("gcs_jpeg_quality", 40)
+    _STREAM_WIDTH = _cfg["network"].get("gcs_stream_width", 480)
 
-_udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-_udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)  # 1 MB send buffer
+    _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)
 
-_JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
-_UDP_MAX     = 65400   # stay comfortably under 65507-byte UDP limit
+    _JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
+    _UDP_MAX     = 65400
 
-def _udp_stream_worker():
-    last_gen  = -1
-    _t0       = time.time()
-    _sent     = 0
-    print(f"[UDP]  stream worker ready — waiting for GCS to announce")
-    while True:
-        frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
-        if frame is None:
-            continue
-        last_gen = gen
+    def _udp_stream_worker():
+        last_gen  = -1
+        _t0       = time.time()
+        _sent     = 0
+        print(f"[UDP]  stream worker ready — waiting for GCS to announce")
+        while True:
+            frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
+            if frame is None:
+                continue
+            last_gen = gen
 
-        if GCS_IP is None:
-            continue   # no GCS yet — discard frame silently
+            if GCS_IP is None:
+                continue
 
-        # Log actual send rate every 5 s
-        _sent += 1
-        _now = time.time()
-        if _now - _t0 >= 5.0:
-            print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)  → {GCS_IP}")
-            _t0, _sent = _now, 0
+            _sent += 1
+            _now = time.time()
+            if _now - _t0 >= 5.0:
+                print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)  → {GCS_IP}")
+                _t0, _sent = _now, 0
 
-        # Scale down wide frames so the JPEG fits in one UDP datagram
-        h_f, w_f = frame.shape[:2]
-        if w_f > _STREAM_WIDTH:
-            scale = _STREAM_WIDTH / w_f
-            frame = cv2.resize(frame, (_STREAM_WIDTH, int(h_f * scale)), interpolation=cv2.INTER_LINEAR)
+            h_f, w_f = frame.shape[:2]
+            if w_f > _STREAM_WIDTH:
+                scale = _STREAM_WIDTH / w_f
+                frame = cv2.resize(frame, (_STREAM_WIDTH, int(h_f * scale)), interpolation=cv2.INTER_LINEAR)
 
-        ok, buf = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
-        if not ok:
-            continue
-        data = buf.tobytes()
-        if len(data) > _UDP_MAX:
-            continue   # frame too large even after resize — skip rather than corrupt
-        try:
-            _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))
-        except Exception as e:
-            print(f"[UDP]  send error: {e}")
+            ok, buf = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
+            if not ok:
+                continue
+            data = buf.tobytes()
+            if len(data) > _UDP_MAX:
+                continue
+            try:
+                _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))
+            except Exception as e:
+                print(f"[UDP]  send error: {e}")
 
-udp_thread = Thread(target=_udp_stream_worker, daemon=True)
-udp_thread.start()
+    Thread(target=_udp_stream_worker, daemon=True).start()
+
+else:
+    print(f"[WARN] Unknown video_mode '{_VIDEO_MODE}' in config.toml — no video stream started")
 
 # === UDP command channel (broadcast-based — works through AP isolation) ===
 # Mac sends JSON command datagrams to the subnet broadcast address.

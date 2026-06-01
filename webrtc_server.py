@@ -347,12 +347,15 @@ WEBRTC_HTML = """
         if (e.key === 'c' || e.key === 'C') cycleLores(-1);
       });
 
+      // Bitrate limit in bps (0 = unconstrained); injected by Python server
+      const TARGET_BITRATE_BPS = __TARGET_BITRATE_BPS__;
+
       // WebRTC handshake with auto-start + reconnect
       let pc = null;
       let reconnecting = false;
       let lastFrameTime = Date.now();
-      let watchdogStarted = false;
-      let connectStartTime = 0;   // set after setRemoteDescription; 0 = not connected
+      let connectStartTime = 0;
+      let _watchdogRunning = false;
 
       function cleanupPeerConnection(){
         if (pc) {
@@ -367,15 +370,41 @@ WEBRTC_HTML = """
       async function reconnectWebRTC(reason){
         if (reconnecting) return;
         reconnecting = true;
-        setStatus('Reconnecting WebRTC: ' + reason);
+        setStatus('Reconnecting: ' + reason);
         console.log('Reconnecting WebRTC:', reason);
-
         cleanupPeerConnection();
         video.srcObject = null;
-
         setTimeout(async () => {
           reconnecting = false;
           await start();
+        }, 500);
+      }
+
+      // Called from ontrack each reconnect — restarts rVFC loop so it is never lost.
+      function _startRVFCLoop(){
+        if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) return;
+        const loop = () => {
+          lastFrameTime = Date.now();
+          if (video.srcObject) video.requestVideoFrameCallback(loop);
+        };
+        video.requestVideoFrameCallback(loop);
+      }
+
+      // Singleton watchdog — started once, runs forever.
+      function _startWatchdog(){
+        if (_watchdogRunning) return;
+        _watchdogRunning = true;
+        if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
+          video.addEventListener('timeupdate', () => { lastFrameTime = Date.now(); });
+        }
+        setInterval(() => {
+          if (!pc || reconnecting) return;
+          const age = Date.now() - lastFrameTime;
+          if (video.srcObject && age > 3000) {
+            reconnectWebRTC('video frozen');
+          } else if (!video.srcObject && connectStartTime && Date.now() - connectStartTime > 5000) {
+            reconnectWebRTC('no track received');
+          }
         }, 1000);
       }
 
@@ -390,7 +419,8 @@ WEBRTC_HTML = """
             video.srcObject = ev.streams[0] ?? new MediaStream([ev.track]);
             video.play().catch(()=>{});
             lastFrameTime = Date.now();
-            setStatus('Streaming\u2026');
+            setStatus('Streaming…');
+            _startRVFCLoop();
           };
 
           pc.onconnectionstatechange = () => {
@@ -410,22 +440,18 @@ WEBRTC_HTML = """
           const offer = await pc.createOffer({ offerToReceiveVideo: true });
           await pc.setLocalDescription(offer);
 
-          // Modern Chrome gathers candidates asynchronously; wait for completion
-          // so the offer SDP has all host candidates before we send it.
+          // Wait for ICE gathering so the offer SDP has all host candidates.
           await new Promise(resolve => {
             if (pc.iceGatheringState === 'complete') { resolve(); return; }
             const h = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', h); resolve(); } };
             pc.addEventListener('icegatheringstatechange', h);
-            setTimeout(resolve, 2000);  // cap at 2 s in case gathering stalls
+            setTimeout(resolve, 2000);
           });
 
           const resp = await fetch('/offer', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({
-              sdp: pc.localDescription.sdp,
-              type: pc.localDescription.type
-            })
+            body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
           });
 
           const answer = await resp.json();
@@ -433,45 +459,25 @@ WEBRTC_HTML = """
           connectStartTime = Date.now();
           setStatus('Connected via WebRTC');
 
-          startFrameWatchdogOnce();
+          // Apply bitrate cap if configured (e.g. for narrow RF links)
+          if (TARGET_BITRATE_BPS > 0) {
+            for (const sender of pc.getSenders()) {
+              if (sender.track?.kind === 'video') {
+                const params = sender.getParameters();
+                if (!params.encodings?.length) params.encodings = [{}];
+                params.encodings[0].maxBitrate = TARGET_BITRATE_BPS;
+                await sender.setParameters(params).catch(()=>{});
+              }
+            }
+          }
+
+          _startWatchdog();
 
         }catch(e){
           setStatus('WebRTC error: ' + e);
           console.log('WebRTC start error:', e);
           reconnectWebRTC('start error');
         }
-      }
-
-      // Frame watchdog — detects frozen video even if WebRTC state still looks alive
-      function startFrameWatchdogOnce(){
-        if (watchdogStarted) return;
-        watchdogStarted = true;
-
-        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
-          const frameLoop = () => {
-            lastFrameTime = Date.now();
-            video.requestVideoFrameCallback(frameLoop);
-          };
-          video.requestVideoFrameCallback(frameLoop);
-        } else {
-          // Fallback for older browsers: timeupdate is less accurate but still useful
-          video.addEventListener('timeupdate', () => {
-            lastFrameTime = Date.now();
-          });
-        }
-
-        setInterval(() => {
-          if (!pc || reconnecting) return;
-
-          const age = Date.now() - lastFrameTime;
-          const hasStream = !!video.srcObject;
-
-          if (hasStream && age > 3000) {
-            reconnectWebRTC('video frozen');
-          } else if (!hasStream && connectStartTime && (Date.now() - connectStartTime > 5000)) {
-            reconnectWebRTC('no track received');
-          }
-        }, 1000);
       }
 
       startBtn.addEventListener('click', start);
@@ -578,15 +584,21 @@ async def _on_shutdown(app):
     await asyncio.gather(*[pc.close() for pc in _pcs])
 
 
-def start(frame_buffer: FrameBuffer, port=8080, host="0.0.0.0"):
+def start(frame_buffer: FrameBuffer, port=8080, host="0.0.0.0", target_bitrate_kbps=0):
     """
     Run the aiohttp/WebRTC server in the calling thread's event loop.
     Call from a daemon Thread so it doesn't block the main loop.
+    target_bitrate_kbps: max video bitrate hint sent to browser (0 = unconstrained).
     """
+    html = WEBRTC_HTML.replace("__TARGET_BITRATE_BPS__", str(target_bitrate_kbps * 1000))
+
+    async def _index_with_bitrate(request):
+        return web.Response(text=html, content_type="text/html")
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = web.Application()
     app.on_shutdown.append(_on_shutdown)
-    app.router.add_get("/", _index)
+    app.router.add_get("/", _index_with_bitrate)
     app.router.add_post("/offer", _make_offer_handler(frame_buffer))
     web.run_app(app, host=host, port=port, handle_signals=False)

@@ -44,7 +44,12 @@ interface        = "wlan0"
 gcs_udp_port     = 5600
 gcs_cmd_port     = 5601
 gcs_jpeg_quality = 40     # was 60 — lower = smaller frames (~12 KB vs ~35 KB)
-gcs_stream_width = 480    # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 30fps)
+gcs_stream_width = 640  # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 30fps)
+
+# Video transport: "jpeg_udp" = current JPEG-over-UDP for gcs.py
+#                  "webrtc"   = H.264 WebRTC served at http://<pi>:8080
+video_mode           = "webrtc"
+webrtc_bitrate_kbps  = 0   # 0 = unconstrained; set e.g. 800 for narrow RF links
 
 [network.wlan0]
 bind_ip = "192.168.1.34"
