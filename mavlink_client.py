@@ -96,7 +96,7 @@ def send_vision_error(pitch_err, yaw_err, is_tracking=False):
 # ---------------------------------------------------------------------------
 
 def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
-                   gcs_ip="192.168.1.100", gcs_port=14550, local_port=14551,
+                   gcs_port=14550, local_port=14551,
                    extra_outputs=None):
     """
     Launch MAVProxy as a background subprocess.
@@ -104,7 +104,6 @@ def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
 
     extra_outputs: list of IP strings that each get a dedicated unicast
                    --out=udpout:<ip>:<gcs_port> added to the MAVProxy command.
-                   Use this for QGC machines that don't receive UDP broadcast.
     """
     global _mavproxy_proc
     cmd = [
@@ -112,7 +111,6 @@ def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
         f"--master={pixhawk_port}",
         f"--baud={pixhawk_baud}",
         f"--out=udpout:127.0.0.1:{local_port}",
-        f"--out=udpbcast:{gcs_ip}:{gcs_port}",
     ]
     for ip in (extra_outputs or []):
         cmd.append(f"--out=udpout:{ip}:{gcs_port}")
