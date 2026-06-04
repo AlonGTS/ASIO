@@ -18,7 +18,8 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
     Arrows   Nudge target (5 px)
     X / Z    Cycle MAIN resolution  + / −
     V / C    Cycle TRACK resolution + / −
-    P        Toggle local recording
+    P        Toggle Pi recording
+    O        Toggle local (GCS) recording
     Q        Quit
 """
 
@@ -92,9 +93,11 @@ DISPLAY_W   = 640     # video is always stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
-launched      = False
-moving_tgt    = False
-_pi_recording = False   # Pi-side recording state (optimistic: toggled on each command)
+launched        = False
+moving_tgt      = False
+_pi_recording   = False   # Pi-side recording state (optimistic: toggled on each command)
+_local_recording = False  # GCS-side recording state
+_local_writer    = None   # cv2.VideoWriter when local recording is active
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
@@ -158,6 +161,22 @@ def select_point(x, y):
     ny = round(y / _cur_video_h, 6)
     _post("select_point", nx=nx, ny=ny)
     set_status(f"Selected ({x}, {y})")
+
+def toggle_local_record(frame_w=640, frame_h=480):
+    global _local_recording, _local_writer
+    if _local_recording:
+        if _local_writer is not None:
+            _local_writer.release()
+            _local_writer = None
+        _local_recording = False
+        set_status("Local REC stopped")
+    else:
+        ts    = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"gcs_rec_{ts}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        _local_writer   = cv2.VideoWriter(fname, fourcc, 20.0, (frame_w, frame_h))
+        _local_recording = True
+        set_status(f"Local REC → {fname}")
 
 def cycle_main(delta):
     _post("cycle_main", delta=delta)
@@ -289,6 +308,14 @@ def _build_buttons(vx: int):
         36, lambda: toggle_pi_record(est_fps_ref[0]),
         lambda: (30, 30, 180) if _pi_recording else (35, 120, 35),
     )
+    y += 44
+
+    # ── Local Record ───────────────────────────────────────────────────────
+    btn(
+        lambda: "■ Local REC" if _local_recording else "● Local REC",
+        36, lambda: toggle_local_record(_cur_video_w, _cur_video_h),
+        lambda: (140, 30, 30) if _local_recording else (35, 120, 35),
+    )
     y += 52
 
     # ── D-pad ──────────────────────────────────────────────────────────────
@@ -334,18 +361,24 @@ def draw_hud(frame, fps):
     txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (130, 25), color=mode_col)
     txt("LAUNCHED" if launched else "READY",           (255, 25), color=launch_col)
 
-    # Pi REC indicator — blinking every second, plus FPS delta from baseline
+    # REC indicators — blinking every second
+    rec_x = w - 16
+    if _local_recording:
+        dot_col = (40, 220, 40) if int(time.time()) % 2 == 0 else (100, 255, 100)
+        cv2.circle(frame, (rec_x, 18), 7, dot_col, -1)
+        txt("Local REC", (rec_x - 100, 25), color=(100, 255, 100))
+        rec_x -= 120
+
     if _pi_recording:
-        # Blink: alternate dot colour each second
         dot_col = (40, 40, 220) if int(time.time()) % 2 == 0 else (100, 100, 255)
-        cv2.circle(frame, (w - 16, 18), 7, dot_col, -1)
+        cv2.circle(frame, (rec_x, 18), 7, dot_col, -1)
         if _fps_baseline is not None:
             delta = fps - _fps_baseline
             sign  = "+" if delta >= 0 else ""
             delta_col = (80, 200, 80) if delta > -0.5 else (80, 80, 220)
-            txt(f"Pi REC  ({sign}{delta:.1f})", (w - 155, 25), color=delta_col)
+            txt(f"Pi REC  ({sign}{delta:.1f})", (rec_x - 139, 25), color=delta_col)
         else:
-            txt("Pi REC", (w - 80, 25), color=(100, 100, 255))
+            txt("Pi REC", (rec_x - 64, 25), color=(100, 100, 255))
 
     # Status bar (bottom, fades after 4 s)
     age = time.time() - _status_ts
@@ -496,6 +529,13 @@ def main():
 
         draw_hud(frame, est_fps)
 
+        # Write to local recorder (video + HUD, no panel)
+        if _local_recording and _local_writer is not None:
+            fh, fw = frame.shape[:2]
+            rec_frame = frame if (fw, fh) == (_cur_video_w, _cur_video_h) else \
+                        cv2.resize(frame, (_cur_video_w, _cur_video_h))
+            _local_writer.write(rec_frame)
+
         # ── Composite canvas: video left + button panel right ──────────────
         canvas_h = max(h, PANEL_MIN_H)
         canvas   = np.zeros((canvas_h, w + PANEL_W, 3), np.uint8)
@@ -534,6 +574,7 @@ def main():
         elif k in (ord('v'), ord('V')): cycle_lores(+1)
         elif k in (ord('c'), ord('C')): cycle_lores(-1)
         elif k in (ord('p'), ord('P')): toggle_pi_record(est_fps)
+        elif k in (ord('o'), ord('O')): toggle_local_record(_cur_video_w, _cur_video_h)
 
         if _quit.is_set():
             break
