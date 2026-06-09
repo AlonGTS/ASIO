@@ -18,7 +18,8 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
     Arrows   Nudge target (5 px)
     X / Z    Cycle MAIN resolution  + / −
     V / C    Cycle TRACK resolution + / −
-    P        Toggle local recording
+    P        Toggle Pi recording
+    O        Toggle local (GCS) recording
     Q        Quit
 """
 
@@ -92,13 +93,18 @@ DISPLAY_W   = 640     # video is always stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
-launched      = False
-moving_tgt    = False
-_pi_recording = False   # Pi-side recording state (optimistic: toggled on each command)
+launched        = False
+moving_tgt      = False
+_pi_recording   = False   # Pi-side recording state (optimistic: toggled on each command)
+_local_recording = False  # GCS-side recording state
+_local_writer    = None   # cv2.VideoWriter when local recording is active
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
-_quit      = threading.Event()  # set to break the main loop from any thread
+_quit         = threading.Event()  # set to break the main loop from any thread
+_confirm_quit = False             # True while the "are you sure?" overlay is shown
+_CONFIRM_YES  = None              # (x, y, w, h) of the Yes button in the overlay
+_CONFIRM_NO   = None              # (x, y, w, h) of the No  button in the overlay
 
 # FPS baseline for performance comparison
 _fps_baseline   = None   # FPS snapshot taken when recording starts
@@ -136,6 +142,58 @@ def quit_gcs():
     send_cmd('q')
     _quit.set()
 
+def ask_quit():
+    global _confirm_quit
+    _confirm_quit = True
+
+def _draw_confirm_overlay(canvas):
+    """Draw a semi-transparent 'Are you sure?' dialog over the canvas."""
+    global _CONFIRM_YES, _CONFIRM_NO
+
+    ch, cw = canvas.shape[:2]
+
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (0, 0), (cw, ch), (0, 0, 0), -1)
+    cv2.addWeighted(canvas, 0.5, overlay, 0.5, 0, canvas)
+
+    dw, dh = 380, 150
+    dx = (cw - dw) // 2
+    dy = (ch - dh) // 2
+    cv2.rectangle(canvas, (dx, dy), (dx + dw, dy + dh), (50, 50, 50), -1)
+    cv2.rectangle(canvas, (dx, dy), (dx + dw, dy + dh), (150, 150, 150), 2)
+
+    for txt, scale, oy, color in [
+        ("Quit GCS?",                    0.65, 38,  (255, 255, 255)),
+        ("This will also quit the Pi.",  0.46, 64,  (180, 180, 180)),
+        ("Y = confirm   Esc = cancel",   0.40, 84,  (130, 130, 130)),
+    ]:
+        (tw, th), _ = cv2.getTextSize(txt, _FONT, scale, 1)
+        cv2.putText(canvas, txt, (dx + (dw - tw) // 2, dy + oy),
+                    _FONT, scale, color, 1, cv2.LINE_AA)
+
+    bw, bh = 110, 34
+    yes_x = dx + dw // 2 - bw - 10
+    no_x  = dx + dw // 2 + 10
+    by    = dy + dh - bh - 14
+
+    _CONFIRM_YES = (yes_x, by, bw, bh)
+    _CONFIRM_NO  = (no_x,  by, bw, bh)
+
+    mx, my = _mouse_pos
+    for (bx2, by2, bw2, bh2), lbl, col in [
+        (_CONFIRM_YES, "Yes",  (40, 40, 170)),
+        (_CONFIRM_NO,  "No",   (60, 60, 60)),
+    ]:
+        hover = bx2 <= mx < bx2 + bw2 and by2 <= my < by2 + bh2
+        c = tuple(min(255, v + 45) for v in col) if hover else col
+        cv2.rectangle(canvas, (bx2, by2), (bx2 + bw2, by2 + bh2), c, -1)
+        cv2.rectangle(canvas, (bx2, by2), (bx2 + bw2, by2 + bh2), (110, 110, 110), 1)
+        (tw, th), _ = cv2.getTextSize(lbl, _FONT, 0.50, 1)
+        tx = bx2 + (bw2 - tw) // 2
+        ty = by2 + (bh2 + th) // 2
+        cv2.putText(canvas, lbl, (tx, ty), _FONT, 0.50, (0, 0, 0),   3, cv2.LINE_AA)
+        cv2.putText(canvas, lbl, (tx, ty), _FONT, 0.50, (240,240,240), 1, cv2.LINE_AA)
+
 def send_launch():
     global launched
     launched = not launched
@@ -158,6 +216,22 @@ def select_point(x, y):
     ny = round(y / _cur_video_h, 6)
     _post("select_point", nx=nx, ny=ny)
     set_status(f"Selected ({x}, {y})")
+
+def toggle_local_record(frame_w=640, frame_h=480):
+    global _local_recording, _local_writer
+    if _local_recording:
+        if _local_writer is not None:
+            _local_writer.release()
+            _local_writer = None
+        _local_recording = False
+        set_status("Local REC stopped")
+    else:
+        ts    = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"gcs_rec_{ts}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        _local_writer   = cv2.VideoWriter(fname, fourcc, 20.0, (frame_w, frame_h))
+        _local_recording = True
+        set_status(f"Local REC → {fname}")
 
 def cycle_main(delta):
     _post("cycle_main", delta=delta)
@@ -272,7 +346,7 @@ def _build_buttons(vx: int):
          (35, 120, 35))
     y += 44
 
-    btn("Quit", 36, quit_gcs, (40, 40, 170))
+    btn("Quit", 36, ask_quit, (40, 40, 170))
     y += 52
 
     # ── Target mode ────────────────────────────────────────────────────────
@@ -288,6 +362,14 @@ def _build_buttons(vx: int):
         lambda: "■ Pi REC" if _pi_recording else "● Pi REC",
         36, lambda: toggle_pi_record(est_fps_ref[0]),
         lambda: (30, 30, 180) if _pi_recording else (35, 120, 35),
+    )
+    y += 44
+
+    # ── Local Record ───────────────────────────────────────────────────────
+    btn(
+        lambda: "■ Local REC" if _local_recording else "● Local REC",
+        36, lambda: toggle_local_record(_cur_video_w, _cur_video_h),
+        lambda: (140, 30, 30) if _local_recording else (35, 120, 35),
     )
     y += 52
 
@@ -334,18 +416,24 @@ def draw_hud(frame, fps):
     txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (130, 25), color=mode_col)
     txt("LAUNCHED" if launched else "READY",           (255, 25), color=launch_col)
 
-    # Pi REC indicator — blinking every second, plus FPS delta from baseline
+    # REC indicators — blinking every second
+    rec_x = w - 16
+    if _local_recording:
+        dot_col = (40, 220, 40) if int(time.time()) % 2 == 0 else (100, 255, 100)
+        cv2.circle(frame, (rec_x, 18), 7, dot_col, -1)
+        txt("Local REC", (rec_x - 100, 25), color=(100, 255, 100))
+        rec_x -= 120
+
     if _pi_recording:
-        # Blink: alternate dot colour each second
         dot_col = (40, 40, 220) if int(time.time()) % 2 == 0 else (100, 100, 255)
-        cv2.circle(frame, (w - 16, 18), 7, dot_col, -1)
+        cv2.circle(frame, (rec_x, 18), 7, dot_col, -1)
         if _fps_baseline is not None:
             delta = fps - _fps_baseline
             sign  = "+" if delta >= 0 else ""
             delta_col = (80, 200, 80) if delta > -0.5 else (80, 80, 220)
-            txt(f"Pi REC  ({sign}{delta:.1f})", (w - 155, 25), color=delta_col)
+            txt(f"Pi REC  ({sign}{delta:.1f})", (rec_x - 139, 25), color=delta_col)
         else:
-            txt("Pi REC", (w - 80, 25), color=(100, 100, 255))
+            txt("Pi REC", (rec_x - 64, 25), color=(100, 100, 255))
 
     # Status bar (bottom, fades after 4 s)
     age = time.time() - _status_ts
@@ -434,7 +522,7 @@ class _LiveCapture:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    global launched, _cur_video_w, _cur_video_h, est_fps_ref
+    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit
 
     data     = _get("status")
     launched = data.get("launched", False)
@@ -448,9 +536,18 @@ def main():
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
     def on_mouse(event, x, y, flags, _):
+        global _confirm_quit
         _mouse_pos[0], _mouse_pos[1] = x, y
         if event == cv2.EVENT_LBUTTONDOWN:
-            if x < _cur_video_w:
+            if _confirm_quit:
+                if _CONFIRM_YES and _CONFIRM_YES[0] <= x < _CONFIRM_YES[0] + _CONFIRM_YES[2] \
+                                and _CONFIRM_YES[1] <= y < _CONFIRM_YES[1] + _CONFIRM_YES[3]:
+                    _confirm_quit = False
+                    quit_gcs()
+                elif _CONFIRM_NO and _CONFIRM_NO[0] <= x < _CONFIRM_NO[0] + _CONFIRM_NO[2] \
+                                 and _CONFIRM_NO[1] <= y < _CONFIRM_NO[1] + _CONFIRM_NO[3]:
+                    _confirm_quit = False
+            elif x < _cur_video_w:
                 select_point(x, y)          # click on video → track target
             else:
                 for btn in _buttons:        # click on panel → button action
@@ -496,6 +593,13 @@ def main():
 
         draw_hud(frame, est_fps)
 
+        # Write to local recorder (video + HUD, no panel)
+        if _local_recording and _local_writer is not None:
+            fh, fw = frame.shape[:2]
+            rec_frame = frame if (fw, fh) == (_cur_video_w, _cur_video_h) else \
+                        cv2.resize(frame, (_cur_video_w, _cur_video_h))
+            _local_writer.write(rec_frame)
+
         # ── Composite canvas: video left + button panel right ──────────────
         canvas_h = max(h, PANEL_MIN_H)
         canvas   = np.zeros((canvas_h, w + PANEL_W, 3), np.uint8)
@@ -510,11 +614,23 @@ def main():
         for btn in _buttons:
             btn.draw(canvas, hover=btn.hit(mx, my))
 
+        if _confirm_quit:
+            _draw_confirm_overlay(canvas)
+
         cv2.imshow("Mahat GCS", canvas)
 
         # ── Key handling ───────────────────────────────────────────────────
         key = cv2.waitKeyEx(1)
         if key == -1:
+            continue
+
+        if _confirm_quit:
+            k = key & 0xFF
+            if k in (ord('y'), ord('Y'), 13):   # Y or Enter → confirm
+                _confirm_quit = False
+                quit_gcs()
+            else:                               # anything else → cancel
+                _confirm_quit = False
             continue
 
         direction = _ARROW.get(key)
@@ -524,7 +640,7 @@ def main():
             continue
 
         k = key & 0xFF
-        if   k in (ord('q'), ord('Q')): quit_gcs()
+        if   k in (ord('q'), ord('Q')): ask_quit()
         elif k in (ord('r'), ord('R')): send_cmd('r')
         elif k in (ord('s'), ord('S')): send_cmd('s')
         elif k in (ord('l'), ord('L')): send_launch()
@@ -534,6 +650,7 @@ def main():
         elif k in (ord('v'), ord('V')): cycle_lores(+1)
         elif k in (ord('c'), ord('C')): cycle_lores(-1)
         elif k in (ord('p'), ord('P')): toggle_pi_record(est_fps)
+        elif k in (ord('o'), ord('O')): toggle_local_record(_cur_video_w, _cur_video_h)
 
         if _quit.is_set():
             break
