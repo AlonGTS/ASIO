@@ -65,6 +65,8 @@ CMD_PORT = 5601
 # UDP socket for sending commands directly to the Pi (unicast)
 import json as _json
 _cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# Pi's real IP, learned from the first incoming video packet (overrides configured PI_IP)
+_discovered_pi_ip = None
 
 print(f"[GCS] Pi={PI_IP}  video={UDP_PORT}  cmd={CMD_PORT}")
 
@@ -78,7 +80,7 @@ def _heartbeat_sender():
     msg = _json.dumps({}).encode()   # empty payload — no endpoint → Pi ignores body
     while True:
         try:
-            _cmd_sock.sendto(msg, (PI_IP, CMD_PORT))
+            _cmd_sock.sendto(msg, (_discovered_pi_ip or PI_IP, CMD_PORT))
         except Exception:
             pass
         time.sleep(3)
@@ -116,7 +118,7 @@ def _post(endpoint, **data):
     """Send command to Pi via UDP unicast. Non-blocking, no TCP needed."""
     msg = _json.dumps({"endpoint": endpoint, **data}).encode()
     try:
-        _cmd_sock.sendto(msg, (PI_IP, CMD_PORT))
+        _cmd_sock.sendto(msg, (_discovered_pi_ip or PI_IP, CMD_PORT))
     except Exception as e:
         set_status(f"CMD error: {e}")
 
@@ -359,7 +361,7 @@ def _build_buttons(vx: int):
 
     # ── Pi Record ──────────────────────────────────────────────────────────
     btn(
-        lambda: "■ Pi REC" if _pi_recording else "● Pi REC",
+        lambda: "[.] Pi REC" if _pi_recording else "(*) Pi REC",
         36, lambda: toggle_pi_record(est_fps_ref[0]),
         lambda: (30, 30, 180) if _pi_recording else (35, 120, 35),
     )
@@ -367,7 +369,7 @@ def _build_buttons(vx: int):
 
     # ── Local Record ───────────────────────────────────────────────────────
     btn(
-        lambda: "■ Local REC" if _local_recording else "● Local REC",
+        lambda: "[.] Local REC" if _local_recording else "(*) Local REC",
         36, lambda: toggle_local_record(_cur_video_w, _cur_video_h),
         lambda: (140, 30, 30) if _local_recording else (35, 120, 35),
     )
@@ -496,9 +498,13 @@ class _LiveCapture:
 
     def _reader(self):
         """Receive JPEG datagrams and decode them; marks _ok=False on timeout."""
+        global _discovered_pi_ip
         while True:
             try:
-                data, _ = self._sock.recvfrom(1 << 16)  # 65536 bytes max UDP payload
+                data, addr = self._sock.recvfrom(1 << 16)  # 65536 bytes max UDP payload
+                if _discovered_pi_ip is None:
+                    _discovered_pi_ip = addr[0]
+                    print(f"[GCS] Pi discovered at {_discovered_pi_ip}")
                 arr   = np.frombuffer(data, dtype=np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame is not None:
@@ -557,15 +563,19 @@ def main():
 
     cv2.setMouseCallback("Mahat GCS", on_mouse)
 
-    prev_ts  = time.time()
-    est_fps  = 0.0
-    FPS_A    = 0.9
+    last_frame_ts = None
+    est_fps       = 0.0
+    FPS_A         = 0.9
 
     while not _quit.is_set():
         ok, frame = cap.read()
 
         if not ok or frame is None:
             frame = _waiting_frame(_cur_video_w, _cur_video_h)
+            # Drop to 0 if no real frame for more than 1 s
+            if last_frame_ts is not None and (time.time() - last_frame_ts) > 1.0:
+                est_fps       = 0.0
+                last_frame_ts = None
         else:
             # Stretch to DISPLAY_W regardless of stream resolution
             # so the window stays the same size even when stream is downscaled
@@ -574,6 +584,13 @@ def main():
                 dh = int(fh * DISPLAY_W / fw)
                 frame = cv2.resize(frame, (DISPLAY_W, dh), interpolation=cv2.INTER_LINEAR)
 
+            # FPS — only real frames count
+            now = time.time()
+            if last_frame_ts is not None:
+                inst    = 1.0 / max(1e-6, now - last_frame_ts)
+                est_fps = FPS_A * est_fps + (1 - FPS_A) * inst if est_fps else inst
+            last_frame_ts = now
+
         h, w = frame.shape[:2]
 
         # Rebuild button layout if display width changed
@@ -581,13 +598,6 @@ def main():
             _cur_video_w = w
             _cur_video_h = h
             _build_buttons(w)
-
-        # FPS
-        now      = time.time()
-        dt       = max(1e-6, now - prev_ts)
-        prev_ts  = now
-        inst     = 1.0 / dt
-        est_fps  = FPS_A * est_fps + (1 - FPS_A) * inst if est_fps else inst
 
         est_fps_ref[0] = est_fps   # share live FPS with button lambdas
 
