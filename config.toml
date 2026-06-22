@@ -48,7 +48,7 @@ gcs_stream_width = 640  # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 
 
 # Video transport: "jpeg_udp" = current JPEG-over-UDP for gcs.py
 #                  "webrtc"   = H.264 WebRTC served at http://<pi>:8080
-video_mode           = "webrtc"
+video_mode           = "jpeg_udp"
 webrtc_bitrate_kbps  = 0   # 0 = unconstrained; set e.g. 800 for narrow RF links
 
 [network.wlan0]
@@ -62,12 +62,12 @@ gcs_ip  = "192.168.10.8"
 [mavlink]
 pixhawk_port  = "/dev/ttyACM0"
 pixhawk_baud  = 115200
-gcs_ip        = "192.168.1.26"    # legacy field (kept for reference)
+gcs_ip        = "192.168.1.30"    # legacy field (kept for reference)
 gcs_port      = 14550
 local_port    = 14551
 # Dedicated unicast outputs — MAVProxy sends a copy to each IP:gcs_port
 # Add every QGC / GCS machine here that needs full telemetry
-extra_outputs = ["192.168.1.32"]
+extra_outputs = ["192.168.1.30", "192.168.1.32"]
 
 [camera]
 # Safe/default resolutions for IMX708 path

@@ -956,6 +956,10 @@ while True:
     cv2.putText(frame, overlay1, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
     cv2.putText(frame, overlay2, (8, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
 
+    # Launched indicator
+    if mavlink_client._launched:
+        cv2.putText(frame, "Launched", (8, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
     # REC indicator — blinking dot + elapsed time (only when live-toggle recording is active)
     if _recording and _rec_start_time is not None:
         rec_elapsed = now - _rec_start_time
