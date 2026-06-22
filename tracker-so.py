@@ -12,7 +12,10 @@ import threading
 from types import SimpleNamespace
 
 # CLI args / timestamps / small GUI dialogs for file/duration picking
+import fcntl
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tomllib
@@ -169,9 +172,19 @@ MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
 MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 
+def _get_iface_ip(iface: str) -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            return socket.inet_ntoa(
+                fcntl.ioctl(s.fileno(), 0x8915,
+                            struct.pack('256s', iface[:15].encode()))[20:24]
+            )
+    except OSError:
+        return None
+
 _net_iface  = _cfg["network"]["interface"]
 _net        = _cfg["network"][_net_iface]
-BIND_IP     = _net["bind_ip"]
+BIND_IP     = _get_iface_ip(_net_iface) or _net["bind_ip"]
 _VIDEO_MODE = _cfg["network"].get("video_mode", "jpeg_udp")
 GCS_IP     = None   # learned dynamically when GCS announces itself over the command channel
 print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs=<waiting for GCS hello>")
