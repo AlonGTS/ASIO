@@ -491,9 +491,10 @@ class _LiveCapture:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)  # 1 MB
         self._sock.bind(('', port))
         self._sock.settimeout(1.0)
-        self._frame = None
-        self._ok    = False
-        self._lock  = threading.Lock()
+        self._frame    = None
+        self._ok       = False
+        self._frame_id = 0
+        self._lock     = threading.Lock()
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
@@ -509,8 +510,9 @@ class _LiveCapture:
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame is not None:
                     with self._lock:
-                        self._frame = frame
-                        self._ok    = True
+                        self._frame    = frame
+                        self._ok       = True
+                        self._frame_id += 1
             except socket.timeout:
                 with self._lock:
                     self._ok = False   # no packet for 1 s → show waiting screen
@@ -518,11 +520,11 @@ class _LiveCapture:
                 print(f"[UDP] recv: {e}")
 
     def read(self):
-        """Return (ok, frame_copy).  Never blocks more than the lock."""
+        """Return (ok, frame_copy, frame_id).  Never blocks more than the lock."""
         with self._lock:
             if self._frame is None:
-                return False, None
-            return self._ok, self._frame.copy()
+                return False, None, 0
+            return self._ok, self._frame.copy(), self._frame_id
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -564,11 +566,12 @@ def main():
     cv2.setMouseCallback("Mahat GCS", on_mouse)
 
     last_frame_ts = None
+    last_frame_id = 0
     est_fps       = 0.0
     FPS_A         = 0.9
 
     while not _quit.is_set():
-        ok, frame = cap.read()
+        ok, frame, frame_id = cap.read()
 
         if not ok or frame is None:
             frame = _waiting_frame(_cur_video_w, _cur_video_h)
@@ -584,12 +587,14 @@ def main():
                 dh = int(fh * DISPLAY_W / fw)
                 frame = cv2.resize(frame, (DISPLAY_W, dh), interpolation=cv2.INTER_LINEAR)
 
-            # FPS — only real frames count
-            now = time.time()
-            if last_frame_ts is not None:
-                inst    = 1.0 / max(1e-6, now - last_frame_ts)
-                est_fps = FPS_A * est_fps + (1 - FPS_A) * inst if est_fps else inst
-            last_frame_ts = now
+            # FPS — only count genuinely new UDP frames, not repeated buffer reads
+            if frame_id != last_frame_id:
+                now = time.time()
+                if last_frame_ts is not None:
+                    inst    = 1.0 / max(1e-6, now - last_frame_ts)
+                    est_fps = FPS_A * est_fps + (1 - FPS_A) * inst if est_fps else inst
+                last_frame_ts = now
+                last_frame_id = frame_id
 
         h, w = frame.shape[:2]
 
