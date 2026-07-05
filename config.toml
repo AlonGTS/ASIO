@@ -52,7 +52,7 @@ video_mode           = "jpeg_udp"
 webrtc_bitrate_kbps  = 0   # 0 = unconstrained; set e.g. 800 for narrow RF links
 
 [network.wlan0]
-bind_ip = "192.168.1.34"
+bind_ip = "192.168.1.36"
 # gcs_ip no longer needed — Pi learns GCS IP dynamically from heartbeat packets
 
 [network.wlan1]
@@ -67,7 +67,7 @@ gcs_port      = 14550
 local_port    = 14551
 # Dedicated unicast outputs — MAVProxy sends a copy to each IP:gcs_port
 # Add every QGC / GCS machine here that needs full telemetry
-extra_outputs = ["192.168.1.30", "192.168.1.32"]
+extra_outputs = ["192.168.1.30", "192.168.1.32", "192.168.1.36"]  # .36 = Mac GCS
 
 [camera]
 # Safe/default resolutions for IMX708 path

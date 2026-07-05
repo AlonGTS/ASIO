@@ -98,11 +98,11 @@ WEBRTC_HTML = """
 <html>
   <head>
     <meta charset="utf-8">
-    <title>Mahat Live Video &amp; Control</title>
+    <title>GTS Ground Control</title>
     <style>
       * { box-sizing: border-box; }
       body { font-family: sans-serif; background:#f0f0f0; margin:0; padding:24px; }
-      h1 { margin:0 0 16px 0; text-align:center; }
+      h1 { margin:0 0 12px 0; text-align:center; width:100%; }
 
       .layout {
         display:grid;
@@ -164,9 +164,9 @@ WEBRTC_HTML = """
     </style>
   </head>
   <body>
-    <h1>Mahat Live Video &amp; Control</h1>
     <div class="layout">
       <div class="video-panel">
+        <h1>GTS Ground Control</h1>
         <div id="wrap"><video id="video" autoplay playsinline></video></div>
         <div id="status"></div>
         <div class="hint">
@@ -227,6 +227,7 @@ WEBRTC_HTML = """
       window.addEventListener('resize', fitWrap);
 
       async function sendCmd(cmd){
+        if (cmd === 'q' && !confirm('Are you sure you want to quit?')) return;
         try{
           const r = await fetch('http://' + location.hostname + ':5000/command', {
             method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},

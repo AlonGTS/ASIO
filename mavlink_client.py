@@ -107,7 +107,7 @@ def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
     """
     global _mavproxy_proc
     cmd = [
-        "/home/mahat/webrtc_venv/bin/mavproxy.py",
+        "/home/mahat/mav_venv/bin/mavproxy.py",
         f"--master={pixhawk_port}",
         f"--baud={pixhawk_baud}",
         f"--out=udpout:127.0.0.1:{local_port}",
