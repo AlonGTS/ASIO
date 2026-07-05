@@ -639,9 +639,10 @@ app = flask_app.create_app(
     get_record_state_fn= lambda: _recording,
 )
 
-# === Launch Flask in separate thread ===
-print(f"[Flask]  http://{BIND_IP}:5000")
-flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
+# === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
+from waitress import serve as _waitress_serve
+print(f"[Flask]  http://{BIND_IP}:5000  (waitress)")
+flask_thread = Thread(target=lambda: _waitress_serve(app, host="0.0.0.0", port=5000, threads=8, _quiet=True))
 flask_thread.daemon = True
 flask_thread.start()
 
