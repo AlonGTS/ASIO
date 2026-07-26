@@ -23,11 +23,14 @@ Two control schemes, selected by set_autopilot():
       arm/disarm via MAV_CMD_COMPONENT_ARM_DISARM.
 """
 import math
+import os
+import sys
 import time
 import struct
 import threading
 import subprocess
 import atexit
+import shutil
 
 _connection    = None
 _enabled       = False
@@ -146,19 +149,44 @@ def send_vision_error(pitch_err, yaw_err, is_tracking=False):
 # Connect
 # ---------------------------------------------------------------------------
 
+def _find_mavproxy(override=None):
+    """Locate mavproxy.py without hardcoding a venv name — this project runs
+    on several RPis whose venvs aren't all named/laid out the same way, and a
+    hardcoded absolute path only ever matches one of them. Preference order:
+    1. explicit override (e.g. config.toml's [mavlink] mavproxy_path)
+    2. same venv as the running interpreter (sys.executable's bin/ dir) —
+       correct as long as mavproxy is installed alongside tracker-so.py's own
+       deps, which is how every Pi in the fleet is actually set up
+    3. PATH lookup, for a bare/system install with no venv at all
+    """
+    if override:
+        return override
+    candidate = os.path.join(os.path.dirname(sys.executable), "mavproxy.py")
+    if os.path.exists(candidate):
+        return candidate
+    found = shutil.which("mavproxy.py")
+    if found:
+        return found
+    print(f"[MAVProxy] WARNING: mavproxy.py not found next to {sys.executable} "
+          f"or on PATH — falling back to {candidate}")
+    return candidate
+
+
 def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
                    gcs_port=14550, local_port=14551,
-                   extra_outputs=None):
+                   extra_outputs=None, mavproxy_path=None):
     """
     Launch MAVProxy as a background subprocess.
     Automatically killed when the Python process exits.
 
     extra_outputs: list of IP strings that each get a dedicated unicast
                    --out=udpout:<ip>:<gcs_port> added to the MAVProxy command.
+    mavproxy_path: explicit path to mavproxy.py; auto-detected via
+                   _find_mavproxy() if omitted.
     """
     global _mavproxy_proc
     cmd = [
-        "/home/mahat/webrtc_venv/bin/mavproxy.py",
+        _find_mavproxy(mavproxy_path),
         f"--master={pixhawk_port}",
         f"--baud={pixhawk_baud}",
         f"--out=udpout:127.0.0.1:{local_port}",

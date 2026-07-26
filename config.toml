@@ -68,6 +68,11 @@ gcs_ip  = "192.168.10.7"
 #            SET_ATTITUDE_TARGET (body rates), with MAV_CMD_DO_SET_MODE /
 #            MAV_CMD_COMPONENT_ARM_DISARM for mode switching and arm/disarm.
 autopilot     = "custom"
+# mavproxy_path: usually leave unset — auto-detected next to whichever venv's
+# python is running tracker-so.py, so this doesn't need editing per RPi.
+# Only set this if a given Pi keeps mavproxy in a separate venv from the one
+# running the tracker.
+# mavproxy_path = "/home/mahat/mav_venv/bin/mavproxy.py"
 pixhawk_port  = "/dev/ttyACM0"
 pixhawk_baud  = 115200
 gcs_ip        = "192.168.1.30"    # legacy field (kept for reference)

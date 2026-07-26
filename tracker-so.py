@@ -382,6 +382,7 @@ mavlink_client.start_mavproxy(
     gcs_port      = _mav_cfg["gcs_port"],
     local_port    = _mav_cfg["local_port"],
     extra_outputs = _mav_cfg.get("extra_outputs", []),
+    mavproxy_path = _mav_cfg.get("mavproxy_path"),
 )
 mavlink_client.connect(
     url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",
