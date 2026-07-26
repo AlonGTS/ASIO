@@ -51,24 +51,10 @@ _PX4_MAIN_MODE_NAMES = {
     6: "OFFBOARD", 7: "STABILIZED", 8: "RATTITUDE",
 }
 
-# send_attitude_target() clamp: bounds how far the camera error is ever
-# allowed to rotate the target away from the FC's current attitude.
+# send_attitude_target() clamp: bounds the body rate ever commanded on any
+# axis (rad/s — camera-error angles are reinterpreted directly as rates, see
+# that function's docstring).
 MAX_ANGLE = math.radians(25)
-
-# PX4 rate-mode roll self-level: with the angle loop bypassed (see
-# send_attitude_target docstring), roll has no restoring force unless we
-# close that loop ourselves. ROLL_LEVEL_KP converts current bank-angle error
-# (rad) into a commanded roll rate (rad/s). Tune to the airframe's own
-# angle->rate gain (Kp = 1/time_constant); MAX_ROLL_RATE bounds the output.
-ROLL_LEVEL_KP  = 1.0 / 0.4
-MAX_ROLL_RATE  = math.radians(70)
-
-# send_attitude_target() refuses to compose onto a stale ATTITUDE reading
-# rather than send a wrong absolute target.
-_attitude_lock      = threading.Lock()
-_current_attitude    = None  # (roll, pitch, yaw) radians, or None until first ATTITUDE msg
-_attitude_timestamp  = 0.0
-MAX_ATTITUDE_AGE     = 0.3   # seconds; skip send if the cached attitude is older than this
 
 # PX4 params this rig always wants fixed to a specific value on every connect
 # (px4 mode only). Blind writes, not read-modify-write: MAVProxy does its own
@@ -331,10 +317,6 @@ def _telemetry_reader():
                 continue
             mtype = msg.get_type()
             if mtype == 'ATTITUDE':
-                global _current_attitude, _attitude_timestamp
-                with _attitude_lock:
-                    _current_attitude = (msg.roll, msg.pitch, msg.yaw)
-                    _attitude_timestamp = time.time()
                 if SHOW_TELEMETRY:
                     print(f"[Telem] roll={math.degrees(msg.roll):+.1f}°  "
                           f"pitch={math.degrees(msg.pitch):+.1f}°  "
@@ -551,50 +533,40 @@ def disarm():
 
 def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
     """Send SET_ATTITUDE_TARGET every frame. pitch_err/yaw_err/roll_err are
-    BODY-FRAME camera tracking errors (radians), clamped to MAX_ANGLE. px4
-    mode only — for "custom" mode use send_vision_error() instead.
+    BODY-FRAME camera tracking errors (radians), clamped to MAX_ANGLE and
+    used directly as body RATE setpoints (rad/s) — a P-gain-of-1 open-loop
+    mapping, not an absolute attitude target. px4 mode only — for "custom"
+    mode use send_vision_error() instead.
+
+    roll_err defaults to 0.0 (tracker-so.py never computes a nonzero one),
+    which commands zero roll RATE — i.e. "stop rotating", not "return to a
+    level/zero roll angle". This airframe launches vertically and has no
+    meaningful "level" attitude, so a self-level controller driving roll
+    toward 0 would fight whatever attitude the vehicle is actually in (and,
+    since it would read the FC's Euler roll, breaks down entirely near
+    pitch=90° from gimbal lock). Pure rate damping avoids both problems by
+    never reading current attitude at all.
 
     Runs PX4 in full RATE mode: type_mask sets
-    ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE, so the quaternion (q) is unused
-    (current attitude sent as a harmless placeholder) and all three axes are
-    driven as explicit body rate setpoints. This bypasses FW_ATT_CONTROL's
-    angle loop (and its turn-coordination yaw logic) entirely, going straight
-    to the rate controller / control allocation for roll, pitch AND yaw.
+    ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE, so the quaternion (q) is
+    unused (sent as an identity placeholder) and all three axes are driven
+    as explicit body rate setpoints. This bypasses FW_ATT_CONTROL's angle
+    loop (and its turn-coordination yaw logic) entirely, going straight to
+    the rate controller / control allocation for roll, pitch AND yaw.
 
-    Bypassing the angle loop means roll has no restoring force of its own any
-    more — a rate setpoint only says "stop rotating", not "return to level".
-    So roll_rate is NOT the raw clamped error like pitch/yaw; it's closed
-    here with our own P controller against the FC's current roll
-    (ROLL_LEVEL_KP, clamped to MAX_ROLL_RATE) so the aircraft still
-    self-levels when roll_err is 0. pitch/yaw keep the simple mapping
-    (clamped angle error, in rad, used directly as rad/s rate) — PX4's rate
-    controller still closes those loops itself once given a rate target.
-
-    Skips the send if the cached current-attitude reading is stale (older
-    than MAX_ATTITUDE_AGE) rather than command against unknown current
-    attitude. Call at ~10 Hz or faster."""
+    Call at ~10 Hz or faster."""
     if _autopilot != "px4":
         return
     if not _enabled:
         if DEBUG:
             print(f"[DEBUG] pitch_err={math.degrees(pitch_err):.2f}° yaw_err={math.degrees(yaw_err):.2f}°")
         return
-    with _attitude_lock:
-        current = _current_attitude
-        age = time.time() - _attitude_timestamp
-    if current is None or age > MAX_ATTITUDE_AGE:
-        if DEBUG:
-            print(f"[MAVLink] set_attitude_target skipped: attitude stale/missing (age={age:.2f}s)")
-        return
     roll  = max(-MAX_ANGLE, min(MAX_ANGLE, roll_err))
     pitch = max(-MAX_ANGLE, min(MAX_ANGLE, pitch_err))
     yaw   = max(-MAX_ANGLE, min(MAX_ANGLE, yaw_err))
     from pymavlink.quaternion import QuaternionBase
     try:
-        q = QuaternionBase([current[0], current[1], current[2]])  # placeholder; ATTITUDE_IGNORE bit means it's unused
-        roll_rate_cmd = ROLL_LEVEL_KP * (roll - current[0])
-        body_roll_rate = max(-MAX_ROLL_RATE, min(MAX_ROLL_RATE, roll_rate_cmd))
-        body_pitch_rate, body_yaw_rate = pitch, yaw
+        q = QuaternionBase([0.0, 0.0, 0.0])  # identity; unused (ATTITUDE_IGNORE bit set)
         # NOTE: bit 6 (0b01000000=64) is ATTITUDE_TARGET_TYPEMASK_THRUST_IGNORE,
         # NOT ignore-attitude. ignore_attitude is bit 7 (0b10000000=128).
         type_mask = 0b10000000  # ignore attitude only -> use body rates + thrust
@@ -604,13 +576,13 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
             _connection.target_component,
             type_mask,
             q,
-            body_roll_rate, body_pitch_rate, body_yaw_rate,
+            roll, pitch, yaw,
             thrust
         )
         if DEBUG:
-            print(f"[MAVLink] SET_ATTITUDE_TARGET (rate mode) age={age*1000:.0f}ms "
-                  f"sent_rates=(roll={math.degrees(body_roll_rate):+.2f}°/s,"
-                  f"pitch={math.degrees(body_pitch_rate):+.2f}°/s,"
-                  f"yaw={math.degrees(body_yaw_rate):+.2f}°/s) thrust={thrust:.2f}")
+            print(f"[MAVLink] SET_ATTITUDE_TARGET (rate mode) "
+                  f"sent_rates=(roll={math.degrees(roll):+.2f}°/s,"
+                  f"pitch={math.degrees(pitch):+.2f}°/s,"
+                  f"yaw={math.degrees(yaw):+.2f}°/s) thrust={thrust:.2f}")
     except Exception as e:
         print(f"[MAVLink] set_attitude_target failed: {e}")
