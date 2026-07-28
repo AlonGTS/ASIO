@@ -408,6 +408,15 @@ signal.signal(signal.SIGHUP, _shutdown)
 _HFOV_RAD = math.radians(60)   # ~60° horizontal FOV
 _VFOV_RAD = math.radians(45)   # ~45° vertical FOV
 
+# PX4 rate-mode gain — px4 mode only, does not touch custom mode's _mav_x/_mav_y.
+# _px4_pitch_err/_px4_yaw_err are sent as body-RATE setpoints (see
+# mavlink_client.send_attitude_target), but their raw FOV-derived value tops
+# out at the frame edge around ±22.5° (pitch) / ±30° (yaw) — nowhere near a
+# meaningful rate. This gain scales that up so a target pinned at the frame
+# edge commands ~100°/s on the larger (yaw) axis; MAX_ANGLE in
+# mavlink_client.py still clamps above that as a hard ceiling.
+_PX4_RATE_GAIN = math.radians(100) / (_HFOV_RAD / 2)
+
 # === Command-line arguments setup ===
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', choices=['live', 'record', 'playback'], default='live')
@@ -918,8 +927,8 @@ while True:
                     # Only drive the drone when quality is sufficient
                     if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
                         _mav_x, _mav_y = pitch_norm, yaw_norm
-                        _px4_pitch_err = -norm_dy * _VFOV_RAD
-                        _px4_yaw_err   =  norm_dx * _HFOV_RAD
+                        _px4_pitch_err = -norm_dy * _VFOV_RAD * _PX4_RATE_GAIN
+                        _px4_yaw_err   =  norm_dx * _HFOV_RAD * _PX4_RATE_GAIN
 
                     # Box color encodes quality level
                     if tq >= TrackingQualityMonitor.SCORE_GOOD:

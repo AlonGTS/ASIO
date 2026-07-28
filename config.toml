@@ -67,7 +67,7 @@ gcs_ip  = "192.168.10.7"
 # "px4"    = stock PX4 flight stack: drives OFFBOARD mode directly via
 #            SET_ATTITUDE_TARGET (body rates), with MAV_CMD_DO_SET_MODE /
 #            MAV_CMD_COMPONENT_ARM_DISARM for mode switching and arm/disarm.
-autopilot     = "custom"
+autopilot     = "px4"
 # mavproxy_path: usually leave unset — auto-detected next to whichever venv's
 # python is running tracker-so.py, so this doesn't need editing per RPi.
 # Only set this if a given Pi keeps mavproxy in a separate venv from the one

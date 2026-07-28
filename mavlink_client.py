@@ -47,7 +47,6 @@ _autopilot = "custom"
 
 # PX4 custom_mode packs main_mode into bits 16-23 (sub_mode in 24-31).
 # Values from PX4's mavlink/mavlink_main.h custom mode enum.
-_PX4_MAIN_MODE_MANUAL   = 1
 _PX4_MAIN_MODE_OFFBOARD = 6
 _PX4_MAIN_MODE_NAMES = {
     1: "MANUAL", 2: "ALTCTL", 3: "POSCTL", 4: "AUTO", 5: "ACRO",
@@ -57,7 +56,7 @@ _PX4_MAIN_MODE_NAMES = {
 # send_attitude_target() clamp: bounds the body rate ever commanded on any
 # axis (rad/s — camera-error angles are reinterpreted directly as rates, see
 # that function's docstring).
-MAX_ANGLE = math.radians(25)
+MAX_ANGLE = math.radians(120)
 
 # PX4 params this rig always wants fixed to a specific value on every connect
 # (px4 mode only). Blind writes, not read-modify-write: MAVProxy does its own
@@ -509,7 +508,9 @@ def arm():
 
 
 def disarm():
-    """Disarm the FC. px4 mode only."""
+    """Disarm the FC. Stays in OFFBOARD mode (doesn't fall back to MANUAL) so
+    the next arm() lands while still in OFFBOARD, instead of requiring the
+    mode to be manually reselected before/after every launch. px4 mode only."""
     if _autopilot != "px4":
         print("[MAVLink] disarm() only applies to autopilot='px4' — use set_launch() for custom mode")
         return
@@ -527,21 +528,6 @@ def disarm():
             if not armed:
                 _launched = False
                 return
-            # PX4 MANUAL: main_mode=1, sub_mode=0.
-            base_mode = (mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-                         | mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED
-                         | mavutil.mavlink.MAV_MODE_FLAG_MANUAL_INPUT_ENABLED)
-            custom_mode = _PX4_MAIN_MODE_MANUAL
-            _connection.mav.command_long_send(
-                _connection.target_system,
-                _connection.target_component,
-                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-                0,
-                base_mode,
-                custom_mode,
-                0, 0, 0, 0, 0
-            )
-            time.sleep(0.5)
             _connection.mav.command_long_send(
                 _connection.target_system,
                 _connection.target_component,
