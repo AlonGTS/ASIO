@@ -5,6 +5,7 @@ import cv2
 import time
 import math
 import numpy as np
+import psutil
 
 # Concurrency primitives
 from threading import Thread, Lock, Condition
@@ -171,6 +172,8 @@ MAX_BB_WIDTH  = _cfg["tracking"]["max_bb_width"]
 MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
 MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
+_CAM_IDLE_FPS   = _cfg["camera"].get("idle_fps", 5)
+_CAM_ACTIVE_FPS = _cfg["camera"].get("active_fps", 30)
 
 def _get_iface_ip(iface: str) -> str | None:
     try:
@@ -196,6 +199,8 @@ frame_buffer = webrtc_server.FrameBuffer()
 # Mutable state shared between main loop, reader threads, and Flask/WebRTC
 state = SimpleNamespace(
     current_frame   = None,   # Raw latest frame from camera/file (no overlays)
+    frame_gen       = 0,      # bumped by reader threads on every new frame; lets the
+                              # main loop tell "new frame" from "same frame, re-read"
     command_from_remote = None,   # One-letter command from web UI: 'r','s','q'
     bbox            = None,   # Current GTS tracking box (MAIN coords: x, y, w, h)
     tracking        = False,  # Tracking on/off flag
@@ -241,6 +246,7 @@ cap = None
 picam2 = None
 _reader_thread = None
 _stop_reader = threading.Event()
+_camera_active = False   # False = idle (low fps, power-save); True = full fps. GCS-controlled.
 
 def _reader_playback(path, loop=False):
     """
@@ -283,6 +289,7 @@ def _reader_playback(path, loop=False):
 
         with frame_ready:
             state.current_frame = frame
+            state.frame_gen += 1
             frame_ready.notify_all()
 
         # Adjust pacing
@@ -343,9 +350,11 @@ def _init_live_camera():
         sensor={"output_size": sensor_res},
     )
     picam2.configure(config)
-    picam2.set_controls({"FrameRate": 30})
+    fps = _CAM_ACTIVE_FPS if _camera_active else _CAM_IDLE_FPS
+    picam2.set_controls({"FrameRate": fps})
     picam2.start()
-    print(f"[LIVE] Camera started MAIN={w}x{h} sensor={sensor_res}")
+    print(f"[LIVE] Camera started MAIN={w}x{h} sensor={sensor_res} @ {fps}fps "
+          f"({'active' if _camera_active else 'idle'})")
 
 def _reader_live_picam():
     """Continuously read frames from PiCamera2 and publish into current_frame."""
@@ -357,6 +366,7 @@ def _reader_live_picam():
             continue
         with frame_ready:
             state.current_frame = frame  # raw MAIN frame only
+            state.frame_gen += 1
             frame_ready.notify_all()
 
 def _restart_reader_live():
@@ -369,6 +379,24 @@ def _restart_reader_live():
     _init_live_camera()
     _reader_thread = Thread(target=_reader_live_picam, daemon=True)
     _reader_thread.start()
+
+def _set_camera_active(active: bool):
+    """
+    Explicit GCS-triggered toggle: raise/lower the live camera's capture FPS.
+    Idle (low fps) keeps the Pi's CPU/heat down while waiting; a GCS command
+    bumps it to full fps for responsive tracking. MAVLink keeps flowing at
+    the mavproxy level regardless of this setting.
+    """
+    global _camera_active
+    _camera_active = active
+    if picam2 is None:
+        return
+    fps = _CAM_ACTIVE_FPS if active else _CAM_IDLE_FPS
+    try:
+        picam2.set_controls({"FrameRate": fps})
+        print(f"[LIVE] Camera → {fps} fps ({'active' if active else 'idle'})")
+    except Exception as e:
+        print(f"[LIVE] Failed to set framerate {fps}: {e}")
 
 
 # === MAVLink / Serial Setup ===
@@ -401,7 +429,19 @@ def _shutdown(signum, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, _shutdown)
-signal.signal(signal.SIGHUP, _shutdown)                                                      
+signal.signal(signal.SIGHUP, _shutdown)
+
+# === CPU usage monitor (for GCS HUD) ===
+# Sampled in a dedicated thread so /status never blocks on psutil's 1s interval.
+_cpu_percent = 0.0
+
+def _cpu_monitor():
+    global _cpu_percent
+    psutil.cpu_percent(interval=None)   # prime the internal counter
+    while True:
+        _cpu_percent = psutil.cpu_percent(interval=1.0)
+
+Thread(target=_cpu_monitor, daemon=True).start()
 
 
 # Precomputed FOV constants (avoid recomputing math.radians every frame)
@@ -676,6 +716,9 @@ app = flask_app.create_app(
     get_launch_state_fn= lambda: mavlink_client._launched,
     toggle_record_fn   = lambda: _stop_recording() if _recording else _start_recording(),
     get_record_state_fn= lambda: _recording,
+    set_fps_fn         = _set_camera_active if args.mode == 'live' else None,
+    get_fps_state_fn   = lambda: _camera_active,
+    get_cpu_fn         = lambda: _cpu_percent,
 )
 
 # === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
@@ -797,12 +840,21 @@ _tq_monitor      = TrackingQualityMonitor()
 _last_tracker_id = None   # detect tracker replacement from ANY init path
 _tq_needs_init   = True   # capture first patch on next successful update
 
+_last_frame_gen = -1   # last state.frame_gen this loop has already processed
+
 while True:
-    # Wait for a new current_frame from reader
+    # Wait for a genuinely NEW frame (by generation, not just "not None") —
+    # otherwise, once current_frame is set once, this would spin re-processing
+    # and re-publishing the same stale frame as fast as the CPU allows,
+    # completely ignoring the camera's actual capture rate (incl. idle fps).
     with frame_ready:
-        if state.current_frame is None:
+        if state.frame_gen == _last_frame_gen:
             frame_ready.wait(timeout=0.02)
-        frame = None if state.current_frame is None else state.current_frame.copy()
+        if state.frame_gen == _last_frame_gen or state.current_frame is None:
+            frame = None
+        else:
+            frame = state.current_frame.copy()
+            _last_frame_gen = state.frame_gen
 
     if frame is None:
         key = cv2.waitKey(1) & 0xFF
