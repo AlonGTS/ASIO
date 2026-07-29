@@ -18,6 +18,7 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
     Arrows   Nudge target (5 px)
     X / Z    Cycle MAIN resolution  + / −
     V / C    Cycle TRACK resolution + / −
+    F        Toggle Pi camera FPS (idle/power-save ↔ full)
     P        Toggle Pi recording
     O        Toggle local (GCS) recording
     Q        Quit
@@ -98,6 +99,8 @@ moving_tgt      = False
 _pi_recording   = False   # Pi-side recording state (optimistic: toggled on each command)
 _local_recording = False  # GCS-side recording state
 _local_writer    = None   # cv2.VideoWriter when local recording is active
+cam_active      = False   # Pi camera fps state: False=idle (power-save), True=full fps
+_cpu_percent    = None    # Pi CPU usage %, polled from /status; None until first poll
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
@@ -232,6 +235,26 @@ def toggle_local_record(frame_w=640, frame_h=480):
         _local_writer   = cv2.VideoWriter(fname, fourcc, 20.0, (frame_w, frame_h))
         _local_recording = True
         set_status(f"Local REC → {fname}")
+
+def toggle_fps():
+    """Explicitly tell the Pi to switch camera capture between idle (power-save) and full fps."""
+    global cam_active
+    cam_active = not cam_active
+    _post("set_fps", active=1 if cam_active else 0)
+    set_status("Pi camera: FULL FPS" if cam_active else "Pi camera: IDLE (power-save)")
+
+def _status_poller():
+    """Background: poll /status every 2s to keep cam_active/_cpu_percent fresh
+    even when nothing else is triggering a request (e.g. after Pi restarts)."""
+    global cam_active, _cpu_percent
+    while not _quit.is_set():
+        data = _get("status")
+        if data:
+            cam_active   = data.get("active_fps", cam_active)
+            _cpu_percent = data.get("cpu_percent", _cpu_percent)
+        time.sleep(2.0)
+
+threading.Thread(target=_status_poller, daemon=True).start()
 
 def cycle_main(delta):
     _post("cycle_main", delta=delta)
@@ -371,6 +394,14 @@ def _build_buttons(vx: int):
         36, lambda: toggle_local_record(_cur_video_w, _cur_video_h),
         lambda: (140, 30, 30) if _local_recording else (35, 120, 35),
     )
+    y += 44
+
+    # ── Pi camera FPS (idle/power-save ↔ full) ─────────────────────────────
+    btn(
+        lambda: "FPS: FULL" if cam_active else "FPS: IDLE",
+        36, toggle_fps,
+        lambda: (30, 140, 50) if cam_active else (90, 90, 30),
+    )
     y += 52
 
     # ── D-pad ──────────────────────────────────────────────────────────────
@@ -413,8 +444,16 @@ def draw_hud(frame, fps):
         cv2.putText(frame, msg, pos, _FONT, scale, color,   1, cv2.LINE_AA)
 
     txt(f"FPS {fps:4.1f}",                            (8,   25))
-    txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (130, 25), color=mode_col)
-    txt("LAUNCHED" if launched else "READY",           (255, 25), color=launch_col)
+
+    if _cpu_percent is not None:
+        cpu_col = (60, 200, 60) if _cpu_percent < 50 else \
+                  (60, 160, 255) if _cpu_percent < 80 else (60, 60, 220)
+        txt(f"CPU {_cpu_percent:3.0f}%", (100, 25), color=cpu_col)
+    txt("FULL" if cam_active else "IDLE",             (195, 25),
+        color=(60, 200, 60) if cam_active else (150, 150, 150))
+
+    txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (255, 25), color=mode_col)
+    txt("LAUNCHED" if launched else "READY",           (380, 25), color=launch_col)
 
     # REC indicators — blinking every second
     rec_x = w - 16
@@ -649,6 +688,7 @@ def main():
         elif k in (ord('z'), ord('Z')): cycle_main(-1)
         elif k in (ord('v'), ord('V')): cycle_lores(+1)
         elif k in (ord('c'), ord('C')): cycle_lores(-1)
+        elif k in (ord('f'), ord('F')): toggle_fps()
         elif k in (ord('p'), ord('P')): toggle_pi_record(est_fps)
         elif k in (ord('o'), ord('O')): toggle_local_record(_cur_video_w, _cur_video_h)
 
