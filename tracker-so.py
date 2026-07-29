@@ -12,7 +12,10 @@ import threading
 from types import SimpleNamespace
 
 # CLI args / timestamps / small GUI dialogs for file/duration picking
+import fcntl
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tomllib
@@ -169,9 +172,19 @@ MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
 MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 
+def _get_iface_ip(iface: str) -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            return socket.inet_ntoa(
+                fcntl.ioctl(s.fileno(), 0x8915,
+                            struct.pack('256s', iface[:15].encode()))[20:24]
+            )
+    except OSError:
+        return None
+
 _net_iface  = _cfg["network"]["interface"]
 _net        = _cfg["network"][_net_iface]
-BIND_IP     = _net["bind_ip"]
+BIND_IP     = _get_iface_ip(_net_iface) or _net["bind_ip"]
 _VIDEO_MODE = _cfg["network"].get("video_mode", "jpeg_udp")
 GCS_IP     = None   # learned dynamically when GCS announces itself over the command channel
 print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs=<waiting for GCS hello>")
@@ -361,12 +374,15 @@ def _restart_reader_live():
 # === MAVLink / Serial Setup ===
 import mavlink_client
 _mav_cfg = _cfg["mavlink"]
+AUTOPILOT = _mav_cfg.get("autopilot", "custom")
+mavlink_client.set_autopilot(AUTOPILOT)
 mavlink_client.start_mavproxy(
     pixhawk_port  = _mav_cfg["pixhawk_port"],
     pixhawk_baud  = _mav_cfg["pixhawk_baud"],
     gcs_port      = _mav_cfg["gcs_port"],
     local_port    = _mav_cfg["local_port"],
     extra_outputs = _mav_cfg.get("extra_outputs", []),
+    mavproxy_path = _mav_cfg.get("mavproxy_path"),
 )
 mavlink_client.connect(
     url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",
@@ -391,6 +407,15 @@ signal.signal(signal.SIGHUP, _shutdown)
 # Precomputed FOV constants (avoid recomputing math.radians every frame)
 _HFOV_RAD = math.radians(60)   # ~60° horizontal FOV
 _VFOV_RAD = math.radians(45)   # ~45° vertical FOV
+
+# PX4 rate-mode gain — px4 mode only, does not touch custom mode's _mav_x/_mav_y.
+# _px4_pitch_err/_px4_yaw_err are sent as body-RATE setpoints (see
+# mavlink_client.send_attitude_target), but their raw FOV-derived value tops
+# out at the frame edge around ±22.5° (pitch) / ±30° (yaw) — nowhere near a
+# meaningful rate. This gain scales that up so a target pinned at the frame
+# edge commands ~100°/s on the larger (yaw) axis; MAX_ANGLE in
+# mavlink_client.py still clamps above that as a hard ceiling.
+_PX4_RATE_GAIN = math.radians(100) / (_HFOV_RAD / 2)
 
 # === Command-line arguments setup ===
 parser = argparse.ArgumentParser()
@@ -628,20 +653,35 @@ def _cycle_lores(delta):
     state.lores_size = list(LORES_SIZES[_lores_idx])
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
 
+# Launch button: "custom" mode just flips the launch flag the Simulink app
+# reads over NAMED_VALUE_FLOAT; "px4" mode actually arms/disarms the FC
+# (mode switch already happened at connect time, see set_guided_mode()).
+def _launch_fn(v=None):
+    launch = v if v is not None else not mavlink_client._launched
+    if AUTOPILOT == "px4":
+        if launch:
+            time.sleep(1)  # give the FC a beat to settle into OFFBOARD before arming
+            mavlink_client.arm()
+        else:
+            mavlink_client.disarm()
+    else:
+        mavlink_client.set_launch(launch)
+
 import flask_app
 app = flask_app.create_app(
     state, create_gts_tracker,
     cycle_main_fn      = _cycle_main if args.mode == 'live' else None,
     cycle_lores_fn     = _cycle_lores,
-    launch_fn          = lambda v=None: mavlink_client.set_launch(v if v is not None else not mavlink_client._launched),
+    launch_fn          = _launch_fn,
     get_launch_state_fn= lambda: mavlink_client._launched,
     toggle_record_fn   = lambda: _stop_recording() if _recording else _start_recording(),
     get_record_state_fn= lambda: _recording,
 )
 
-# === Launch Flask in separate thread ===
-print(f"[Flask]  http://{BIND_IP}:5000")
-flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
+# === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
+from waitress import serve as _waitress_serve
+print(f"[Flask]  http://{BIND_IP}:5000  (waitress)")
+flask_thread = Thread(target=lambda: _waitress_serve(app, host="0.0.0.0", port=5000, threads=8, _quiet=True))
 flask_thread.daemon = True
 flask_thread.start()
 
@@ -812,7 +852,8 @@ while True:
         break
 
     # Tracking on LORES (lores_frame computed above, before dims check)
-    _mav_x, _mav_y = 100.0, 100.0  # sentinel: not tracking
+    _mav_x, _mav_y = 100.0, 100.0  # sentinel: not tracking ("custom" mode)
+    _px4_pitch_err, _px4_yaw_err = 0.0, 0.0  # neutral hold ("px4" mode)
 
     # Detect tracker replacement from ANY init path (flask, mouse, resolution change)
     if state.tracker is not None and id(state.tracker) != _last_tracker_id:
@@ -886,6 +927,8 @@ while True:
                     # Only drive the drone when quality is sufficient
                     if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
                         _mav_x, _mav_y = pitch_norm, yaw_norm
+                        _px4_pitch_err = -norm_dy * _VFOV_RAD * _PX4_RATE_GAIN
+                        _px4_yaw_err   =  norm_dx * _HFOV_RAD * _PX4_RATE_GAIN
 
                     # Box color encodes quality level
                     if tq >= TrackingQualityMonitor.SCORE_GOOD:
@@ -912,8 +955,17 @@ while True:
             print(f"[ERROR] Tracker update failed: {e}")
             state.tracking = False
 
-    is_tracking = (_mav_x != 100.0)
-    mavlink_client.send_vision_error(_mav_x, _mav_y, is_tracking)
+    if AUTOPILOT == "px4":
+        # PX4's OFFBOARD mode auto-exits if the setpoint stream stops even
+        # briefly, so this must run every frame regardless of tracking state
+        # — untracked/low-quality frames fall back to the neutral-hold
+        # sentinel set above, keeping the stream alive without commanding
+        # a real correction.
+        _px4_thrust = 0.5 if mavlink_client._launched else 0.0
+        mavlink_client.send_attitude_target(_px4_pitch_err, _px4_yaw_err, thrust=_px4_thrust)
+    else:
+        is_tracking = (_mav_x != 100.0)
+        mavlink_client.send_vision_error(_mav_x, _mav_y, is_tracking)
 
     # Write to file if in record mode (timed) or live toggle recording
     if args.mode == 'record' and record_queue is not None:
@@ -982,7 +1034,7 @@ while True:
         state.tracking = False; state.bbox = None; state.tracker = None
         print("[INFO] Tracker reset from Pi")
     elif key == ord('l'):
-        mavlink_client.set_launch(not mavlink_client._launched)
+        _launch_fn(not mavlink_client._launched)
     elif args.mode == 'live':
         if key == ord('x'):   _cycle_main(+1)
         elif key == ord('z'): _cycle_main(-1)
