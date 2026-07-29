@@ -1,0 +1,27 @@
+# Python deps for tracker-so.py / flask_app.py / gcs.py / mavlink_client.py / webrtc_server.py
+#
+# cv2 (opencv) and picamera2 are NOT listed here — on Raspberry Pi OS they come
+# from apt (they need the system libcamera bindings) and are exposed to the venv
+# via --system-site-packages. See README.md "Deploying to another Pi".
+#
+# Install with:
+#   pip install -r requirements.txt
+
+numpy==1.24.2
+Flask==2.2.2
+flask-cors==6.0.1
+requests==2.28.1
+pymavlink==2.4.43
+pyserial==3.5
+psutil==5.9.4
+waitress==3.0.2
+
+# WebRTC video path (webrtc_server.py) — imported unconditionally by tracker-so.py
+# even when config.toml's video_mode is "jpeg_udp", so these are always required.
+aiohttp==3.13.1
+aiortc==1.14.0
+av==16.0.1
+
+# Only needed to rebuild gts_tracker.pyx into a .so (see README) — not required
+# to just run the tracker with the prebuilt .so already in the repo.
+Cython==3.2.4
