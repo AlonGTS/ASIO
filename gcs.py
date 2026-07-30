@@ -18,6 +18,7 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
     Arrows   Nudge target (5 px)
     X / Z    Cycle MAIN resolution  + / −
     V / C    Cycle TRACK resolution + / −
+    F        Toggle Pi camera FPS (idle/power-save ↔ full)
     P        Toggle Pi recording
     O        Toggle local (GCS) recording
     Q        Quit
@@ -65,8 +66,6 @@ CMD_PORT = 5601
 # UDP socket for sending commands directly to the Pi (unicast)
 import json as _json
 _cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-# Pi's real IP, learned from the first incoming video packet (overrides configured PI_IP)
-_discovered_pi_ip = None
 
 print(f"[GCS] Pi={PI_IP}  video={UDP_PORT}  cmd={CMD_PORT}")
 
@@ -80,7 +79,7 @@ def _heartbeat_sender():
     msg = _json.dumps({}).encode()   # empty payload — no endpoint → Pi ignores body
     while True:
         try:
-            _cmd_sock.sendto(msg, (_discovered_pi_ip or PI_IP, CMD_PORT))
+            _cmd_sock.sendto(msg, (PI_IP, CMD_PORT))
         except Exception:
             pass
         time.sleep(3)
@@ -100,6 +99,8 @@ moving_tgt      = False
 _pi_recording   = False   # Pi-side recording state (optimistic: toggled on each command)
 _local_recording = False  # GCS-side recording state
 _local_writer    = None   # cv2.VideoWriter when local recording is active
+cam_active      = False   # Pi camera fps state: False=idle (power-save), True=full fps
+_cpu_percent    = None    # Pi CPU usage %, polled from /status; None until first poll
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
@@ -118,7 +119,7 @@ def _post(endpoint, **data):
     """Send command to Pi via UDP unicast. Non-blocking, no TCP needed."""
     msg = _json.dumps({"endpoint": endpoint, **data}).encode()
     try:
-        _cmd_sock.sendto(msg, (_discovered_pi_ip or PI_IP, CMD_PORT))
+        _cmd_sock.sendto(msg, (PI_IP, CMD_PORT))
     except Exception as e:
         set_status(f"CMD error: {e}")
 
@@ -231,9 +232,30 @@ def toggle_local_record(frame_w=640, frame_h=480):
         ts    = time.strftime("%Y%m%d_%H%M%S")
         fname = f"gcs_rec_{ts}.mp4"
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        _local_writer   = cv2.VideoWriter(fname, fourcc, 20.0, (frame_w, frame_h))
+        rec_fps = est_fps_ref[0] if est_fps_ref[0] >= 1.0 else 20.0
+        _local_writer   = cv2.VideoWriter(fname, fourcc, rec_fps, (frame_w, frame_h))
         _local_recording = True
         set_status(f"Local REC → {fname}")
+
+def toggle_fps():
+    """Explicitly tell the Pi to switch camera capture between idle (power-save) and full fps."""
+    global cam_active
+    cam_active = not cam_active
+    _post("set_fps", active=1 if cam_active else 0)
+    set_status("Pi camera: FULL FPS" if cam_active else "Pi camera: IDLE (power-save)")
+
+def _status_poller():
+    """Background: poll /status every 2s to keep cam_active/_cpu_percent fresh
+    even when nothing else is triggering a request (e.g. after Pi restarts)."""
+    global cam_active, _cpu_percent
+    while not _quit.is_set():
+        data = _get("status")
+        if data:
+            cam_active   = data.get("active_fps", cam_active)
+            _cpu_percent = data.get("cpu_percent", _cpu_percent)
+        time.sleep(2.0)
+
+threading.Thread(target=_status_poller, daemon=True).start()
 
 def cycle_main(delta):
     _post("cycle_main", delta=delta)
@@ -361,7 +383,7 @@ def _build_buttons(vx: int):
 
     # ── Pi Record ──────────────────────────────────────────────────────────
     btn(
-        lambda: "[.] Pi REC" if _pi_recording else "(*) Pi REC",
+        lambda: "■ Pi REC" if _pi_recording else "● Pi REC",
         36, lambda: toggle_pi_record(est_fps_ref[0]),
         lambda: (30, 30, 180) if _pi_recording else (35, 120, 35),
     )
@@ -369,9 +391,17 @@ def _build_buttons(vx: int):
 
     # ── Local Record ───────────────────────────────────────────────────────
     btn(
-        lambda: "[.] Local REC" if _local_recording else "(*) Local REC",
+        lambda: "■ Local REC" if _local_recording else "● Local REC",
         36, lambda: toggle_local_record(_cur_video_w, _cur_video_h),
         lambda: (140, 30, 30) if _local_recording else (35, 120, 35),
+    )
+    y += 44
+
+    # ── Pi camera FPS (idle/power-save ↔ full) ─────────────────────────────
+    btn(
+        lambda: "FPS: FULL" if cam_active else "FPS: IDLE",
+        36, toggle_fps,
+        lambda: (30, 140, 50) if cam_active else (90, 90, 30),
     )
     y += 52
 
@@ -415,8 +445,16 @@ def draw_hud(frame, fps):
         cv2.putText(frame, msg, pos, _FONT, scale, color,   1, cv2.LINE_AA)
 
     txt(f"FPS {fps:4.1f}",                            (8,   25))
-    txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (130, 25), color=mode_col)
-    txt("LAUNCHED" if launched else "READY",           (255, 25), color=launch_col)
+
+    if _cpu_percent is not None:
+        cpu_col = (60, 200, 60) if _cpu_percent < 50 else \
+                  (60, 160, 255) if _cpu_percent < 80 else (60, 60, 220)
+        txt(f"CPU {_cpu_percent:3.0f}%", (100, 25), color=cpu_col)
+    txt("FULL" if cam_active else "IDLE",             (195, 25),
+        color=(60, 200, 60) if cam_active else (150, 150, 150))
+
+    txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (255, 25), color=mode_col)
+    txt("LAUNCHED" if launched else "READY",           (380, 25), color=launch_col)
 
     # REC indicators — blinking every second
     rec_x = w - 16
@@ -499,13 +537,9 @@ class _LiveCapture:
 
     def _reader(self):
         """Receive JPEG datagrams and decode them; marks _ok=False on timeout."""
-        global _discovered_pi_ip
         while True:
             try:
-                data, addr = self._sock.recvfrom(1 << 16)  # 65536 bytes max UDP payload
-                if _discovered_pi_ip is None:
-                    _discovered_pi_ip = addr[0]
-                    print(f"[GCS] Pi discovered at {_discovered_pi_ip}")
+                data, _ = self._sock.recvfrom(1 << 16)  # 65536 bytes max UDP payload
                 arr   = np.frombuffer(data, dtype=np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame is not None:
@@ -567,6 +601,7 @@ def main():
 
     last_frame_ts = None
     last_frame_id = 0
+    last_rec_id   = 0
     est_fps       = 0.0
     FPS_A         = 0.9
 
@@ -575,10 +610,6 @@ def main():
 
         if not ok or frame is None:
             frame = _waiting_frame(_cur_video_w, _cur_video_h)
-            # Drop to 0 if no real frame for more than 1 s
-            if last_frame_ts is not None and (time.time() - last_frame_ts) > 1.0:
-                est_fps       = 0.0
-                last_frame_ts = None
         else:
             # Stretch to DISPLAY_W regardless of stream resolution
             # so the window stays the same size even when stream is downscaled
@@ -608,8 +639,11 @@ def main():
 
         draw_hud(frame, est_fps)
 
-        # Write to local recorder (video + HUD, no panel)
-        if _local_recording and _local_writer is not None:
+        # Write to local recorder (video + HUD, no panel) — only on genuinely
+        # new frames, so recorded playback speed matches real time instead of
+        # being stretched by the render loop re-writing the same cached frame.
+        if _local_recording and _local_writer is not None and frame_id != last_rec_id:
+            last_rec_id = frame_id
             fh, fw = frame.shape[:2]
             rec_frame = frame if (fw, fh) == (_cur_video_w, _cur_video_h) else \
                         cv2.resize(frame, (_cur_video_w, _cur_video_h))
@@ -664,6 +698,7 @@ def main():
         elif k in (ord('z'), ord('Z')): cycle_main(-1)
         elif k in (ord('v'), ord('V')): cycle_lores(+1)
         elif k in (ord('c'), ord('C')): cycle_lores(-1)
+        elif k in (ord('f'), ord('F')): toggle_fps()
         elif k in (ord('p'), ord('P')): toggle_pi_record(est_fps)
         elif k in (ord('o'), ord('O')): toggle_local_record(_cur_video_w, _cur_video_h)
 
