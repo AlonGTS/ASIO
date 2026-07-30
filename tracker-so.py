@@ -1046,11 +1046,6 @@ while True:
                     cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
                     cv2.line(frame, (cx - 10, cy), (cx + 10, cy), box_color, 1)
                     cv2.line(frame, (cx, cy - 10), (cx, cy + 10), box_color, 1)
-                    label = f"TQ:{int(tq * 100)}%"
-                    if _tq_monitor.bad_frames > 0:
-                        label += f" ({_tq_monitor.bad_frames}/{TrackingQualityMonitor.BAD_FRAMES_LIMIT})"
-                    cv2.putText(frame, label, (x, max(14, y - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2, cv2.LINE_AA)
             else:
                 _tq_monitor.reset()
                 cv2.putText(frame, "Tracking lost", (10, 140),
