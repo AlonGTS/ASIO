@@ -176,7 +176,7 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
         from flask import jsonify
         launched  = get_launch_state_fn()  if get_launch_state_fn  else False
         recording = get_record_state_fn()  if get_record_state_fn  else False
-        return jsonify({"launched": launched, "recording": recording})
+        return jsonify({"launched": launched, "recording": recording, "tracking": state.tracking})
 
     @app.route('/cycle_lores', methods=['POST'])
     def cycle_lores():

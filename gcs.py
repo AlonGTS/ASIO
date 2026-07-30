@@ -22,6 +22,11 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
     P        Toggle Pi recording
     O        Toggle local (GCS) recording
     Q        Quit
+
+Gamepad (optional): connect a PS4/PS5 controller (USB or Bluetooth) before
+launching. While not tracking, its D-pad moves a red crosshair over the video
+(local only, no network traffic) — press the LOCK TARGET panel button to
+select whatever the crosshair is pointing at, same as a mouse click.
 """
 
 import argparse
@@ -35,6 +40,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import requests
+
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")  # pygame is only used for joystick input, no window needed
+try:
+    import pygame
+except ImportError:
+    pygame = None
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -89,7 +100,7 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 560     # minimum canvas height so all buttons fit
+PANEL_MIN_H = 620     # minimum canvas height so all buttons fit
 DISPLAY_W   = 640     # video is always stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -101,6 +112,10 @@ _local_recording = False  # GCS-side recording state
 _local_writer    = None   # cv2.VideoWriter when local recording is active
 cam_active      = False   # Pi camera fps state: False=idle (power-save), True=full fps
 _cpu_percent    = None    # Pi CPU usage %, polled from /status; None until first poll
+_cpu_temp_c     = None    # Pi SoC temperature °C, polled from /status; None until first poll
+_pi_tracking    = False   # Pi-side tracking state, polled from /status
+_cross_x        = None    # crosshair position (display px) — gamepad-controlled pre-lock target picker
+_cross_y        = None    # None until first frame establishes the display size
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
@@ -220,6 +235,15 @@ def select_point(x, y):
     _post("select_point", nx=nx, ny=ny)
     set_status(f"Selected ({x}, {y})")
 
+def lock_target():
+    """Commit the gamepad-controlled crosshair as the tracking target."""
+    global _pi_tracking
+    if _cross_x is None:
+        set_status("No crosshair position yet")
+        return
+    select_point(_cross_x, _cross_y)
+    _pi_tracking = True   # optimistic — confirmed/corrected by the next /status poll
+
 def toggle_local_record(frame_w=640, frame_h=480):
     global _local_recording, _local_writer
     if _local_recording:
@@ -245,14 +269,16 @@ def toggle_fps():
     set_status("Pi camera: FULL FPS" if cam_active else "Pi camera: IDLE (power-save)")
 
 def _status_poller():
-    """Background: poll /status every 2s to keep cam_active/_cpu_percent fresh
-    even when nothing else is triggering a request (e.g. after Pi restarts)."""
-    global cam_active, _cpu_percent
+    """Background: poll /status every 2s to keep cam_active/_cpu_percent/_cpu_temp_c/
+    _pi_tracking fresh even when nothing else is triggering a request (e.g. after Pi restarts)."""
+    global cam_active, _cpu_percent, _cpu_temp_c, _pi_tracking
     while not _quit.is_set():
         data = _get("status")
         if data:
             cam_active   = data.get("active_fps", cam_active)
             _cpu_percent = data.get("cpu_percent", _cpu_percent)
+            _cpu_temp_c  = data.get("cpu_temp", _cpu_temp_c)
+            _pi_tracking = data.get("tracking", _pi_tracking)
         time.sleep(2.0)
 
 threading.Thread(target=_status_poller, daemon=True).start()
@@ -415,6 +441,10 @@ def _build_buttons(vx: int):
     _buttons.append(Button("v",  dpx + dw,       y + dh*2,   dw, dh, lambda: nudge( 0,  5), (75,75,75)))
     y += dh * 3 + 16
 
+    # ── Lock target (commits gamepad crosshair position) ───────────────────
+    btn("LOCK TARGET", 40, lock_target, (50, 50, 200))
+    y += 48
+
     # ── Resolution cycling ─────────────────────────────────────────────────
     btn2("MAIN -", "MAIN +",   32,
          lambda: cycle_main(-1), lambda: cycle_main(+1), (55, 55, 85))
@@ -431,6 +461,12 @@ _build_buttons(640)
 
 # ── HUD overlay (drawn on video portion only) ─────────────────────────────────
 
+def draw_crosshair(frame, x, y, size=14, color=(50, 50, 230)):
+    """Red crosshair for the gamepad-controlled pre-lock target picker."""
+    cv2.line(frame, (x - size, y), (x + size, y), color, 2, cv2.LINE_AA)
+    cv2.line(frame, (x, y - size), (x, y + size), color, 2, cv2.LINE_AA)
+    cv2.circle(frame, (x, y), size // 2, color, 1, cv2.LINE_AA)
+
 def draw_hud(frame, fps):
     h, w = frame.shape[:2]
 
@@ -443,18 +479,29 @@ def draw_hud(frame, fps):
     def txt(msg, pos, color=(240,240,240), scale=0.55):
         cv2.putText(frame, msg, pos, _FONT, scale, (0,0,0), 3, cv2.LINE_AA)
         cv2.putText(frame, msg, pos, _FONT, scale, color,   1, cv2.LINE_AA)
+        (tw, _), _ = cv2.getTextSize(msg, _FONT, scale, 1)
+        return tw
 
-    txt(f"FPS {fps:4.1f}",                            (8,   25))
+    x = 8
+    GAP = 14
+    x += txt(f"FPS {fps:4.1f}", (x, 25)) + GAP
 
     if _cpu_percent is not None:
         cpu_col = (60, 200, 60) if _cpu_percent < 50 else \
                   (60, 160, 255) if _cpu_percent < 80 else (60, 60, 220)
-        txt(f"CPU {_cpu_percent:3.0f}%", (100, 25), color=cpu_col)
-    txt("FULL" if cam_active else "IDLE",             (195, 25),
-        color=(60, 200, 60) if cam_active else (150, 150, 150))
+        x += txt(f"CPU {_cpu_percent:3.0f}%", (x, 25), color=cpu_col) + GAP
 
-    txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (255, 25), color=mode_col)
-    txt("LAUNCHED" if launched else "READY",           (380, 25), color=launch_col)
+    if _cpu_temp_c is not None:
+        # Pi SoC starts soft-throttling around ~80C, hard throttle ~85C
+        temp_col = (60, 200, 60) if _cpu_temp_c < 60 else \
+                   (60, 160, 255) if _cpu_temp_c < 75 else (60, 60, 220)
+        x += txt(f"{_cpu_temp_c:4.1f}C", (x, 25), color=temp_col) + GAP
+
+    x += txt("FULL" if cam_active else "IDLE", (x, 25),
+             color=(60, 200, 60) if cam_active else (150, 150, 150)) + GAP
+
+    x += txt(f"{'MOVING' if moving_tgt else 'FIXED'}", (x, 25), color=mode_col) + GAP
+    txt("LAUNCHED" if launched else "READY", (x, 25), color=launch_col)
 
     # REC indicators — blinking every second
     rec_x = w - 16
@@ -508,6 +555,45 @@ _ARROW = {
     2490368:(0,-1), 2621440:(0,1), 2424832:(-1,0), 2555904:(1,0),  # Windows
     82:(0,-1), 84:(0,1), 81:(-1,0), 83:(1,0),               # Linux fallback
 }
+
+
+# ── Gamepad (optional) — PS4/PS5 D-pad drives the pre-lock crosshair ──────────
+#
+# D-pad on this controller reports as 4 discrete buttons rather than a hat
+# (SDL/macOS quirk over Bluetooth) — mapping verified against a PS4 controller;
+# adjust _DPAD_BUTTONS if directions come out swapped on a different pad.
+
+_DPAD_BUTTONS   = {11: (0, -1), 13: (-1, 0), 12: (0, 1), 14: (1, 0)}  # Up, Left, Down, Right
+_CROSS_STEP     = 5      # crosshair px moved per loop iteration while a D-pad direction is held
+                         # (local only — no network round-trip, so this can move as fast as feels good)
+
+class _Gamepad:
+    def __init__(self):
+        self._joy = None
+        if pygame is None:
+            return
+        try:
+            pygame.display.init()
+            pygame.joystick.init()
+            if pygame.joystick.get_count() > 0:
+                self._joy = pygame.joystick.Joystick(0)
+                self._joy.init()
+                print(f"[Gamepad] connected: {self._joy.get_name()}")
+        except Exception as e:
+            print(f"[Gamepad] unavailable: {e}")
+
+    def direction(self):
+        """Return (dx, dy) each in {-1,0,1} from currently held D-pad buttons."""
+        if self._joy is None:
+            return 0, 0
+        pygame.event.pump()
+        dx = dy = 0
+        n = self._joy.get_numbuttons()
+        for btn, (bx, by) in _DPAD_BUTTONS.items():
+            if btn < n and self._joy.get_button(btn):
+                dx += bx
+                dy += by
+        return dx, dy
 
 
 # ── Live capture — background reader thread ───────────────────────────────────
@@ -564,7 +650,7 @@ class _LiveCapture:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit
+    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit, _cross_x, _cross_y
 
     data     = _get("status")
     launched = data.get("launched", False)
@@ -573,7 +659,8 @@ def main():
     else:
         set_status(f"Commands via UDP broadcast — waiting for video…")
 
-    cap = _LiveCapture(UDP_PORT)
+    cap     = _LiveCapture(UDP_PORT)
+    gamepad = _Gamepad()
 
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
@@ -599,11 +686,11 @@ def main():
 
     cv2.setMouseCallback("Mahat GCS", on_mouse)
 
-    last_frame_ts = None
-    last_frame_id = 0
-    last_rec_id   = 0
-    est_fps       = 0.0
-    FPS_A         = 0.9
+    last_frame_ts   = None
+    last_frame_id   = 0
+    last_rec_id     = 0
+    est_fps         = 0.0
+    FPS_A           = 0.9
 
     while not _quit.is_set():
         ok, frame, frame_id = cap.read()
@@ -638,6 +725,19 @@ def main():
         est_fps_ref[0] = est_fps   # share live FPS with button lambdas
 
         draw_hud(frame, est_fps)
+
+        # ── Gamepad crosshair — pre-lock target picker ──────────────────────
+        # D-pad moves this locally (no network round-trip, so it's instant/smooth);
+        # LOCK button sends the final position as a single select_point() call.
+        if _cross_x is None:
+            _cross_x, _cross_y = w // 2, h // 2
+
+        if not _pi_tracking:
+            gx, gy = gamepad.direction()
+            if gx or gy:
+                _cross_x = max(0, min(w - 1, _cross_x + gx * _CROSS_STEP))
+                _cross_y = max(0, min(h - 1, _cross_y + gy * _CROSS_STEP))
+            draw_crosshair(frame, _cross_x, _cross_y)
 
         # Write to local recorder (video + HUD, no panel) — only on genuinely
         # new frames, so recorded playback speed matches real time instead of
