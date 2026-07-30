@@ -330,6 +330,26 @@ def _restart_playback(new_path=None):
     _reader_thread.start()
     print(f"[PLAYBACK] Restarted: {path}")
 
+def _pick_full_fov_sensor_mode(picam2, min_fps):
+    """
+    Pick the smallest (fastest-reading-out) sensor mode whose crop still spans
+    the WHOLE sensor array — same full FOV as the native resolution — instead
+    of hardcoding the full pixel array as output_size. On IMX708 the full-res
+    4608x2592 mode is full-FOV but caps out at ~14 fps; the 2x2-binned
+    2304x1296 mode is *also* full-FOV (same crop_limits) and reaches ~56 fps.
+    Falls back to the full-resolution mode if no full-FOV mode hits min_fps.
+    """
+    full_w, full_h = picam2.sensor_resolution
+    full_fov = [m for m in picam2.sensor_modes
+                if tuple(m["crop_limits"][2:]) == (full_w, full_h)]
+    if not full_fov:
+        return (full_w, full_h)
+    full_fov.sort(key=lambda m: m["size"][0] * m["size"][1])  # smallest/fastest first
+    for m in full_fov:
+        if m["fps"] >= min_fps:
+            return m["size"]
+    return max(full_fov, key=lambda m: m["fps"])["size"]
+
 def _init_live_camera():
     """(Re)create and start PiCamera2 with the current main_size."""
     global picam2
@@ -343,17 +363,18 @@ def _init_live_camera():
 
     picam2 = Picamera2()
     w, h = main_size
-    sensor_res = picam2.sensor_resolution  # full sensor pixel array
-    # Explicitly request full-sensor mode so ISP downscales to (w,h) — consistent FOV
+    # Pick a sensor mode covering the full array (consistent FOV) fast enough
+    # for active_fps, instead of always forcing the full-res ~14fps mode.
+    sensor_size = _pick_full_fov_sensor_mode(picam2, _CAM_ACTIVE_FPS)
     config = picam2.create_preview_configuration(
         main={"size": (int(w), int(h)), "format": "RGB888"},
-        sensor={"output_size": sensor_res},
+        sensor={"output_size": sensor_size},
     )
     picam2.configure(config)
     fps = _CAM_ACTIVE_FPS if _camera_active else _CAM_IDLE_FPS
     picam2.set_controls({"FrameRate": fps})
     picam2.start()
-    print(f"[LIVE] Camera started MAIN={w}x{h} sensor={sensor_res} @ {fps}fps "
+    print(f"[LIVE] Camera started MAIN={w}x{h} sensor={sensor_size} @ {fps}fps "
           f"({'active' if _camera_active else 'idle'})")
 
 def _reader_live_picam():
@@ -431,15 +452,32 @@ def _shutdown(signum, frame):
 signal.signal(signal.SIGTERM, _shutdown)
 signal.signal(signal.SIGHUP, _shutdown)
 
-# === CPU usage monitor (for GCS HUD) ===
+# === CPU usage/temp monitor (for GCS HUD) ===
 # Sampled in a dedicated thread so /status never blocks on psutil's 1s interval.
 _cpu_percent = 0.0
+_cpu_temp_c  = None
+
+def _read_cpu_temp_c():
+    """Pi SoC temperature in °C, or None if unavailable (e.g. non-Pi host)."""
+    try:
+        zones = psutil.sensors_temperatures()
+        zone = zones.get("cpu_thermal") or next(iter(zones.values()), None)
+        if zone:
+            return zone[0].current
+    except Exception:
+        pass
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return int(f.read().strip()) / 1000.0
+    except Exception:
+        return None
 
 def _cpu_monitor():
-    global _cpu_percent
+    global _cpu_percent, _cpu_temp_c
     psutil.cpu_percent(interval=None)   # prime the internal counter
     while True:
         _cpu_percent = psutil.cpu_percent(interval=1.0)
+        _cpu_temp_c  = _read_cpu_temp_c()
 
 Thread(target=_cpu_monitor, daemon=True).start()
 
@@ -719,6 +757,7 @@ app = flask_app.create_app(
     set_fps_fn         = _set_camera_active if args.mode == 'live' else None,
     get_fps_state_fn   = lambda: _camera_active,
     get_cpu_fn         = lambda: _cpu_percent,
+    get_cpu_temp_fn    = lambda: _cpu_temp_c,
 )
 
 # === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
@@ -747,6 +786,12 @@ elif _VIDEO_MODE == "jpeg_udp":
     _UDP_PORT     = _cfg["network"].get("gcs_udp_port", 5600)
     _JPEG_QUALITY = _cfg["network"].get("gcs_jpeg_quality", 40)
     _STREAM_WIDTH = _cfg["network"].get("gcs_stream_width", 480)
+    # Encode+send rate to the GCS is independent of capture/tracking fps — the
+    # operator's video view doesn't need every frame, but the tracker/MAVLink
+    # loop does. Throttling this is the cheapest way to cut CPU without
+    # slowing down tracking. 0 = uncapped (encode every published frame).
+    _STREAM_FPS   = _cfg["network"].get("gcs_stream_fps", 15)
+    _STREAM_INTERVAL = (1.0 / _STREAM_FPS) if _STREAM_FPS > 0 else 0.0
 
     _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)
@@ -755,10 +800,12 @@ elif _VIDEO_MODE == "jpeg_udp":
     _UDP_MAX     = 65400
 
     def _udp_stream_worker():
-        last_gen  = -1
-        _t0       = time.time()
-        _sent     = 0
-        print(f"[UDP]  stream worker ready — waiting for GCS to announce")
+        last_gen      = -1
+        _t0           = time.time()
+        _sent         = 0
+        _last_send_ts = 0.0
+        print(f"[UDP]  stream worker ready — waiting for GCS to announce "
+              f"(cap {_STREAM_FPS if _STREAM_FPS > 0 else 'uncapped'} fps)")
         while True:
             frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
             if frame is None:
@@ -767,6 +814,11 @@ elif _VIDEO_MODE == "jpeg_udp":
 
             if GCS_IP is None:
                 continue
+
+            _now_gate = time.time()
+            if _STREAM_INTERVAL > 0 and (_now_gate - _last_send_ts) < _STREAM_INTERVAL:
+                continue   # skip encode+send for this frame — capture/tracking keep running at full fps
+            _last_send_ts = _now_gate
 
             _sent += 1
             _now = time.time()

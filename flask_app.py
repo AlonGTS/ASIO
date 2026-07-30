@@ -12,7 +12,7 @@ from flask import Flask, request
 from flask_cors import CORS
 
 
-def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None):
+def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None, get_cpu_temp_fn=None):
     """
     Build and return the Flask app with all control routes bound to `state`.
     state is a SimpleNamespace with: command_from_remote, bbox, tracking,
@@ -190,9 +190,11 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
         recording = get_record_state_fn()  if get_record_state_fn  else False
         active_fps  = get_fps_state_fn()   if get_fps_state_fn     else False
         cpu_percent = get_cpu_fn()         if get_cpu_fn           else None
+        cpu_temp    = get_cpu_temp_fn()    if get_cpu_temp_fn      else None
         return jsonify({
             "launched": launched, "recording": recording,
             "active_fps": active_fps, "cpu_percent": cpu_percent,
+            "cpu_temp": cpu_temp,
         })
 
     @app.route('/cycle_lores', methods=['POST'])
