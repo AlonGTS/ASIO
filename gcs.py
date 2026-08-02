@@ -7,7 +7,8 @@ Usage:
     python gcs.py --pi 192.168.1.100
     python gcs.py          # reads gcs_ip from config.toml if present
 
-Mouse  : left-click on video → select tracking target
+Mouse  : press + drag on video → zoom loupe follows the cursor;
+         release to select the tracking target at the loupe's center
          left-click on buttons → same as keyboard shortcuts
 
 Keyboard shortcuts (work whether or not the mouse is in the window):
@@ -119,6 +120,7 @@ _cross_y        = None    # None until first frame establishes the display size
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
+_drag_active = False  # True while left mouse button is held on the video (zoom-loupe target pick)
 _quit         = threading.Event()  # set to break the main loop from any thread
 _confirm_quit = False             # True while the "are you sure?" overlay is shown
 _CONFIRM_YES  = None              # (x, y, w, h) of the Yes button in the overlay
@@ -467,6 +469,40 @@ def draw_crosshair(frame, x, y, size=14, color=(50, 50, 230)):
     cv2.line(frame, (x, y - size), (x, y + size), color, 2, cv2.LINE_AA)
     cv2.circle(frame, (x, y), size // 2, color, 1, cv2.LINE_AA)
 
+_ZOOM_SRC = 60    # px cropped from the frame around the cursor
+_ZOOM_OUT = 180   # loupe window size on screen (3x magnification)
+
+def draw_zoom_loupe(frame, mx, my):
+    """Picture-in-picture magnifier around (mx, my), with a crosshair marking
+    the exact point that will be selected when the mouse button is released."""
+    h, w = frame.shape[:2]
+    half = _ZOOM_SRC // 2
+    x0 = max(0, min(w - _ZOOM_SRC, mx - half))
+    y0 = max(0, min(h - _ZOOM_SRC, my - half))
+    if w < _ZOOM_SRC or h < _ZOOM_SRC:
+        return
+    crop = frame[y0:y0 + _ZOOM_SRC, x0:x0 + _ZOOM_SRC]
+    zoom = cv2.resize(crop, (_ZOOM_OUT, _ZOOM_OUT), interpolation=cv2.INTER_NEAREST)
+
+    cx = int((mx - x0) * _ZOOM_OUT / _ZOOM_SRC)
+    cy = int((my - y0) * _ZOOM_OUT / _ZOOM_SRC)
+    cv2.line(zoom, (cx - 12, cy), (cx + 12, cy), (50, 50, 230), 1, cv2.LINE_AA)
+    cv2.line(zoom, (cx, cy - 12), (cx, cy + 12), (50, 50, 230), 1, cv2.LINE_AA)
+    cv2.rectangle(zoom, (0, 0), (_ZOOM_OUT - 1, _ZOOM_OUT - 1), (255, 255, 255), 2)
+
+    # Offset from the cursor so the loupe doesn't sit under the finger/pointer;
+    # flip to the opposite side if it would run off the video edge.
+    lx = mx + 24
+    ly = my - _ZOOM_OUT - 24
+    if lx + _ZOOM_OUT > w:
+        lx = mx - _ZOOM_OUT - 24
+    if ly < 0:
+        ly = my + 24
+    lx = max(0, min(w - _ZOOM_OUT, lx))
+    ly = max(0, min(h - _ZOOM_OUT, ly))
+
+    frame[ly:ly + _ZOOM_OUT, lx:lx + _ZOOM_OUT] = zoom
+
 def draw_hud(frame, fps):
     h, w = frame.shape[:2]
 
@@ -665,7 +701,7 @@ def main():
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
     def on_mouse(event, x, y, flags, _):
-        global _confirm_quit
+        global _confirm_quit, _drag_active
         _mouse_pos[0], _mouse_pos[1] = x, y
         if event == cv2.EVENT_LBUTTONDOWN:
             if _confirm_quit:
@@ -677,12 +713,18 @@ def main():
                                  and _CONFIRM_NO[1] <= y < _CONFIRM_NO[1] + _CONFIRM_NO[3]:
                     _confirm_quit = False
             elif x < _cur_video_w:
-                select_point(x, y)          # click on video → track target
+                _drag_active = True         # press on video → start zoom-loupe drag
             else:
                 for btn in _buttons:        # click on panel → button action
                     if btn.hit(x, y):
                         btn.action()
                         break
+        elif event == cv2.EVENT_LBUTTONUP:
+            if _drag_active:
+                _drag_active = False
+                fx = max(0, min(_cur_video_w - 1, x))
+                fy = max(0, min(_cur_video_h - 1, y))
+                select_point(fx, fy)        # release → track target at loupe center
 
     cv2.setMouseCallback("Mahat GCS", on_mouse)
 
@@ -738,6 +780,12 @@ def main():
                 _cross_x = max(0, min(w - 1, _cross_x + gx * _CROSS_STEP))
                 _cross_y = max(0, min(h - 1, _cross_y + gy * _CROSS_STEP))
             draw_crosshair(frame, _cross_x, _cross_y)
+
+        # ── Mouse zoom-loupe — press-drag-release target picker ─────────────
+        if _drag_active:
+            mx, my = _mouse_pos
+            if mx < w:
+                draw_zoom_loupe(frame, min(w - 1, mx), min(h - 1, my))
 
         # Write to local recorder (video + HUD, no panel) — only on genuinely
         # new frames, so recorded playback speed matches real time instead of
