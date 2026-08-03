@@ -438,7 +438,8 @@ WEBRTC_HTML = """
             }
           };
 
-          const offer = await pc.createOffer({ offerToReceiveVideo: true });
+          pc.addTransceiver('video', { direction: 'recvonly' });
+          const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
 
           // Wait for ICE gathering so the offer SDP has all host candidates.
