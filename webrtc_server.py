@@ -34,10 +34,14 @@ class FrameBuffer:
         self._frame = None
         self._gen = 0   # incremented on every put(); consumers track last seen gen
 
-    def put(self, frame):
+    def put(self, frame, gen=None):
+        """gen lets the caller stamp this frame with an externally-meaningful
+        id (tracker-so.py passes its own state.frame_gen, so consumers can
+        correlate a published frame back to the raw capture it came from).
+        Self-increments as before if omitted."""
         with self._cond:
             self._frame = frame
-            self._gen += 1
+            self._gen = gen if gen is not None else self._gen + 1
             self._cond.notify_all()
 
     def get(self, last_gen=-1, timeout=0.05):

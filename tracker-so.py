@@ -6,6 +6,7 @@ import time
 import math
 import numpy as np
 import psutil
+import collections
 
 # Concurrency primitives
 from threading import Thread, Lock, Condition
@@ -241,6 +242,26 @@ frame_lock = Lock()
 frame_ready = Condition(frame_lock)
 state.frame_lock = frame_lock   # expose to flask_app for safe current_frame snapshots
 
+# Short rolling history of raw MAIN frames, keyed by state.frame_gen, so a
+# GCS click that echoes back the frame_gen it was actually looking at can be
+# applied to that historical frame (and replayed forward) instead of
+# whatever frame is live on the Pi by the time the click round-trips back.
+# maxlen covers ~2s at active_fps — comfortably more than one round trip.
+_FRAME_HISTORY_LEN = max(30, _CAM_ACTIVE_FPS * 2)
+_frame_history_lock = Lock()
+_frame_history = collections.deque(maxlen=_FRAME_HISTORY_LEN)  # [(gen, frame), ...] oldest first
+
+def _get_frame_history(min_gen):
+    """(gen, frame) pairs for min_gen and everything captured after it, still
+    in the buffer, oldest first. None if min_gen has already aged out (round
+    trip took too long) or was never captured."""
+    with _frame_history_lock:
+        snapshot = list(_frame_history)
+    if not snapshot or snapshot[0][0] > min_gen:
+        return None
+    result = [(g, f) for g, f in snapshot if g >= min_gen]
+    return result if result else None
+
 # ============ Camera/File Reader (unified) ============
 cap = None
 picam2 = None
@@ -388,7 +409,10 @@ def _reader_live_picam():
         with frame_ready:
             state.current_frame = frame  # raw MAIN frame only
             state.frame_gen += 1
+            gen = state.frame_gen
             frame_ready.notify_all()
+        with _frame_history_lock:
+            _frame_history.append((gen, frame))
 
 def _restart_reader_live():
     """Stop live reader, reinit camera (for new MAIN size), and restart reader."""
@@ -758,6 +782,7 @@ app = flask_app.create_app(
     get_fps_state_fn   = lambda: _camera_active,
     get_cpu_fn         = lambda: _cpu_percent,
     get_cpu_temp_fn    = lambda: _cpu_temp_c,
+    get_frame_history_fn = _get_frame_history if args.mode == 'live' else None,
 )
 
 # === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
@@ -834,7 +859,12 @@ elif _VIDEO_MODE == "jpeg_udp":
             ok, buf = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
             if not ok:
                 continue
-            data = buf.tobytes()
+            # 4-byte big-endian frame_gen header + JPEG bytes. GCS must strip
+            # the first 4 bytes before decoding, and echo that value back as
+            # frame_gen on /select_point so the Pi can init tracking against
+            # the frame the operator actually clicked on (see
+            # STABILIZATION.md — "the stale-click problem").
+            data = struct.pack('>I', gen & 0xFFFFFFFF) + buf.tobytes()
             if len(data) > _UDP_MAX:
                 continue
             try:
@@ -1119,8 +1149,10 @@ while True:
         finally:
             _suppress_trackbar_cb = False
 
-    # Publish final frame
-    frame_buffer.put(frame)
+    # Publish final frame (tagged with the raw capture's frame_gen so
+    # consumers/GCS can correlate a displayed frame back to a specific
+    # captured one — see _get_frame_history above)
+    frame_buffer.put(frame, gen=_last_frame_gen)
 
     # Local window
     if SHOW_LOCAL:
