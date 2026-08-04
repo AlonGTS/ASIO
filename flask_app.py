@@ -138,7 +138,7 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
             state.bbox = bbox_main
             state.tracking = True
 
-            if replay_frames and len(replay_frames) > 1:
+            if replay_frames:
                 print(f"[INFO] Tracker init @ MAIN({mw}x{mh}) from frame_gen={requested_gen}, "
                       f"replayed {replayed} frame(s) → bbox {state.bbox} | LORES {lw}x{lh}")
             else:

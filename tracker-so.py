@@ -311,7 +311,10 @@ def _reader_playback(path, loop=False):
         with frame_ready:
             state.current_frame = frame
             state.frame_gen += 1
+            gen = state.frame_gen
             frame_ready.notify_all()
+        with _frame_history_lock:
+            _frame_history.append((gen, frame))
 
         # Adjust pacing
         if rate > 1.0:
@@ -782,7 +785,7 @@ app = flask_app.create_app(
     get_fps_state_fn   = lambda: _camera_active,
     get_cpu_fn         = lambda: _cpu_percent,
     get_cpu_temp_fn    = lambda: _cpu_temp_c,
-    get_frame_history_fn = _get_frame_history if args.mode == 'live' else None,
+    get_frame_history_fn = _get_frame_history if args.mode in ('live', 'playback') else None,
 )
 
 # === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
