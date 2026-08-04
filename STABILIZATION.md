@@ -4,20 +4,106 @@ Goal: make the video shown at the GCS steady enough that an operator can
 reliably click the tracking point, without hurting tracking latency/accuracy
 on the Pi.
 
-Not implemented yet — this is the design discussion to review from the GCS
-before we touch `tracker-so.py`.
+## Current decision
 
-## Why Pixhawk attitude instead of optical flow
+**Stabilization runs on the GCS (optical flow), not on the Pi via Pixhawk
+attitude.** The GCS has CPU headroom to spare; keeping the Pi side simple
+and avoiding a cross-system timestamp-sync dependency won out. This is a
+change from the original direction — see "Alternative considered" below for
+why Pixhawk attitude was attractive and why it's shelved for now, in case
+it's worth revisiting later (e.g. if GCS-side CPU becomes tight, or
+translational vibration turns out to matter more than expected).
+
+**Status:**
+- ✅ Done (Pi side): the stale-click fix — `frame_gen` tagging, the raw-frame
+  rolling buffer, and tracker replay in `/select_point`. Implemented, not
+  yet run on real hardware.
+- ⬜ To do (GCS side, remote): strip the new `frame_gen` header from the
+  video stream, do the optical-flow stabilization for display, and echo
+  `frame_gen` back on click (inverting any local display transform first).
+  Contract below.
+- ⬜ Not started: Pixhawk attitude buffer / timestamp sync (shelved, see
+  below).
+
+## The stale-click problem (fixed on the Pi)
+
+`flask_app.py`'s `/select_point` handler used to have a latent bug
+independent of stabilization: the GCS sends normalized click coordinates
+`(nx, ny)`, and the Pi applied them to whatever frame was live *at the
+moment the request was processed* — with no notion of which frame the
+operator actually saw. Any added latency (network, GCS-side stabilization,
+round-trip) only made the mismatch between "frame operator clicked on" and
+"frame Pi is currently on" larger.
+
+Fixed by two changes in `tracker-so.py`/`flask_app.py`:
+
+1. **Every frame now carries an id.** `state.frame_gen` (already existed,
+   bumped once per captured frame) is now attached to the published stream
+   frame and to a rolling history buffer of raw MAIN frames
+   (`_frame_history` in `tracker-so.py`, ~2 seconds deep at the active
+   capture fps — comfortably more than one round trip).
+2. **`/select_point` accepts an optional `frame_gen` field.** If present and
+   still in the buffer, the Pi initializes the tracker on *that* historical
+   frame (the one the operator actually saw), then replays
+   `tracker.update()` through each buffered frame captured since then, in
+   order — the same per-frame step the live loop already does — so it
+   arrives at the live frame already converged instead of jumping the whole
+   round-trip gap in one step (which risks landing outside a correlation
+   tracker's search window). If `frame_gen` is omitted, already aged out of
+   the buffer, or the replay loses the target partway through, it falls back
+   to the original behavior (init directly on the live frame) — never worse
+   than before.
+
+### Wire contract the GCS needs to implement
+
+**Video stream (`jpeg_udp` mode, the active `video_mode` in `config.toml`):**
+each UDP datagram sent to `gcs_udp_port` is now
+
+```
+[4-byte big-endian uint32 frame_gen][JPEG bytes]
+```
+
+instead of raw JPEG. The GCS decoder must strip the first 4 bytes, decode
+the rest as JPEG as before, and remember that `frame_gen` value as "the id
+of the frame currently being displayed."
+
+*(WebRTC mode: `webrtc_server.FrameBuffer.put()` now accepts an explicit
+`gen` and tracker-so.py passes `frame_gen` through it, but there's no
+data-channel signaling wired up yet to get that id to the browser. Not
+needed unless `video_mode` switches to `"webrtc"`.)*
+
+**Click submission:** `POST /select_point` (port 5000) gets one new optional
+form field alongside the existing ones:
+
+| field | required? | notes |
+|---|---|---|
+| `nx`, `ny` | preferred | normalized `[0..1]`, unchanged |
+| `x`, `y` | fallback if no `nx`/`ny` | absolute pixels, unchanged |
+| `frame_gen` | **new, optional** | the `frame_gen` of the frame that was on screen when the operator clicked |
+
+Important: the coordinate system for `nx`/`ny`/`x`/`y` is the frame as
+*received from the Pi* (the buffered history frame and the published stream
+frame share the same `frame_gen` and the same pixel geometry — overlays
+drawn on the stream frame don't resize/shift anything). If the GCS applies
+its own optical-flow stabilization warp before displaying the frame, **it
+must invert that warp on the click coordinates before sending them** — send
+back where the click falls on the original received frame, not on the
+GCS's locally-smoothed display. Omitting `frame_gen` entirely still works
+(falls back to old behavior); omitting the un-warp step will silently send
+wrong coordinates rather than erroring, so this part is easy to get wrong
+quietly — worth testing explicitly with the camera panning during a click.
+
+## Alternative considered: Pixhawk attitude (shelved)
 
 The camera is rigidly mounted to the airframe — no gimbal (see
 `mavlink_client.py`'s notes on why `send_attitude_target()` uses pure rate
 damping instead of a self-level controller: this airframe has no meaningful
 "level" attitude). Because of that rigid mount, the Pixhawk's attitude
-(roll/pitch/yaw) *is* the camera's rotation, which makes it a better
-stabilization signal than computing motion from the video itself:
+(roll/pitch/yaw) *is* the camera's rotation, which would have made it a
+better stabilization signal than computing motion from the video itself:
 
 - **Cheaper**: a rotation warp from known angle deltas vs. per-frame feature
-  detection + optical flow + RANSAC on the Pi's CPU.
+  detection + optical flow + RANSAC.
 - **More robust**: optical flow can be fooled by the tracked target's own
   motion dominating the frame (especially in `bMoovingTgt` mode); attitude
   data doesn't care what's in the image.
@@ -27,140 +113,27 @@ stabilization signal than computing motion from the video itself:
   clean signal (no smoothing needed) — its only lag is MAVLink relay time
   (serial → mavproxy → UDP loopback), estimated at single-digit to ~20ms.
 
-### What it doesn't fix
+Shelved because the GCS has CPU to spare and doing it there avoids a
+cross-system timestamp-sync dependency (Pixhawk ATTITUDE messages vs. camera
+frame timestamps, two different clocks-in-code that would need to be kept
+aligned on the Pi). If revisited, note it wouldn't have been a complete fix
+either:
 
 - **Translational vibration**: gyro/attitude only carries rotation, not
-  linear displacement. Double-integrating accelerometer data to get position
-  drifts too fast to be usable. In practice this is likely a small
-  contributor for a standoff target (apparent angular error from a linear
-  shift Δx at range D is ~Δx/D — it shrinks with distance, unlike rotational
-  jitter which is range-independent), but would matter more for close-range
-  targets.
+  linear displacement. In practice likely a small contributor for a
+  standoff target (apparent angular error from a linear shift Δx at range D
+  is ~Δx/D — shrinks with distance, unlike rotational jitter which is
+  range-independent), but would matter more for close-range targets.
 - **FC/camera mount compliance**: the Pixhawk's IMU measures motion at *its*
-  location. If the camera isn't rigidly bonded to the same structure (any
-  flex, standoff, damping between FC and camera), differential vibration
-  between the two is invisible to this correction. Worth physically
-  verifying mount rigidity.
+  location; any flex/compliance between FC and camera mount is invisible to
+  it.
 - **Motion blur**: real vibration frequencies (tens–100+ Hz) alias past both
-  the 20Hz attitude stream and the 15fps video stream — that shows up as
-  blur *within* a single exposure, which no post-capture stabilization
-  (attitude-based or optical-flow-based) can undo. Only shorter exposure or
-  physical damping helps here.
+  a ~20Hz attitude stream and a 15fps video stream — that shows up as blur
+  *within* a single exposure, which no post-capture stabilization (attitude-
+  or optical-flow-based) can undo.
 
-### Which attitude fields to use
-
-The MAVLink `ATTITUDE` message carries both:
-- `roll` / `pitch` / `yaw` — EKF-filtered Euler angles.
-- `rollspeed` / `pitchspeed` / `yawspeed` — raw body-frame gyro rates.
-
-Mapping to image correction (camera boresighted along the airframe):
-- **Roll** → pure in-plane image rotation (rotate frame by −Δroll).
-- **Pitch/yaw** → apparent translation of the scene across the image plane,
-  not rotation. Converting angle → pixels needs focal length/FOV
-  (`shift_px ≈ Δangle × frame_width / horizontal_FOV`), and is only a valid
-  small-angle approximation near frame center.
-
-The raw gyro rates update with less filter lag than the fused Euler angles,
-so integrating rates between two frame timestamps may track fast jitter
-better than diffing filtered roll/pitch/yaw. Worth keeping both in the
-shared attitude buffer.
-
-## Timestamp sync (Pi-side, needed regardless of GCS changes)
-
-Both sides can share one clock for free: pymavlink stamps every received
-message with `msg._timestamp = time.time()` at parse time
-(`mavutil.py:371`), and `_telemetry_reader()` in `mavlink_client.py` runs a
-tight loop with nothing else blocking it. So an ATTITUDE timestamp and a
-`time.time()` call in the camera reader thread land on the same host clock
-— no cross-clock calibration needed.
-
-Two gaps to close on the Pi, both currently missing:
-
-1. `_telemetry_reader()` only prints ATTITUDE (if `SHOW_TELEMETRY`); it
-   never stores it. Need a small shared ring buffer of the last few
-   `(timestamp, roll, pitch, yaw, rollspeed, pitchspeed, yawspeed)` samples,
-   guarded by a lock, so frames can be bracketed and interpolated (ATTITUDE
-   arrives at ~20Hz vs. the 15fps GCS stream — close enough that nearest-
-   neighbor matching alone can be off by up to ±25ms; interpolate instead).
-2. `_reader_live_picam()` (`tracker-so.py`) calls `picam2.capture_array()`
-   and stores the frame with no timestamp. Need to tag each frame with
-   `time.time()` right after `capture_array()` returns.
-
-Unmeasured but likely small: MAVLink relay latency (serial → mavproxy → UDP
-loopback) and Picamera2's internal ISP/DMA pipeline delay before
-`capture_array()` returns. Should log actual `frame_ts - attitude_ts` deltas
-on real hardware before trusting the math.
-
-## The stale-click problem
-
-Independent of stabilization, `flask_app.py`'s `/select_point` handler
-already has a latent bug: the GCS sends normalized click coordinates
-`(nx, ny)`, and the Pi applies them to `state.current_frame` — whatever is
-live *at the moment the request is processed* — with no notion of which
-frame the operator actually saw. There's no frame ID or timestamp
-round-tripped today.
-
-Any stabilization added on top (Pi-side pre-encode warp, or GCS-side
-display smoothing) only adds more delay before the click round-trips back,
-making the mismatch between "frame operator clicked on" and "frame Pi is
-currently on" larger, not new-in-kind.
-
-### Two separate things to fix
-
-1. **Undoing GCS-side display smoothing** — fully fixable on the GCS alone.
-   If the GCS stabilizes the frame before displaying it, it knows (or can
-   invert) the transform it applied to that specific frame, and can send
-   back click coordinates in the original received frame's space. No
-   round-trip needed for this part.
-
-2. **The Pi has moved on since that frame was captured** — cannot be fixed
-   on the GCS alone; the GCS has no visibility into the Pi's current live
-   frame. Needs a small protocol + Pi-side change:
-   - Tag every frame published to the GCS with `state.frame_gen` (already
-     exists, bumped every captured frame).
-   - GCS echoes that `frame_gen` back alongside the click.
-   - Pi keeps a short rolling buffer of raw MAIN frames (last ~1-2s, deep
-     enough to cover worst-case round-trip time), keyed by `frame_gen`.
-   - On click: find the buffered frame matching the echoed `frame_gen`, and
-     `tracker.init()` there — this is the frame the operator actually saw,
-     so the bbox is correct for it.
-   - **Replay, don't jump**: call `tracker.update()` on each subsequent
-     buffered frame in order (N+1, N+2, ... up to live), the same way the
-     live loop already does every iteration. Correlation trackers like
-     GTSTracker only search a small neighborhood around the previous bbox
-     between calls — jumping straight from the old frame to the live frame
-     risks landing outside that search window if the round trip was
-     300-500ms. Stepping through the buffered frames lets the tracker catch
-     the actual motion incrementally, same as it does in normal live
-     operation.
-   - Once the replay reaches the live frame, install the caught-up tracker
-     as `state.tracker` / `state.bbox` and resume normal live tracking.
-
-   This is cheap: a handful of extra `tracker.update()` calls, once per
-   click, not ongoing.
-
-   A lighter-weight alternative is a single-shot reprojection using the
-   attitude buffer (compute Δroll/Δpitch/Δyaw between the clicked frame's
-   timestamp and now, warp the bbox once). Cheaper, but only corrects for
-   camera rotation — it won't account for the target's own motion during
-   the latency window, which matters in `bMoovingTgt` mode. Buffered replay
-   handles both cases since it's the same tracking algorithm already used
-   live, so it's the recommended approach; attitude reprojection could seed
-   it (narrow the search) but isn't required to start.
-
-## Suggested implementation order
-
-1. Pi: add the attitude ring buffer + frame timestamps (needed by
-   everything below; independently testable by logging `frame_ts -
-   attitude_ts` deltas).
-2. Pi: add `frame_gen` tagging to published frames + the raw-frame rolling
-   buffer.
-3. Protocol: GCS echoes `frame_gen` back with `/select_point`.
-4. Pi: `select_point` looks up the buffered frame instead of
-   `state.current_frame`, replays the tracker forward to live.
-5. Pi: attitude-based de-rotation warp on the stream-publish path (JPEG/
-   WebRTC), decoupled from the LORES tracking frame.
-6. GCS: nothing required for the stabilization itself once (5) is done —
-   the Pi is sending an already-stabilized frame. If GCS-side smoothing is
-   still wanted on top, invert its own transform locally per (1) above
-   before sending clicks back.
+The `ATTITUDE` MAVLink message carries `roll`/`pitch`/`yaw` (EKF-filtered
+Euler angles) and `rollspeed`/`pitchspeed`/`yawspeed` (raw gyro rates) if
+this gets revisited — see git history on this file for the fuller writeup
+(timestamp-sync plan, per-axis image-correction mapping) that was here
+before this rewrite.
