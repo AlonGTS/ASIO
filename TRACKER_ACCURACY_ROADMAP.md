@@ -295,3 +295,67 @@ CSRT for acquisition and lock-holding
 \+ confidence
 \+ template management that prevents drift
 \+ gentle filtering that doesn't add significant latency
+
+## Progress log
+
+### 2026-08-06 — Step A implemented and run
+
+**Step A (logging/baseline instrumentation) is done and committed:**
+- `tracker-so.py` writes a per-frame CSV to `logs/baseline_<timestamp>.csv`
+  whenever `[logging] baseline_enabled = true` in `config.toml` (on by
+  default). Columns: `wall_ts, session_id, session_source, frame_gen,
+  main_w/h, lores_w/h, success, cx, cy, bbox_w/h, center_dx/dy/dist,
+  update_ms, tq_score, bad_frames, drift_event, inst_fps`. Runs on a
+  dedicated thread off a bounded queue — never blocks the tracking loop.
+- `session_source` tags *why* each tracker (re)init happened — `click`,
+  `local_click`, `nudge`, `resize`, or `bbox_clamp` — via
+  `state.last_init_source`, set at every call site that creates a new
+  tracker (`flask_app.py` `/select_point` + `/nudge`, `tracker-so.py`'s
+  mouse callback, resolution-cycle reinit, and the bbox-clamp reinit).
+- `analyze_baseline.py` (repo root) summarizes any log: frame counts,
+  drift events, `update_ms`/`fps`/`tq_score` stats, center-jitter stats,
+  and — when present — a sessions-by-source breakdown. Run with no args
+  for the latest log, or pass a path explicitly.
+- Commits: `74d65f8` (baseline logging), `0aef969` (session_source). Both
+  pushed to `origin/main`. Tag `stabilized` (`ff52a41`) marks the commit
+  right before this work, in case it needs to be rolled back to.
+
+**Three runs collected today, all in `logs/`:**
+1. `baseline_20260806_104131.csv` — first smoke test (scenario not recorded
+   before `session_source` existed). 1521 frames, 0 drift, jitter mean
+   1.83px / p95 8.0px.
+2. `baseline_20260806_105602_static_real.csv` — playback, static target,
+   real (not synthetic) footage. 2517 frames, 3 auto-detected drift events
+   spaced almost exactly ~44.5s apart with near-identical re-acquisition
+   coordinates each time — consistent with the tracker reliably failing at
+   the *same moment* in a looping clip. Only 3 of 21 session transitions
+   were tagged `drift_event`; predates `session_source` so the other 18
+   transitions' cause was never confirmed.
+3. `baseline_20260806_112640_playback_fixed_enddrift.csv` — playback, fixed
+   target; per the operator, the payload/camera ends up pointed at a
+   different spot than the tracked point by the end of the clip, causing
+   genuine drift there. 1464 frames, 2 drift events. **Key finding: 24 of
+   35 sessions (69%) were `bbox_clamp`** — i.e. the CSRT bbox repeatedly
+   grew past `max_bb_width`/`max_bb_height` (120×120 in `config.toml`),
+   forcing a full tracker reinit (template/state discarded) each time.
+   Only 2 sessions were genuine drift-driven re-clicks.
+
+**Open finding to chase next:** `bbox_clamp` churn looks like a bigger
+contributor to instability than actual drift on this footage — every
+clamp event throws away the tracker's template and restarts cold. Worth
+checking before starting Step B whether `max_bb_width`/`max_bb_height` is
+simply too tight for this target's apparent size/distance, or whether
+CSRT's scale estimation (`number_of_scales`, `scale_step`, etc. in
+`config.toml`'s `[gts-track.fixed]`/`[gts-track.moving]`) is overshooting
+and growing the box faster than it should.
+
+**Not started yet:** Step B (full-res ROI refinement) — expected to be the
+highest-value next step per "Expected outcome" above, but the `bbox_clamp`
+finding suggests it may be worth a quick look at the clamp/scale behavior
+first, since Step B's accuracy gain will be hard to measure cleanly against
+a baseline that's still churning on reinits this often.
+
+**Also flagged, not yet acted on** (from code review earlier in this
+work): `webrtc_server.py`'s `FrameBuffer.get()` copies the frame while
+holding the lock — worth revisiting once Step B starts touching full-res
+frames every iteration instead of just for streaming/recording.
