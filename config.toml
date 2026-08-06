@@ -1,6 +1,14 @@
 [display]
 show_local = false  # true for playback/debug with monitor, false for headless flight
 
+[logging]
+# Per-frame CSV instrumentation for the tracker-accuracy roadmap (see
+# TRACKER_ACCURACY_ROADMAP.md, "Step A"). Written on a background thread via
+# a bounded queue — rows are dropped rather than blocking the tracking loop
+# if the disk falls behind, so this is safe to leave on in flight.
+baseline_enabled = true
+baseline_dir     = "logs"
+
 [tracking]
 max_bb_width = 120
 max_bb_height = 120
@@ -40,11 +48,16 @@ filter_lr           = 0.25
 
 [network]
 # "wlan0" = original network, "wlan1" = new USB dongle (MAHAT)
-interface        = "wlan1"
+interface        = "wlan0"
 gcs_udp_port     = 5600
 gcs_cmd_port     = 5601
 gcs_jpeg_quality = 60     # was 60 — lower = smaller frames (~12 KB vs ~35 KB)
 gcs_stream_width = 640  # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 30fps)
+# Cap on JPEG-encode-and-send rate to the GCS, independent of camera capture/
+# active_fps — tracking and MAVLink still run at full active_fps regardless.
+# Lower this to cut CPU (encode+resize is the priciest per-frame stream cost).
+# 0 = uncapped (encode every frame the tracker publishes).
+gcs_stream_fps   = 15
 
 # Video transport: "jpeg_udp" = current JPEG-over-UDP for gcs.py
 #                  "webrtc"   = H.264 WebRTC served at http://<pi>:8080
@@ -52,7 +65,7 @@ video_mode           = "jpeg_udp"
 webrtc_bitrate_kbps  = 0   # 0 = unconstrained; set e.g. 800 for narrow RF links
 
 [network.wlan0]
-bind_ip = "10.50.117.219"
+bind_ip = "192.168.1.45"
 # gcs_ip no longer needed — Pi learns GCS IP dynamically from heartbeat packets
 
 [network.wlan1]
@@ -72,14 +85,14 @@ autopilot     = "custom"
 # Only set this if a given Pi keeps mavproxy in a separate venv from the one
 # running the tracker.
 # mavproxy_path = "/home/mahat/mav_venv/bin/mavproxy.py"
-pixhawk_port  = "/dev/ttyACM0"
+pixhawk_port  = "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6C.x_0-if00"
 pixhawk_baud  = 115200
 gcs_ip        = "192.168.1.30"    # legacy field (kept for reference)
 gcs_port      = 14550
 local_port    = 14551
 # Dedicated unicast outputs — MAVProxy sends a copy to each IP:gcs_port
 # Add every QGC / GCS machine here that needs full telemetry
-extra_outputs = ["192.168.10.8", "10.50.117.41", "192.168.1.30", "192.168.1.32"]
+extra_outputs = ["192.168.10.8", "10.50.117.41", "192.168.1.31", "192.168.1.43", "192.168.1.32"]
 
 [camera]
 # Safe/default resolutions for IMX708 path
@@ -89,5 +102,5 @@ lores_sizes = [[320, 240], [416, 312], [512, 384], [640,  480]]
 # Capture starts at idle_fps (low CPU/heat) and only switches to active_fps
 # when the GCS operator explicitly toggles it (FPS button / F key in gcs.py).
 # MAVLink keeps flowing at either rate — it's handled by mavproxy, not this loop.
-idle_fps   = 5
+idle_fps   = 10
 active_fps = 30

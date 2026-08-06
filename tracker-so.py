@@ -7,6 +7,7 @@ import math
 import numpy as np
 import psutil
 import collections
+import csv
 
 # Concurrency primitives
 from threading import Thread, Lock, Condition
@@ -175,6 +176,10 @@ MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 _CAM_IDLE_FPS   = _cfg["camera"].get("idle_fps", 5)
 _CAM_ACTIVE_FPS = _cfg["camera"].get("active_fps", 30)
+
+_LOG_CFG          = _cfg.get("logging", {})
+_BASELINE_ENABLED = _LOG_CFG.get("baseline_enabled", False)
+_BASELINE_DIR     = _LOG_CFG.get("baseline_dir", "logs")
 
 def _get_iface_ip(iface: str) -> str | None:
     try:
@@ -473,6 +478,12 @@ def _shutdown(signum, frame):
         _stop_recording()      # finalize any active recording before exit
     except NameError:
         pass                   # recording not yet initialised (early signal)
+    try:
+        if _baseline_queue is not None:
+            _baseline_queue.put(None)   # stop sentinel — worker flushes+closes the CSV
+            _baseline_thread.join(timeout=1.0)
+    except NameError:
+        pass                   # baseline logger not yet initialised (early signal)
     mavlink_client._stop_mavproxy()
     sys.exit(0)
 
@@ -915,6 +926,52 @@ def _udp_cmd_listener():
 
 Thread(target=_udp_cmd_listener, daemon=True).start()
 
+# === Baseline instrumentation (Step A — TRACKER_ACCURACY_ROADMAP.md) ===
+# Per-frame CSV log of what the tracker already computes (bbox center,
+# confidence, processing time) so Experiment 1's baseline metrics can be
+# derived after the fact, without changing tracking behavior. Writes happen
+# on a dedicated thread off a bounded queue — logging never blocks the
+# tracking loop; rows are dropped (not queued up) if the disk falls behind.
+_BASELINE_FIELDS = [
+    "wall_ts", "session_id", "frame_gen",
+    "main_w", "main_h", "lores_w", "lores_h",
+    "success", "cx", "cy", "bbox_w", "bbox_h",
+    "center_dx", "center_dy", "center_dist",
+    "update_ms", "tq_score", "bad_frames", "drift_event", "inst_fps",
+]
+
+_baseline_queue = None
+_baseline_thread = None
+
+def _baseline_worker(path, q):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_BASELINE_FIELDS)
+        writer.writeheader()
+        f.flush()
+        while True:
+            row = q.get()
+            if row is None:   # shutdown sentinel
+                break
+            writer.writerow(row)
+            f.flush()   # rows are ~30/s at most — fine to flush every write
+
+def _log_baseline(row: dict):
+    if _baseline_queue is None:
+        return
+    try:
+        _baseline_queue.put_nowait(row)
+    except _queue_mod.Full:
+        pass   # never block the tracking loop for logging
+
+if _BASELINE_ENABLED:
+    _baseline_out_dir = _HERE / _BASELINE_DIR
+    _baseline_out_dir.mkdir(parents=True, exist_ok=True)
+    _baseline_path = _baseline_out_dir / f"baseline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    _baseline_queue = _queue_mod.Queue(maxsize=500)
+    _baseline_thread = Thread(target=_baseline_worker, args=(_baseline_path, _baseline_queue), daemon=True)
+    _baseline_thread.start()
+    print(f"[BASELINE] logging per-frame tracking metrics to {_baseline_path}")
+
 # === Main Loop (render & publish) ===
 # Cached scale factors — recomputed only when resolution changes
 _cached_dims = (0, 0, 0, 0)   # (mw, mh, lw, lh)
@@ -926,6 +983,10 @@ _last_tracker_id = None   # detect tracker replacement from ANY init path
 _tq_needs_init   = True   # capture first patch on next successful update
 
 _last_frame_gen = -1   # last state.frame_gen this loop has already processed
+
+# Baseline-logging state (Step A)
+_log_session_id = 0            # increments on every new tracker instance
+_log_prev_cx = _log_prev_cy = None   # previous frame's MAIN-coord center, for jump distance
 
 while True:
     # Wait for a genuinely NEW frame (by generation, not just "not None") —
@@ -997,10 +1058,14 @@ while True:
         _last_tracker_id = id(state.tracker)
         _tq_needs_init   = True
         _tq_monitor.reset()
+        _log_session_id += 1
+        _log_prev_cx = _log_prev_cy = None
 
     if state.tracking and state.tracker is not None:
         try:
+            _upd_t0 = time.perf_counter()
             success, bbox_lo = state.tracker.update(lores_frame)
+            _update_ms = (time.perf_counter() - _upd_t0) * 1000.0
             if success:
                 xl, yl, wl, hl = map(int, bbox_lo)
                 x = int(xl * sx_l2m); y = int(yl * sy_l2m)
@@ -1050,8 +1115,10 @@ while True:
                     _tq_monitor.bad_frames += 1
                 else:
                     _tq_monitor.bad_frames = 0   # good frame resets the counter
+                _bad_frames_for_log = _tq_monitor.bad_frames   # snapshot before a drift reset zeroes it
 
-                if _tq_monitor.bad_frames >= TrackingQualityMonitor.BAD_FRAMES_LIMIT:
+                _drift_event = _tq_monitor.bad_frames >= TrackingQualityMonitor.BAD_FRAMES_LIMIT
+                if _drift_event:
                     print(f"[TQ]   Drift detected ({_tq_monitor.bad_frames} bad frames, "
                           f"score={tq:.2f}) — tracking broken, re-select target")
                     state.tracking = False
@@ -1079,10 +1146,34 @@ while True:
                     cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
                     cv2.line(frame, (cx - 10, cy), (cx + 10, cy), box_color, 1)
                     cv2.line(frame, (cx, cy - 10), (cx, cy + 10), box_color, 1)
+
+                _cdx = (cx - _log_prev_cx) if _log_prev_cx is not None else None
+                _cdy = (cy - _log_prev_cy) if _log_prev_cy is not None else None
+                _log_baseline({
+                    "wall_ts": time.time(), "session_id": _log_session_id, "frame_gen": _last_frame_gen,
+                    "main_w": mw, "main_h": mh, "lores_w": lw, "lores_h": lh,
+                    "success": 1, "cx": cx, "cy": cy, "bbox_w": bw, "bbox_h": bh,
+                    "center_dx": _cdx, "center_dy": _cdy,
+                    "center_dist": math.hypot(_cdx, _cdy) if _cdx is not None else None,
+                    "update_ms": round(_update_ms, 3), "tq_score": round(tq, 4),
+                    "bad_frames": _bad_frames_for_log, "drift_event": int(_drift_event),
+                    "inst_fps": round(_est_fps, 2) if _est_fps else None,
+                })
+                _log_prev_cx, _log_prev_cy = cx, cy
             else:
                 _tq_monitor.reset()
                 cv2.putText(frame, "Tracking lost", (10, 140),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                _log_baseline({
+                    "wall_ts": time.time(), "session_id": _log_session_id, "frame_gen": _last_frame_gen,
+                    "main_w": mw, "main_h": mh, "lores_w": lw, "lores_h": lh,
+                    "success": 0, "cx": None, "cy": None, "bbox_w": None, "bbox_h": None,
+                    "center_dx": None, "center_dy": None, "center_dist": None,
+                    "update_ms": round(_update_ms, 3), "tq_score": None,
+                    "bad_frames": None, "drift_event": 0,
+                    "inst_fps": round(_est_fps, 2) if _est_fps else None,
+                })
+                _log_prev_cx = _log_prev_cy = None
         except Exception as e:
             print(f"[ERROR] Tracker update failed: {e}")
             state.tracking = False
@@ -1232,3 +1323,6 @@ if args.mode == 'record' and record_queue is not None:
     record_thread.join()
 # Finalize any live-toggle recording that was still active when we exited
 _stop_recording()
+if _baseline_queue is not None:
+    _baseline_queue.put(None)
+    _baseline_thread.join(timeout=1.0)
