@@ -134,6 +134,7 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
             state.bbox = None
             state.tracker = None
 
+            state.last_init_source = "click"
             state.tracker = t
             state.bbox = bbox_main
             state.tracking = True
@@ -186,6 +187,7 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
 
             t = create_tracker_fn(state.bMoovingTgt)
             t.init(lores_frame, (xb, yb, wb, hb))
+            state.last_init_source = "nudge"
             state.tracker = t
             state.bbox = bbox_main
             state.tracking = True

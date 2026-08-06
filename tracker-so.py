@@ -213,6 +213,10 @@ state = SimpleNamespace(
     tracker         = None,   # OpenCV tracker object (runs on LORES frame)
     bMoovingTgt     = False,  # Target type (False=fixed, True=moving)
     lores_size      = None,   # Filled after config load below
+    last_init_source = None,  # Why the current tracker was (re)created — set by whichever
+                               # code path creates it, just before assigning state.tracker.
+                               # One of: "click", "local_click", "nudge", "resize",
+                               # "bbox_clamp". Consumed by the baseline logger's session_source.
 )
 
 _main_idx = 0       # index into MAIN_SIZES
@@ -738,6 +742,7 @@ def draw_rectangle(event, x, y, flags, param):
         tracker_local = create_gts_tracker(state.bMoovingTgt)
         tracker_local.init(lores_frame, (xb, yb, wb, hb))
 
+        state.last_init_source = "local_click"
         state.tracker = tracker_local
         state.bbox = bbox_main
         state.tracking = True
@@ -933,7 +938,7 @@ Thread(target=_udp_cmd_listener, daemon=True).start()
 # on a dedicated thread off a bounded queue — logging never blocks the
 # tracking loop; rows are dropped (not queued up) if the disk falls behind.
 _BASELINE_FIELDS = [
-    "wall_ts", "session_id", "frame_gen",
+    "wall_ts", "session_id", "session_source", "frame_gen",
     "main_w", "main_h", "lores_w", "lores_h",
     "success", "cx", "cy", "bbox_w", "bbox_h",
     "center_dx", "center_dy", "center_dist",
@@ -986,6 +991,7 @@ _last_frame_gen = -1   # last state.frame_gen this loop has already processed
 
 # Baseline-logging state (Step A)
 _log_session_id = 0            # increments on every new tracker instance
+_log_session_source = "unknown"      # why the current session started — see state.last_init_source
 _log_prev_cx = _log_prev_cy = None   # previous frame's MAIN-coord center, for jump distance
 
 while True:
@@ -1033,6 +1039,7 @@ while True:
             wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
             new_tracker = create_gts_tracker(state.bMoovingTgt)
             new_tracker.init(lores_frame, (xb, yb, wb, hb))
+            state.last_init_source = "resize"
             state.tracker = new_tracker
             state.bbox = (x0, y0, bw, bh)
             print(f"[INFO] Tracker reinitialized after resolution change: MAIN {mw}x{mh} LORES {lw}x{lh}")
@@ -1059,6 +1066,7 @@ while True:
         _tq_needs_init   = True
         _tq_monitor.reset()
         _log_session_id += 1
+        _log_session_source = state.last_init_source or "unknown"
         _log_prev_cx = _log_prev_cy = None
 
     if state.tracking and state.tracker is not None:
@@ -1086,9 +1094,15 @@ while True:
                     wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
                     state.tracker = create_gts_tracker(state.bMoovingTgt)
                     state.tracker.init(lores_frame, (xb, yb, wb, hb))
+                    state.last_init_source = "bbox_clamp"
+                    # This path bypasses the generic "detect tracker replacement" block
+                    # above (already ran this iteration), so update its bookkeeping here too.
                     _last_tracker_id = id(state.tracker)
                     _tq_needs_init   = True      # new tracker → re-capture patch
                     _tq_monitor.reset()
+                    _log_session_id += 1
+                    _log_session_source = "bbox_clamp"
+                    _log_prev_cx = _log_prev_cy = None
                     print(f"[INFO] BB limited to {bw}x{bh} (max {MAX_BB_WIDTH}x{MAX_BB_HEIGHT})")
 
                 state.bbox = (x, y, bw, bh)
@@ -1150,7 +1164,8 @@ while True:
                 _cdx = (cx - _log_prev_cx) if _log_prev_cx is not None else None
                 _cdy = (cy - _log_prev_cy) if _log_prev_cy is not None else None
                 _log_baseline({
-                    "wall_ts": time.time(), "session_id": _log_session_id, "frame_gen": _last_frame_gen,
+                    "wall_ts": time.time(), "session_id": _log_session_id,
+                    "session_source": _log_session_source, "frame_gen": _last_frame_gen,
                     "main_w": mw, "main_h": mh, "lores_w": lw, "lores_h": lh,
                     "success": 1, "cx": cx, "cy": cy, "bbox_w": bw, "bbox_h": bh,
                     "center_dx": _cdx, "center_dy": _cdy,
@@ -1165,7 +1180,8 @@ while True:
                 cv2.putText(frame, "Tracking lost", (10, 140),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 _log_baseline({
-                    "wall_ts": time.time(), "session_id": _log_session_id, "frame_gen": _last_frame_gen,
+                    "wall_ts": time.time(), "session_id": _log_session_id,
+                    "session_source": _log_session_source, "frame_gen": _last_frame_gen,
                     "main_w": mw, "main_h": mh, "lores_w": lw, "lores_h": lh,
                     "success": 0, "cx": None, "cy": None, "bbox_w": None, "bbox_h": None,
                     "center_dx": None, "center_dy": None, "center_dist": None,

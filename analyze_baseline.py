@@ -41,6 +41,13 @@ def analyze(path: Path, jump_threshold: float):
     lost_rows    = [r for r in rows if r["success"] == "0"]
     drift_events = [r for r in rows if r["drift_event"] == "1"]
 
+    # session_source is absent in logs from before it was added — degrade gracefully.
+    has_source = "session_source" in rows[0]
+    session_source = {}   # session_id -> source, from each session's first row
+    if has_source:
+        for r in rows:
+            session_source.setdefault(r["session_id"], r["session_source"])
+
     update_ms = [_float(r, "update_ms") for r in rows if _float(r, "update_ms") is not None]
     tq        = [_float(r, "tq_score") for r in success_rows if _float(r, "tq_score") is not None]
     dist      = [_float(r, "center_dist") for r in success_rows if _float(r, "center_dist") is not None]
@@ -51,6 +58,14 @@ def analyze(path: Path, jump_threshold: float):
     print(f"success frames: {len(success_rows)} ({100*len(success_rows)/n:.1f}%)   "
           f"lost frames: {len(lost_rows)} ({100*len(lost_rows)/n:.1f}%)")
     print(f"drift events: {len(drift_events)}")
+    if has_source:
+        by_source = {}
+        for sid in sessions:
+            src = session_source.get(sid, "unknown")
+            by_source.setdefault(src, []).append(sid)
+        print("sessions by source:")
+        for src, sids in sorted(by_source.items(), key=lambda kv: -len(kv[1])):
+            print(f"  {src:<12} {len(sids)}   {sids}")
     print()
 
     if update_ms:
