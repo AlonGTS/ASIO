@@ -34,6 +34,7 @@ current mouse position, same as releasing a mouse-drag.
 import argparse
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -116,6 +117,7 @@ cam_active      = False   # Pi camera fps state: False=idle (power-save), True=f
 _cpu_percent    = None    # Pi CPU usage %, polled from /status; None until first poll
 _cpu_temp_c     = None    # Pi SoC temperature °C, polled from /status; None until first poll
 _pi_tracking    = False   # Pi-side tracking state, polled from /status
+_frame_gen      = None    # Pi's frame counter for the currently displayed frame; echoed by select_point()
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
@@ -233,7 +235,13 @@ def select_point(x, y):
     # Send normalized coords (0-1) so Pi maps correctly regardless of stream resolution
     nx = round(x / _cur_video_w, 6)
     ny = round(y / _cur_video_h, 6)
-    _post("select_point", nx=nx, ny=ny)
+    # Echo back which frame this click was actually seen on (STABILIZATION.md,
+    # "stale-click problem") — the Pi buffers recent frames and inits/replays
+    # tracking against the one the operator actually clicked, instead of
+    # whatever's live when this arrives. Omit entirely when unknown — the Pi
+    # treats an absent frame_gen as "use the current live frame".
+    extra = {"frame_gen": _frame_gen} if _frame_gen is not None else {}
+    _post("select_point", nx=nx, ny=ny, **extra)
     set_status(f"Selected ({x}, {y})")
 
 def lock_target(x, y):
@@ -694,6 +702,24 @@ class _Gamepad:
 # The Pi sends JPEG-encoded frames as individual UDP datagrams (broadcast).
 # Each datagram = one complete JPEG image — no stream reassembly needed.
 
+_JPEG_SOI = b"\xff\xd8"   # JPEG Start-Of-Image marker — always the first 2 bytes of a JPEG
+
+def _split_frame_gen(data: bytes):
+    """Split a video datagram into (frame_gen_or_None, jpeg_bytes).
+
+    Wire format (see STABILIZATION.md, "stale-click problem"): the Pi may
+    prepend a 4-byte big-endian frame_gen counter before the JPEG bytes, so
+    the GCS can echo it back with select_point() and the Pi can look up the
+    exact frame that was clicked on, instead of using whatever's live at
+    request time. Detected via the JPEG SOI marker so this stays backward
+    compatible with a Pi that isn't sending the header yet.
+    """
+    if data[:2] == _JPEG_SOI:
+        return None, data            # legacy: no header, whole payload is the JPEG
+    if len(data) > 4 and data[4:6] == _JPEG_SOI:
+        return struct.unpack(">I", data[:4])[0], data[4:]
+    return None, data                # unrecognized — best-effort fallback
+
 class _LiveCapture:
     def __init__(self, port: int):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -701,10 +727,11 @@ class _LiveCapture:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)  # 1 MB
         self._sock.bind(('', port))
         self._sock.settimeout(1.0)
-        self._frame    = None
-        self._ok       = False
-        self._frame_id = 0
-        self._lock     = threading.Lock()
+        self._frame     = None
+        self._ok        = False
+        self._frame_id  = 0
+        self._frame_gen = None   # Pi-side frame counter, echoed back with select_point()
+        self._lock      = threading.Lock()
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
@@ -712,13 +739,15 @@ class _LiveCapture:
         while True:
             try:
                 data, _ = self._sock.recvfrom(1 << 16)  # 65536 bytes max UDP payload
-                arr   = np.frombuffer(data, dtype=np.uint8)
+                frame_gen, jpeg = _split_frame_gen(data)
+                arr   = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame is not None:
                     with self._lock:
-                        self._frame    = frame
-                        self._ok       = True
+                        self._frame     = frame
+                        self._ok        = True
                         self._frame_id += 1
+                        self._frame_gen = frame_gen
             except socket.timeout:
                 with self._lock:
                     self._ok = False   # no packet for 1 s → show waiting screen
@@ -726,18 +755,18 @@ class _LiveCapture:
                 print(f"[UDP] recv: {e}")
 
     def read(self):
-        """Return (ok, frame_copy, frame_id).  Never blocks more than the lock."""
+        """Return (ok, frame_copy, frame_id, frame_gen).  Never blocks more than the lock."""
         with self._lock:
             if self._frame is None:
-                return False, None, 0
-            return self._ok, self._frame.copy(), self._frame_id
+                return False, None, 0, None
+            return self._ok, self._frame.copy(), self._frame_id, self._frame_gen
 
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit
+    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit, _frame_gen
 
     data     = _get("status")
     launched = data.get("launched", False)
@@ -785,7 +814,7 @@ def main():
     FPS_A           = 0.9
 
     while not _quit.is_set():
-        ok, frame, frame_id = cap.read()
+        ok, frame, frame_id, frame_gen = cap.read()
 
         if not ok or frame is None:
             frame = _waiting_frame(_cur_video_w, _cur_video_h)
@@ -807,6 +836,7 @@ def main():
                     est_fps = FPS_A * est_fps + (1 - FPS_A) * inst if est_fps else inst
                 last_frame_ts = now
                 last_frame_id = frame_id
+                _frame_gen    = frame_gen
 
             if _stab_enabled:
                 frame = _stabilize(frame, is_new_frame)

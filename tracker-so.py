@@ -5,6 +5,8 @@ import cv2
 import time
 import math
 import numpy as np
+import psutil
+import collections
 
 # Concurrency primitives
 from threading import Thread, Lock, Condition
@@ -12,7 +14,10 @@ import threading
 from types import SimpleNamespace
 
 # CLI args / timestamps / small GUI dialogs for file/duration picking
+import fcntl
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tomllib
@@ -168,10 +173,22 @@ MAX_BB_WIDTH  = _cfg["tracking"]["max_bb_width"]
 MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
 MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
+_CAM_IDLE_FPS   = _cfg["camera"].get("idle_fps", 5)
+_CAM_ACTIVE_FPS = _cfg["camera"].get("active_fps", 30)
+
+def _get_iface_ip(iface: str) -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            return socket.inet_ntoa(
+                fcntl.ioctl(s.fileno(), 0x8915,
+                            struct.pack('256s', iface[:15].encode()))[20:24]
+            )
+    except OSError:
+        return None
 
 _net_iface  = _cfg["network"]["interface"]
 _net        = _cfg["network"][_net_iface]
-BIND_IP     = _net["bind_ip"]
+BIND_IP     = _get_iface_ip(_net_iface) or _net["bind_ip"]
 _VIDEO_MODE = _cfg["network"].get("video_mode", "jpeg_udp")
 GCS_IP     = None   # learned dynamically when GCS announces itself over the command channel
 print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs=<waiting for GCS hello>")
@@ -183,6 +200,8 @@ frame_buffer = webrtc_server.FrameBuffer()
 # Mutable state shared between main loop, reader threads, and Flask/WebRTC
 state = SimpleNamespace(
     current_frame   = None,   # Raw latest frame from camera/file (no overlays)
+    frame_gen       = 0,      # bumped by reader threads on every new frame; lets the
+                              # main loop tell "new frame" from "same frame, re-read"
     command_from_remote = None,   # One-letter command from web UI: 'r','s','q'
     bbox            = None,   # Current GTS tracking box (MAIN coords: x, y, w, h)
     tracking        = False,  # Tracking on/off flag
@@ -223,11 +242,32 @@ frame_lock = Lock()
 frame_ready = Condition(frame_lock)
 state.frame_lock = frame_lock   # expose to flask_app for safe current_frame snapshots
 
+# Short rolling history of raw MAIN frames, keyed by state.frame_gen, so a
+# GCS click that echoes back the frame_gen it was actually looking at can be
+# applied to that historical frame (and replayed forward) instead of
+# whatever frame is live on the Pi by the time the click round-trips back.
+# maxlen covers ~2s at active_fps — comfortably more than one round trip.
+_FRAME_HISTORY_LEN = max(30, _CAM_ACTIVE_FPS * 2)
+_frame_history_lock = Lock()
+_frame_history = collections.deque(maxlen=_FRAME_HISTORY_LEN)  # [(gen, frame), ...] oldest first
+
+def _get_frame_history(min_gen):
+    """(gen, frame) pairs for min_gen and everything captured after it, still
+    in the buffer, oldest first. None if min_gen has already aged out (round
+    trip took too long) or was never captured."""
+    with _frame_history_lock:
+        snapshot = list(_frame_history)
+    if not snapshot or snapshot[0][0] > min_gen:
+        return None
+    result = [(g, f) for g, f in snapshot if g >= min_gen]
+    return result if result else None
+
 # ============ Camera/File Reader (unified) ============
 cap = None
 picam2 = None
 _reader_thread = None
 _stop_reader = threading.Event()
+_camera_active = False   # False = idle (low fps, power-save); True = full fps. GCS-controlled.
 
 def _reader_playback(path, loop=False):
     """
@@ -270,7 +310,11 @@ def _reader_playback(path, loop=False):
 
         with frame_ready:
             state.current_frame = frame
+            state.frame_gen += 1
+            gen = state.frame_gen
             frame_ready.notify_all()
+        with _frame_history_lock:
+            _frame_history.append((gen, frame))
 
         # Adjust pacing
         if rate > 1.0:
@@ -310,6 +354,26 @@ def _restart_playback(new_path=None):
     _reader_thread.start()
     print(f"[PLAYBACK] Restarted: {path}")
 
+def _pick_full_fov_sensor_mode(picam2, min_fps):
+    """
+    Pick the smallest (fastest-reading-out) sensor mode whose crop still spans
+    the WHOLE sensor array — same full FOV as the native resolution — instead
+    of hardcoding the full pixel array as output_size. On IMX708 the full-res
+    4608x2592 mode is full-FOV but caps out at ~14 fps; the 2x2-binned
+    2304x1296 mode is *also* full-FOV (same crop_limits) and reaches ~56 fps.
+    Falls back to the full-resolution mode if no full-FOV mode hits min_fps.
+    """
+    full_w, full_h = picam2.sensor_resolution
+    full_fov = [m for m in picam2.sensor_modes
+                if tuple(m["crop_limits"][2:]) == (full_w, full_h)]
+    if not full_fov:
+        return (full_w, full_h)
+    full_fov.sort(key=lambda m: m["size"][0] * m["size"][1])  # smallest/fastest first
+    for m in full_fov:
+        if m["fps"] >= min_fps:
+            return m["size"]
+    return max(full_fov, key=lambda m: m["fps"])["size"]
+
 def _init_live_camera():
     """(Re)create and start PiCamera2 with the current main_size."""
     global picam2
@@ -323,16 +387,19 @@ def _init_live_camera():
 
     picam2 = Picamera2()
     w, h = main_size
-    sensor_res = picam2.sensor_resolution  # full sensor pixel array
-    # Explicitly request full-sensor mode so ISP downscales to (w,h) — consistent FOV
+    # Pick a sensor mode covering the full array (consistent FOV) fast enough
+    # for active_fps, instead of always forcing the full-res ~14fps mode.
+    sensor_size = _pick_full_fov_sensor_mode(picam2, _CAM_ACTIVE_FPS)
     config = picam2.create_preview_configuration(
         main={"size": (int(w), int(h)), "format": "RGB888"},
-        sensor={"output_size": sensor_res},
+        sensor={"output_size": sensor_size},
     )
     picam2.configure(config)
-    picam2.set_controls({"FrameRate": 30})
+    fps = _CAM_ACTIVE_FPS if _camera_active else _CAM_IDLE_FPS
+    picam2.set_controls({"FrameRate": fps})
     picam2.start()
-    print(f"[LIVE] Camera started MAIN={w}x{h} sensor={sensor_res}")
+    print(f"[LIVE] Camera started MAIN={w}x{h} sensor={sensor_size} @ {fps}fps "
+          f"({'active' if _camera_active else 'idle'})")
 
 def _reader_live_picam():
     """Continuously read frames from PiCamera2 and publish into current_frame."""
@@ -344,7 +411,11 @@ def _reader_live_picam():
             continue
         with frame_ready:
             state.current_frame = frame  # raw MAIN frame only
+            state.frame_gen += 1
+            gen = state.frame_gen
             frame_ready.notify_all()
+        with _frame_history_lock:
+            _frame_history.append((gen, frame))
 
 def _restart_reader_live():
     """Stop live reader, reinit camera (for new MAIN size), and restart reader."""
@@ -357,16 +428,37 @@ def _restart_reader_live():
     _reader_thread = Thread(target=_reader_live_picam, daemon=True)
     _reader_thread.start()
 
+def _set_camera_active(active: bool):
+    """
+    Explicit GCS-triggered toggle: raise/lower the live camera's capture FPS.
+    Idle (low fps) keeps the Pi's CPU/heat down while waiting; a GCS command
+    bumps it to full fps for responsive tracking. MAVLink keeps flowing at
+    the mavproxy level regardless of this setting.
+    """
+    global _camera_active
+    _camera_active = active
+    if picam2 is None:
+        return
+    fps = _CAM_ACTIVE_FPS if active else _CAM_IDLE_FPS
+    try:
+        picam2.set_controls({"FrameRate": fps})
+        print(f"[LIVE] Camera → {fps} fps ({'active' if active else 'idle'})")
+    except Exception as e:
+        print(f"[LIVE] Failed to set framerate {fps}: {e}")
+
 
 # === MAVLink / Serial Setup ===
 import mavlink_client
 _mav_cfg = _cfg["mavlink"]
+AUTOPILOT = _mav_cfg.get("autopilot", "custom")
+mavlink_client.set_autopilot(AUTOPILOT)
 mavlink_client.start_mavproxy(
     pixhawk_port  = _mav_cfg["pixhawk_port"],
     pixhawk_baud  = _mav_cfg["pixhawk_baud"],
     gcs_port      = _mav_cfg["gcs_port"],
     local_port    = _mav_cfg["local_port"],
     extra_outputs = _mav_cfg.get("extra_outputs", []),
+    mavproxy_path = _mav_cfg.get("mavproxy_path"),
 )
 mavlink_client.connect(
     url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",
@@ -385,12 +477,50 @@ def _shutdown(signum, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, _shutdown)
-signal.signal(signal.SIGHUP, _shutdown)                                                      
+signal.signal(signal.SIGHUP, _shutdown)
+
+# === CPU usage/temp monitor (for GCS HUD) ===
+# Sampled in a dedicated thread so /status never blocks on psutil's 1s interval.
+_cpu_percent = 0.0
+_cpu_temp_c  = None
+
+def _read_cpu_temp_c():
+    """Pi SoC temperature in °C, or None if unavailable (e.g. non-Pi host)."""
+    try:
+        zones = psutil.sensors_temperatures()
+        zone = zones.get("cpu_thermal") or next(iter(zones.values()), None)
+        if zone:
+            return zone[0].current
+    except Exception:
+        pass
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return int(f.read().strip()) / 1000.0
+    except Exception:
+        return None
+
+def _cpu_monitor():
+    global _cpu_percent, _cpu_temp_c
+    psutil.cpu_percent(interval=None)   # prime the internal counter
+    while True:
+        _cpu_percent = psutil.cpu_percent(interval=1.0)
+        _cpu_temp_c  = _read_cpu_temp_c()
+
+Thread(target=_cpu_monitor, daemon=True).start()
 
 
 # Precomputed FOV constants (avoid recomputing math.radians every frame)
 _HFOV_RAD = math.radians(60)   # ~60° horizontal FOV
 _VFOV_RAD = math.radians(45)   # ~45° vertical FOV
+
+# PX4 rate-mode gain — px4 mode only, does not touch custom mode's _mav_x/_mav_y.
+# _px4_pitch_err/_px4_yaw_err are sent as body-RATE setpoints (see
+# mavlink_client.send_attitude_target), but their raw FOV-derived value tops
+# out at the frame edge around ±22.5° (pitch) / ±30° (yaw) — nowhere near a
+# meaningful rate. This gain scales that up so a target pinned at the frame
+# edge commands ~100°/s on the larger (yaw) axis; MAX_ANGLE in
+# mavlink_client.py still clamps above that as a hard ceiling.
+_PX4_RATE_GAIN = math.radians(100) / (_HFOV_RAD / 2)
 
 # === Command-line arguments setup ===
 parser = argparse.ArgumentParser()
@@ -628,20 +758,40 @@ def _cycle_lores(delta):
     state.lores_size = list(LORES_SIZES[_lores_idx])
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
 
+# Launch button: "custom" mode just flips the launch flag the Simulink app
+# reads over NAMED_VALUE_FLOAT; "px4" mode actually arms/disarms the FC
+# (mode switch already happened at connect time, see set_guided_mode()).
+def _launch_fn(v=None):
+    launch = v if v is not None else not mavlink_client._launched
+    if AUTOPILOT == "px4":
+        if launch:
+            time.sleep(1)  # give the FC a beat to settle into OFFBOARD before arming
+            mavlink_client.arm()
+        else:
+            mavlink_client.disarm()
+    else:
+        mavlink_client.set_launch(launch)
+
 import flask_app
 app = flask_app.create_app(
     state, create_gts_tracker,
     cycle_main_fn      = _cycle_main if args.mode == 'live' else None,
     cycle_lores_fn     = _cycle_lores,
-    launch_fn          = lambda v=None: mavlink_client.set_launch(v if v is not None else not mavlink_client._launched),
+    launch_fn          = _launch_fn,
     get_launch_state_fn= lambda: mavlink_client._launched,
     toggle_record_fn   = lambda: _stop_recording() if _recording else _start_recording(),
     get_record_state_fn= lambda: _recording,
+    set_fps_fn         = _set_camera_active if args.mode == 'live' else None,
+    get_fps_state_fn   = lambda: _camera_active,
+    get_cpu_fn         = lambda: _cpu_percent,
+    get_cpu_temp_fn    = lambda: _cpu_temp_c,
+    get_frame_history_fn = _get_frame_history if args.mode in ('live', 'playback') else None,
 )
 
-# === Launch Flask in separate thread ===
-print(f"[Flask]  http://{BIND_IP}:5000")
-flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
+# === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
+from waitress import serve as _waitress_serve
+print(f"[Flask]  http://{BIND_IP}:5000  (waitress)")
+flask_thread = Thread(target=lambda: _waitress_serve(app, host="0.0.0.0", port=5000, threads=8, _quiet=True))
 flask_thread.daemon = True
 flask_thread.start()
 
@@ -664,6 +814,12 @@ elif _VIDEO_MODE == "jpeg_udp":
     _UDP_PORT     = _cfg["network"].get("gcs_udp_port", 5600)
     _JPEG_QUALITY = _cfg["network"].get("gcs_jpeg_quality", 40)
     _STREAM_WIDTH = _cfg["network"].get("gcs_stream_width", 480)
+    # Encode+send rate to the GCS is independent of capture/tracking fps — the
+    # operator's video view doesn't need every frame, but the tracker/MAVLink
+    # loop does. Throttling this is the cheapest way to cut CPU without
+    # slowing down tracking. 0 = uncapped (encode every published frame).
+    _STREAM_FPS   = _cfg["network"].get("gcs_stream_fps", 15)
+    _STREAM_INTERVAL = (1.0 / _STREAM_FPS) if _STREAM_FPS > 0 else 0.0
 
     _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)
@@ -672,10 +828,12 @@ elif _VIDEO_MODE == "jpeg_udp":
     _UDP_MAX     = 65400
 
     def _udp_stream_worker():
-        last_gen  = -1
-        _t0       = time.time()
-        _sent     = 0
-        print(f"[UDP]  stream worker ready — waiting for GCS to announce")
+        last_gen      = -1
+        _t0           = time.time()
+        _sent         = 0
+        _last_send_ts = 0.0
+        print(f"[UDP]  stream worker ready — waiting for GCS to announce "
+              f"(cap {_STREAM_FPS if _STREAM_FPS > 0 else 'uncapped'} fps)")
         while True:
             frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
             if frame is None:
@@ -684,6 +842,11 @@ elif _VIDEO_MODE == "jpeg_udp":
 
             if GCS_IP is None:
                 continue
+
+            _now_gate = time.time()
+            if _STREAM_INTERVAL > 0 and (_now_gate - _last_send_ts) < _STREAM_INTERVAL:
+                continue   # skip encode+send for this frame — capture/tracking keep running at full fps
+            _last_send_ts = _now_gate
 
             _sent += 1
             _now = time.time()
@@ -699,7 +862,12 @@ elif _VIDEO_MODE == "jpeg_udp":
             ok, buf = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
             if not ok:
                 continue
-            data = buf.tobytes()
+            # 4-byte big-endian frame_gen header + JPEG bytes. GCS must strip
+            # the first 4 bytes before decoding, and echo that value back as
+            # frame_gen on /select_point so the Pi can init tracking against
+            # the frame the operator actually clicked on (see
+            # STABILIZATION.md — "the stale-click problem").
+            data = struct.pack('>I', gen & 0xFFFFFFFF) + buf.tobytes()
             if len(data) > _UDP_MAX:
                 continue
             try:
@@ -757,12 +925,21 @@ _tq_monitor      = TrackingQualityMonitor()
 _last_tracker_id = None   # detect tracker replacement from ANY init path
 _tq_needs_init   = True   # capture first patch on next successful update
 
+_last_frame_gen = -1   # last state.frame_gen this loop has already processed
+
 while True:
-    # Wait for a new current_frame from reader
+    # Wait for a genuinely NEW frame (by generation, not just "not None") —
+    # otherwise, once current_frame is set once, this would spin re-processing
+    # and re-publishing the same stale frame as fast as the CPU allows,
+    # completely ignoring the camera's actual capture rate (incl. idle fps).
     with frame_ready:
-        if state.current_frame is None:
+        if state.frame_gen == _last_frame_gen:
             frame_ready.wait(timeout=0.02)
-        frame = None if state.current_frame is None else state.current_frame.copy()
+        if state.frame_gen == _last_frame_gen or state.current_frame is None:
+            frame = None
+        else:
+            frame = state.current_frame.copy()
+            _last_frame_gen = state.frame_gen
 
     if frame is None:
         key = cv2.waitKey(1) & 0xFF
@@ -812,7 +989,8 @@ while True:
         break
 
     # Tracking on LORES (lores_frame computed above, before dims check)
-    _mav_x, _mav_y = 100.0, 100.0  # sentinel: not tracking
+    _mav_x, _mav_y = 100.0, 100.0  # sentinel: not tracking ("custom" mode)
+    _px4_pitch_err, _px4_yaw_err = 0.0, 0.0  # neutral hold ("px4" mode)
 
     # Detect tracker replacement from ANY init path (flask, mouse, resolution change)
     if state.tracker is not None and id(state.tracker) != _last_tracker_id:
@@ -886,6 +1064,8 @@ while True:
                     # Only drive the drone when quality is sufficient
                     if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
                         _mav_x, _mav_y = pitch_norm, yaw_norm
+                        _px4_pitch_err = -norm_dy * _VFOV_RAD * _PX4_RATE_GAIN
+                        _px4_yaw_err   =  norm_dx * _HFOV_RAD * _PX4_RATE_GAIN
 
                     # Box color encodes quality level
                     if tq >= TrackingQualityMonitor.SCORE_GOOD:
@@ -899,11 +1079,6 @@ while True:
                     cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
                     cv2.line(frame, (cx - 10, cy), (cx + 10, cy), box_color, 1)
                     cv2.line(frame, (cx, cy - 10), (cx, cy + 10), box_color, 1)
-                    label = f"TQ:{int(tq * 100)}%"
-                    if _tq_monitor.bad_frames > 0:
-                        label += f" ({_tq_monitor.bad_frames}/{TrackingQualityMonitor.BAD_FRAMES_LIMIT})"
-                    cv2.putText(frame, label, (x, max(14, y - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2, cv2.LINE_AA)
             else:
                 _tq_monitor.reset()
                 cv2.putText(frame, "Tracking lost", (10, 140),
@@ -912,8 +1087,17 @@ while True:
             print(f"[ERROR] Tracker update failed: {e}")
             state.tracking = False
 
-    is_tracking = (_mav_x != 100.0)
-    mavlink_client.send_vision_error(_mav_x, _mav_y, is_tracking)
+    if AUTOPILOT == "px4":
+        # PX4's OFFBOARD mode auto-exits if the setpoint stream stops even
+        # briefly, so this must run every frame regardless of tracking state
+        # — untracked/low-quality frames fall back to the neutral-hold
+        # sentinel set above, keeping the stream alive without commanding
+        # a real correction.
+        _px4_thrust = 0.5 if mavlink_client._launched else 0.0
+        mavlink_client.send_attitude_target(_px4_pitch_err, _px4_yaw_err, thrust=_px4_thrust)
+    else:
+        is_tracking = (_mav_x != 100.0)
+        mavlink_client.send_vision_error(_mav_x, _mav_y, is_tracking)
 
     # Write to file if in record mode (timed) or live toggle recording
     if args.mode == 'record' and record_queue is not None:
@@ -943,6 +1127,10 @@ while True:
     cv2.putText(frame, overlay1, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
     cv2.putText(frame, overlay2, (8, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
 
+    # Launched indicator
+    if mavlink_client._launched:
+        cv2.putText(frame, "Launched", (8, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
     # REC indicator — blinking dot + elapsed time (only when live-toggle recording is active)
     if _recording and _rec_start_time is not None:
         rec_elapsed = now - _rec_start_time
@@ -964,8 +1152,10 @@ while True:
         finally:
             _suppress_trackbar_cb = False
 
-    # Publish final frame
-    frame_buffer.put(frame)
+    # Publish final frame (tagged with the raw capture's frame_gen so
+    # consumers/GCS can correlate a displayed frame back to a specific
+    # captured one — see _get_frame_history above)
+    frame_buffer.put(frame, gen=_last_frame_gen)
 
     # Local window
     if SHOW_LOCAL:
@@ -978,7 +1168,7 @@ while True:
         state.tracking = False; state.bbox = None; state.tracker = None
         print("[INFO] Tracker reset from Pi")
     elif key == ord('l'):
-        mavlink_client.set_launch(not mavlink_client._launched)
+        _launch_fn(not mavlink_client._launched)
     elif args.mode == 'live':
         if key == ord('x'):   _cycle_main(+1)
         elif key == ord('z'): _cycle_main(-1)
