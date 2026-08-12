@@ -11,6 +11,7 @@ Usage:
     python gcs.py          # reads gcs_ip from config.toml if present
 
 Mouse  : click on video, release to select tracking target
+         (toggle ZOOM in the panel to show a magnifier while dragging)
          left-click on buttons → same as keyboard shortcuts
 
 Keyboard shortcuts (work whether or not the mouse is in the window):
@@ -103,7 +104,7 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 650     # minimum canvas height so all buttons fit
+PANEL_MIN_H = 694     # minimum canvas height so all buttons fit
 DISPLAY_W   = 1200    # video is always stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -122,6 +123,7 @@ _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
 _press_on_video = False   # True from LBUTTONDOWN-on-video until release; commits select_point then
+_press_start_ts = 0.0     # time.time() when the press started; gates the zoom loupe's appearance
 _quit         = threading.Event()  # set to break the main loop from any thread
 _confirm_quit = False             # True while the "are you sure?" overlay is shown
 _CONFIRM_YES  = None              # (x, y, w, h) of the Yes button in the overlay
@@ -351,6 +353,78 @@ def cycle_stab_alpha(delta):
     set_status(f"Stabilization smoothing: {_STAB_SLOW_ALPHA:.2f} "
                f"({'more shake removed' if delta < 0 else 'less lag'})")
 
+# ── Zoom loupe (optional) — press + drag on video to aim precisely ────────────
+#
+# While enabled, pressing on the video shows a magnifier centered exactly on
+# the cursor (never offset — an offset loupe was tried before and found
+# confusing). Position never drifts from the real cursor; only the pixel
+# content is smoothed across recent frames (a short motion-blur) to damp
+# rapid shake without ever decoupling from the mouse. Off by default since
+# an earlier always-on version didn't work well in practice — this makes it
+# opt-in per session.
+
+_zoom_enabled = False
+
+_ZOOM_SRC       = 150   # px cropped from the frame around the cursor
+_ZOOM_OUT       = 220   # loupe window size on screen
+_ZOOM_HOLD_S    = 0.5   # seconds the button must be held before the loupe appears —
+                         # a quick click just selects the cursor point directly
+
+_LOUPE_BLEND_ALPHA = 0.35   # weight of the newest frame; lower = smoother/more lag
+
+_loupe_blend = None   # float32 running average of the source crop, while dragging
+
+def toggle_zoom():
+    global _zoom_enabled
+    _zoom_enabled = not _zoom_enabled
+    _reset_loupe_blend()
+    set_status(f"Zoom loupe: {'ON' if _zoom_enabled else 'OFF'}")
+
+def _smoothed_crop(frame, mx, my):
+    """Return (crop, x0, y0): an exponentially-smoothed crop of the source
+    frame, centered on (mx, my)."""
+    global _loupe_blend
+    h, w = frame.shape[:2]
+    half = _ZOOM_SRC // 2
+    x0 = max(0, min(w - _ZOOM_SRC, mx - half))
+    y0 = max(0, min(h - _ZOOM_SRC, my - half))
+    crop = frame[y0:y0 + _ZOOM_SRC, x0:x0 + _ZOOM_SRC].astype(np.float32)
+
+    if _loupe_blend is None or _loupe_blend.shape != crop.shape:
+        _loupe_blend = crop
+    else:
+        _loupe_blend = _LOUPE_BLEND_ALPHA * crop + (1 - _LOUPE_BLEND_ALPHA) * _loupe_blend
+
+    return np.clip(_loupe_blend, 0, 255).astype(np.uint8), x0, y0
+
+def _reset_loupe_blend():
+    global _loupe_blend
+    _loupe_blend = None
+
+def draw_zoom_loupe(frame, mx, my, crop, x0, y0):
+    """Picture-in-picture magnifier around (mx, my), with a crosshair marking
+    the exact point that will be selected when the mouse button is released."""
+    h, w = frame.shape[:2]
+    if w < _ZOOM_SRC or h < _ZOOM_SRC:
+        return
+    out = min(_ZOOM_OUT, w, h)   # shrink to fit if the frame is smaller than the loupe (e.g. 16:9)
+    zoom = cv2.resize(crop, (out, out), interpolation=cv2.INTER_NEAREST)
+
+    cx = int((mx - x0) * out / _ZOOM_SRC)
+    cy = int((my - y0) * out / _ZOOM_SRC)
+    cv2.line(zoom, (cx - 12, cy), (cx + 12, cy), (50, 50, 230), 1, cv2.LINE_AA)
+    cv2.line(zoom, (cx, cy - 12), (cx, cy + 12), (50, 50, 230), 1, cv2.LINE_AA)
+    cv2.rectangle(zoom, (0, 0), (out - 1, out - 1), (255, 255, 255), 2)
+
+    # Shifted up relative to the cursor so the OS pointer icon (hotspot at its
+    # tip, graphic extending down-right from there) doesn't sit on top of the
+    # crosshair — the aim point ends up lower in the box, not dead center.
+    y_bias = out // 4
+    lx = max(0, min(w - out, mx - out // 2))
+    ly = max(0, min(h - out, my - out // 2 - y_bias))
+
+    frame[ly:ly + out, lx:lx + out] = zoom
+
 def _stabilize(frame, is_new_frame):
     """Warp `frame` by the current shake-cancelling correction, recomputing
     that correction only when a genuinely new frame has arrived."""
@@ -537,6 +611,14 @@ def _build_buttons(vx: int):
     y += 40
     btn2("STAB -", "STAB +", 32,
          lambda: cycle_stab_alpha(-1), lambda: cycle_stab_alpha(+1), (55, 55, 85))
+    y += 44
+
+    # ── Zoom loupe (press + drag on video to aim) ───────────────────────────
+    btn(
+        lambda: "ZOOM: ON" if _zoom_enabled else "ZOOM: OFF",
+        36, toggle_zoom,
+        lambda: (30, 140, 50) if _zoom_enabled else (90, 90, 30),
+    )
     y += 44
 
     # ── D-pad ──────────────────────────────────────────────────────────────
@@ -781,7 +863,7 @@ def main():
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
     def on_mouse(event, x, y, flags, _):
-        global _confirm_quit, _press_on_video
+        global _confirm_quit, _press_on_video, _press_start_ts
         _mouse_pos[0], _mouse_pos[1] = x, y
         if event == cv2.EVENT_LBUTTONDOWN:
             if _confirm_quit:
@@ -794,6 +876,7 @@ def main():
                     _confirm_quit = False
             elif x < _cur_video_w:
                 _press_on_video = True      # commit on release, not on press
+                _press_start_ts = time.time()
             else:
                 for btn in _buttons:        # click on panel → button action
                     if btn.hit(x, y):
@@ -804,6 +887,7 @@ def main():
                 _press_on_video = False
                 fx, fy = _to_raw_coords(x, y)   # undo display-only stabilization shift
                 select_point(fx, fy)            # release → track target
+                _reset_loupe_blend()
 
     cv2.setMouseCallback("Mahat GCS", on_mouse)
 
@@ -860,6 +944,15 @@ def main():
         est_fps_ref[0] = est_fps   # share live FPS with button lambdas
 
         draw_hud(frame, est_fps)
+
+        # ── Zoom loupe — appears only after a long press (a quick click just
+        # selects the cursor point directly) ─────────────────────────────────
+        if _zoom_enabled and _press_on_video and (time.time() - _press_start_ts) >= _ZOOM_HOLD_S:
+            mx, my = _mouse_pos
+            if mx < w:
+                mx_c, my_c = min(w - 1, mx), min(h - 1, my)
+                crop, x0, y0 = _smoothed_crop(frame, mx_c, my_c)
+                draw_zoom_loupe(frame, mx_c, my_c, crop, x0, y0)
 
         # ── Gamepad lock — Square/rectangle button selects at mouse position ─
         if gamepad.lock_pressed():
