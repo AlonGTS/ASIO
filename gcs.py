@@ -843,8 +843,16 @@ def main():
 
         h, w = frame.shape[:2]
 
-        # Rebuild button layout if display width changed
-        if w != _cur_video_w:
+        # Rebuild button layout if display size changed. Width alone isn't
+        # enough to detect this: the resize above always forces width to
+        # DISPLAY_W regardless of the stream's aspect ratio, so switching
+        # the Pi's MAIN resolution between 4:3 and 16:9 changes the real
+        # displayed height without changing w — leaving _cur_video_h stuck
+        # at a stale value and silently breaking ny normalization (worse the
+        # further from y=0, since the wrong denominator's effect grows with
+        # distance from the origin — this was the "top correct, bottom
+        # wrong" click bug).
+        if w != _cur_video_w or h != _cur_video_h:
             _cur_video_w = w
             _cur_video_h = h
             _build_buttons(w)
