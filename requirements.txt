@@ -25,3 +25,7 @@ av==16.0.1
 # Only needed to rebuild gts_tracker.pyx into a .so (see README) — not required
 # to just run the tracker with the prebuilt .so already in the repo.
 Cython==3.2.4
+
+# Optional: PS4/PS5 gamepad target-lock in gcs.py (GCS side only). Soft
+# dependency — gcs.py runs fine without it, gamepad support just stays off.
+pygame==2.6.1

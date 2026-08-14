@@ -2,12 +2,16 @@
 """
 Mahat GCS — Ground Control Station
 Receives UDP video from the Pi tracker and controls it via Flask API.
+The displayed video is digitally stabilized (whole-frame shake cancellation)
+to make it easier to aim; this is display-only — click coordinates are
+mapped back to the Pi's real, unwarped frame before being sent.
 
 Usage:
     python gcs.py --pi 192.168.1.100
     python gcs.py          # reads gcs_ip from config.toml if present
 
-Mouse  : left-click on video → select tracking target
+Mouse  : click on video, release to select tracking target
+         (toggle ZOOM in the panel to show a magnifier while dragging)
          left-click on buttons → same as keyboard shortcuts
 
 Keyboard shortcuts (work whether or not the mouse is in the window):
@@ -22,11 +26,16 @@ Keyboard shortcuts (work whether or not the mouse is in the window):
     P        Toggle Pi recording
     O        Toggle local (GCS) recording
     Q        Quit
+
+Gamepad (optional): connect a PS4/PS5 controller (USB or Bluetooth) before
+launching — press the Square/rectangle button to select the target at the
+current mouse position, same as releasing a mouse-drag.
 """
 
 import argparse
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -35,6 +44,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import requests
+
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")  # pygame is only used for joystick input, no window needed
+try:
+    import pygame
+except ImportError:
+    pygame = None
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -89,8 +104,8 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 560     # minimum canvas height so all buttons fit
-DISPLAY_W   = 640     # video is always stretched to this width for display
+PANEL_MIN_H = 694     # minimum canvas height so all buttons fit
+DISPLAY_W   = 1200    # video is always stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -102,9 +117,13 @@ _local_writer    = None   # cv2.VideoWriter when local recording is active
 cam_active      = False   # Pi camera fps state: False=idle (power-save), True=full fps
 _cpu_percent    = None    # Pi CPU usage %, polled from /status; None until first poll
 _cpu_temp_c     = None    # Pi SoC temperature °C, polled from /status; None until first poll
+_pi_tracking    = False   # Pi-side tracking state, polled from /status
+_frame_gen      = None    # Pi's frame counter for the currently displayed frame; echoed by select_point()
 _status    = ""
 _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
+_press_on_video = False   # True from LBUTTONDOWN-on-video until release; commits select_point then
+_press_start_ts = 0.0     # time.time() when the press started; gates the zoom loupe's appearance
 _quit         = threading.Event()  # set to break the main loop from any thread
 _confirm_quit = False             # True while the "are you sure?" overlay is shown
 _CONFIRM_YES  = None              # (x, y, w, h) of the Yes button in the overlay
@@ -218,8 +237,22 @@ def select_point(x, y):
     # Send normalized coords (0-1) so Pi maps correctly regardless of stream resolution
     nx = round(x / _cur_video_w, 6)
     ny = round(y / _cur_video_h, 6)
-    _post("select_point", nx=nx, ny=ny)
+    # Echo back which frame this click was actually seen on (STABILIZATION.md,
+    # "stale-click problem") — the Pi buffers recent frames and inits/replays
+    # tracking against the one the operator actually clicked, instead of
+    # whatever's live when this arrives. Omit entirely when unknown — the Pi
+    # treats an absent frame_gen as "use the current live frame".
+    extra = {"frame_gen": _frame_gen} if _frame_gen is not None else {}
+    _post("select_point", nx=nx, ny=ny, **extra)
     set_status(f"Selected ({x}, {y})")
+
+def lock_target(x, y):
+    """Commit (x, y) — the current mouse position — as the tracking target.
+    Triggered by the gamepad's Square/rectangle button as an alternative to
+    releasing a mouse-drag."""
+    global _pi_tracking
+    select_point(x, y)
+    _pi_tracking = True   # optimistic — confirmed/corrected by the next /status poll
 
 def toggle_local_record(frame_w=640, frame_h=480):
     global _local_recording, _local_writer
@@ -246,15 +279,16 @@ def toggle_fps():
     set_status("Pi camera: FULL FPS" if cam_active else "Pi camera: IDLE (power-save)")
 
 def _status_poller():
-    """Background: poll /status every 2s to keep cam_active/_cpu_percent/_cpu_temp_c
-    fresh even when nothing else is triggering a request (e.g. after Pi restarts)."""
-    global cam_active, _cpu_percent, _cpu_temp_c
+    """Background: poll /status every 2s to keep cam_active/_cpu_percent/_cpu_temp_c/
+    _pi_tracking fresh even when nothing else is triggering a request (e.g. after Pi restarts)."""
+    global cam_active, _cpu_percent, _cpu_temp_c, _pi_tracking
     while not _quit.is_set():
         data = _get("status")
         if data:
             cam_active   = data.get("active_fps", cam_active)
             _cpu_percent = data.get("cpu_percent", _cpu_percent)
             _cpu_temp_c  = data.get("cpu_temp", _cpu_temp_c)
+            _pi_tracking = data.get("tracking", _pi_tracking)
         time.sleep(2.0)
 
 threading.Thread(target=_status_poller, daemon=True).start()
@@ -266,6 +300,167 @@ def cycle_main(delta):
 def cycle_lores(delta):
     _post("cycle_lores", delta=delta)
     set_status(f"TRACK {'up' if delta > 0 else 'down'}")
+
+# ── Whole-frame stabilization ──────────────────────────────────────────────────
+#
+# Cancels camera shake/vibration so the whole displayed picture holds still.
+# Estimates the frame-to-frame global shift (phase correlation on a
+# downsampled frame — cheap), accumulates it into a raw trajectory, low-pass
+# filters that trajectory to get the "intended" slow motion, and shifts each
+# frame by the difference (raw - smoothed) so fast jitter cancels out while
+# genuine panning still comes through. Translation only (no rotation) — a
+# rotation-aware version was tried and reverted after repeated real-world
+# failures (runaway drift, scale creep); this simpler version is reliable.
+#
+# select_point() must be called with RAW-frame coordinates (matching what the
+# Pi's own live frame looks like), so _to_raw_coords() undoes this shift on
+# whatever pixel was clicked in the now-stabilized display.
+
+_STAB_DOWNSCALE  = 4     # phase correlation runs at 1/this resolution, for speed
+_STAB_ALPHA_MIN  = 0.01
+_STAB_ALPHA_MAX  = 0.50
+_STAB_ALPHA_STEP = 0.01
+
+_stab_enabled    = True
+_STAB_SLOW_ALPHA = 0.05  # how fast the "intended" trajectory adapts (lower = more shake removed)
+_STAB_MAX_SHIFT  = 75    # clamp (px) so one bad correlation can't wildly warp the frame
+
+_stab_prev_gray  = None
+_stab_hann       = None
+_stab_traj       = np.array([0.0, 0.0])   # cumulative raw (unfiltered) trajectory
+_stab_smooth     = np.array([0.0, 0.0])   # low-pass filtered trajectory
+_stab_correction = (0.0, 0.0)             # (cx, cy) applied to the currently displayed frame
+
+def _reset_stabilizer():
+    global _stab_prev_gray, _stab_traj, _stab_smooth, _stab_correction
+    _stab_prev_gray  = None
+    _stab_traj       = np.array([0.0, 0.0])
+    _stab_smooth     = np.array([0.0, 0.0])
+    _stab_correction = (0.0, 0.0)
+
+def toggle_stabilization():
+    global _stab_enabled
+    _stab_enabled = not _stab_enabled
+    _reset_stabilizer()   # avoid a jump from stale trajectory state when re-enabled
+    set_status(f"Stabilization: {'ON' if _stab_enabled else 'OFF'}")
+
+def cycle_stab_alpha(delta):
+    """Adjust how aggressively shake is removed. Lower alpha = more smoothing
+    (removes more shake, but lags more behind genuine panning)."""
+    global _STAB_SLOW_ALPHA
+    _STAB_SLOW_ALPHA = round(max(_STAB_ALPHA_MIN, min(_STAB_ALPHA_MAX,
+                                  _STAB_SLOW_ALPHA + delta * _STAB_ALPHA_STEP)), 3)
+    set_status(f"Stabilization smoothing: {_STAB_SLOW_ALPHA:.2f} "
+               f"({'more shake removed' if delta < 0 else 'less lag'})")
+
+# ── Zoom loupe (optional) — press + drag on video to aim precisely ────────────
+#
+# While enabled, pressing on the video shows a magnifier centered exactly on
+# the cursor (never offset — an offset loupe was tried before and found
+# confusing). Position never drifts from the real cursor; only the pixel
+# content is smoothed across recent frames (a short motion-blur) to damp
+# rapid shake without ever decoupling from the mouse. Off by default since
+# an earlier always-on version didn't work well in practice — this makes it
+# opt-in per session.
+
+_zoom_enabled = False
+
+_ZOOM_SRC       = 150   # px cropped from the frame around the cursor
+_ZOOM_OUT       = 220   # loupe window size on screen
+_ZOOM_HOLD_S    = 0.5   # seconds the button must be held before the loupe appears —
+                         # a quick click just selects the cursor point directly
+
+_LOUPE_BLEND_ALPHA = 0.35   # weight of the newest frame; lower = smoother/more lag
+
+_loupe_blend = None   # float32 running average of the source crop, while dragging
+
+def toggle_zoom():
+    global _zoom_enabled
+    _zoom_enabled = not _zoom_enabled
+    _reset_loupe_blend()
+    set_status(f"Zoom loupe: {'ON' if _zoom_enabled else 'OFF'}")
+
+def _smoothed_crop(frame, mx, my):
+    """Return (crop, x0, y0): an exponentially-smoothed crop of the source
+    frame, centered on (mx, my)."""
+    global _loupe_blend
+    h, w = frame.shape[:2]
+    half = _ZOOM_SRC // 2
+    x0 = max(0, min(w - _ZOOM_SRC, mx - half))
+    y0 = max(0, min(h - _ZOOM_SRC, my - half))
+    crop = frame[y0:y0 + _ZOOM_SRC, x0:x0 + _ZOOM_SRC].astype(np.float32)
+
+    if _loupe_blend is None or _loupe_blend.shape != crop.shape:
+        _loupe_blend = crop
+    else:
+        _loupe_blend = _LOUPE_BLEND_ALPHA * crop + (1 - _LOUPE_BLEND_ALPHA) * _loupe_blend
+
+    return np.clip(_loupe_blend, 0, 255).astype(np.uint8), x0, y0
+
+def _reset_loupe_blend():
+    global _loupe_blend
+    _loupe_blend = None
+
+def draw_zoom_loupe(frame, mx, my, crop, x0, y0):
+    """Picture-in-picture magnifier around (mx, my), with a crosshair marking
+    the exact point that will be selected when the mouse button is released."""
+    h, w = frame.shape[:2]
+    if w < _ZOOM_SRC or h < _ZOOM_SRC:
+        return
+    out = min(_ZOOM_OUT, w, h)   # shrink to fit if the frame is smaller than the loupe (e.g. 16:9)
+    zoom = cv2.resize(crop, (out, out), interpolation=cv2.INTER_NEAREST)
+
+    cx = int((mx - x0) * out / _ZOOM_SRC)
+    cy = int((my - y0) * out / _ZOOM_SRC)
+    cv2.line(zoom, (cx - 12, cy), (cx + 12, cy), (50, 50, 230), 1, cv2.LINE_AA)
+    cv2.line(zoom, (cx, cy - 12), (cx, cy + 12), (50, 50, 230), 1, cv2.LINE_AA)
+    cv2.rectangle(zoom, (0, 0), (out - 1, out - 1), (255, 255, 255), 2)
+
+    # Shifted up relative to the cursor so the OS pointer icon (hotspot at its
+    # tip, graphic extending down-right from there) doesn't sit on top of the
+    # crosshair — the aim point ends up lower in the box, not dead center.
+    y_bias = out // 4
+    lx = max(0, min(w - out, mx - out // 2))
+    ly = max(0, min(h - out, my - out // 2 - y_bias))
+
+    frame[ly:ly + out, lx:lx + out] = zoom
+
+def _stabilize(frame, is_new_frame):
+    """Warp `frame` by the current shake-cancelling correction, recomputing
+    that correction only when a genuinely new frame has arrived."""
+    global _stab_prev_gray, _stab_hann, _stab_traj, _stab_smooth, _stab_correction
+    h, w = frame.shape[:2]
+
+    if is_new_frame:
+        sw, sh = max(1, w // _STAB_DOWNSCALE), max(1, h // _STAB_DOWNSCALE)
+        small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        if _stab_prev_gray is not None and _stab_prev_gray.shape == gray.shape:
+            if _stab_hann is None or _stab_hann.shape != (sh, sw):
+                _stab_hann = cv2.createHanningWindow((sw, sh), cv2.CV_32F)
+            (dx, dy), resp = cv2.phaseCorrelate(_stab_prev_gray, gray, _stab_hann)
+            if resp > 0.05:   # low confidence (e.g. near-blank frame) → skip this sample
+                dx = max(-_STAB_MAX_SHIFT, min(_STAB_MAX_SHIFT, dx * _STAB_DOWNSCALE))
+                dy = max(-_STAB_MAX_SHIFT, min(_STAB_MAX_SHIFT, dy * _STAB_DOWNSCALE))
+                _stab_traj += (dx, dy)
+
+        _stab_prev_gray = gray
+        _stab_smooth += _STAB_SLOW_ALPHA * (_stab_traj - _stab_smooth)
+        corr = np.clip(_stab_smooth - _stab_traj, -_STAB_MAX_SHIFT, _STAB_MAX_SHIFT)
+        _stab_correction = (float(corr[0]), float(corr[1]))
+
+    cx, cy = _stab_correction
+    M = np.float32([[1, 0, cx], [0, 1, cy]])
+    return cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+def _to_raw_coords(px, py):
+    """Undo the current stabilization shift — use before select_point()/lock_target()
+    so the Pi (which sees its own unwarped live frame) gets the right pixel."""
+    cx, cy = _stab_correction
+    rx = max(0, min(_cur_video_w - 1, int(round(px - cx))))
+    ry = max(0, min(_cur_video_h - 1, int(round(py - cy))))
+    return rx, ry
 
 def toggle_pi_record(cur_fps=0.0):
     """Tell the Pi to start or stop recording. Tracks state optimistically."""
@@ -405,7 +600,26 @@ def _build_buttons(vx: int):
         36, toggle_fps,
         lambda: (30, 140, 50) if cam_active else (90, 90, 30),
     )
-    y += 52
+    y += 44
+
+    # ── Video stabilization ─────────────────────────────────────────────────
+    btn(
+        lambda: "STAB: ON" if _stab_enabled else "STAB: OFF",
+        36, toggle_stabilization,
+        lambda: (30, 140, 50) if _stab_enabled else (90, 90, 30),
+    )
+    y += 40
+    btn2("STAB -", "STAB +", 32,
+         lambda: cycle_stab_alpha(-1), lambda: cycle_stab_alpha(+1), (55, 55, 85))
+    y += 44
+
+    # ── Zoom loupe (press + drag on video to aim) ───────────────────────────
+    btn(
+        lambda: "ZOOM: ON" if _zoom_enabled else "ZOOM: OFF",
+        36, toggle_zoom,
+        lambda: (30, 140, 50) if _zoom_enabled else (90, 90, 30),
+    )
+    y += 44
 
     # ── D-pad ──────────────────────────────────────────────────────────────
     dw  = dh  = 46
@@ -445,25 +659,29 @@ def draw_hud(frame, fps):
     def txt(msg, pos, color=(240,240,240), scale=0.55):
         cv2.putText(frame, msg, pos, _FONT, scale, (0,0,0), 3, cv2.LINE_AA)
         cv2.putText(frame, msg, pos, _FONT, scale, color,   1, cv2.LINE_AA)
+        (tw, _), _ = cv2.getTextSize(msg, _FONT, scale, 1)
+        return tw
 
-    txt(f"FPS {fps:4.1f}",                            (8,   25))
+    x = 8
+    GAP = 14
+    x += txt(f"FPS {fps:4.1f}", (x, 25)) + GAP
 
     if _cpu_percent is not None:
         cpu_col = (60, 200, 60) if _cpu_percent < 50 else \
                   (60, 160, 255) if _cpu_percent < 80 else (60, 60, 220)
-        txt(f"CPU {_cpu_percent:3.0f}%", (100, 25), color=cpu_col)
+        x += txt(f"CPU {_cpu_percent:3.0f}%", (x, 25), color=cpu_col) + GAP
 
     if _cpu_temp_c is not None:
         # Pi SoC starts soft-throttling around ~80C, hard throttle ~85C
         temp_col = (60, 200, 60) if _cpu_temp_c < 60 else \
                    (60, 160, 255) if _cpu_temp_c < 75 else (60, 60, 220)
-        txt(f"{_cpu_temp_c:4.1f}C", (175, 25), color=temp_col)
+        x += txt(f"{_cpu_temp_c:4.1f}C", (x, 25), color=temp_col) + GAP
 
-    txt("FULL" if cam_active else "IDLE",             (250, 25),
-        color=(60, 200, 60) if cam_active else (150, 150, 150))
+    x += txt("FULL" if cam_active else "IDLE", (x, 25),
+             color=(60, 200, 60) if cam_active else (150, 150, 150)) + GAP
 
-    txt(f"{'MOVING' if moving_tgt else 'FIXED'}",     (310, 25), color=mode_col)
-    txt("LAUNCHED" if launched else "READY",           (435, 25), color=launch_col)
+    x += txt(f"{'MOVING' if moving_tgt else 'FIXED'}", (x, 25), color=mode_col) + GAP
+    txt("LAUNCHED" if launched else "READY", (x, 25), color=launch_col)
 
     # REC indicators — blinking every second
     rec_x = w - 16
@@ -519,6 +737,41 @@ _ARROW = {
 }
 
 
+# ── Gamepad (optional) — Square/rectangle button locks the target ─────────────
+#
+# Button index is a best guess (raw HID face-button order on a PS4 controller
+# over Bluetooth) — unverified; adjust _LOCK_BUTTON if the wrong button fires.
+
+_LOCK_BUTTON = 2   # Square/rectangle face button
+
+class _Gamepad:
+    def __init__(self):
+        self._joy = None
+        self._prev_lock = False
+        if pygame is None:
+            return
+        try:
+            pygame.display.init()
+            pygame.joystick.init()
+            if pygame.joystick.get_count() > 0:
+                self._joy = pygame.joystick.Joystick(0)
+                self._joy.init()
+                print(f"[Gamepad] connected: {self._joy.get_name()}")
+        except Exception as e:
+            print(f"[Gamepad] unavailable: {e}")
+
+    def lock_pressed(self):
+        """True on the frame the Square/rectangle button transitions to pressed
+        (edge-triggered — holding it down doesn't fire repeatedly)."""
+        if self._joy is None:
+            return False
+        pygame.event.pump()
+        cur = self._joy.get_numbuttons() > _LOCK_BUTTON and self._joy.get_button(_LOCK_BUTTON)
+        edge = cur and not self._prev_lock
+        self._prev_lock = cur
+        return edge
+
+
 # ── Live capture — background reader thread ───────────────────────────────────
 #
 # Problem: cv2.VideoCapture.read() returns frames in decode order from an internal
@@ -531,6 +784,24 @@ _ARROW = {
 # The Pi sends JPEG-encoded frames as individual UDP datagrams (broadcast).
 # Each datagram = one complete JPEG image — no stream reassembly needed.
 
+_JPEG_SOI = b"\xff\xd8"   # JPEG Start-Of-Image marker — always the first 2 bytes of a JPEG
+
+def _split_frame_gen(data: bytes):
+    """Split a video datagram into (frame_gen_or_None, jpeg_bytes).
+
+    Wire format (see STABILIZATION.md, "stale-click problem"): the Pi may
+    prepend a 4-byte big-endian frame_gen counter before the JPEG bytes, so
+    the GCS can echo it back with select_point() and the Pi can look up the
+    exact frame that was clicked on, instead of using whatever's live at
+    request time. Detected via the JPEG SOI marker so this stays backward
+    compatible with a Pi that isn't sending the header yet.
+    """
+    if data[:2] == _JPEG_SOI:
+        return None, data            # legacy: no header, whole payload is the JPEG
+    if len(data) > 4 and data[4:6] == _JPEG_SOI:
+        return struct.unpack(">I", data[:4])[0], data[4:]
+    return None, data                # unrecognized — best-effort fallback
+
 class _LiveCapture:
     def __init__(self, port: int):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -538,10 +809,11 @@ class _LiveCapture:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)  # 1 MB
         self._sock.bind(('', port))
         self._sock.settimeout(1.0)
-        self._frame    = None
-        self._ok       = False
-        self._frame_id = 0
-        self._lock     = threading.Lock()
+        self._frame     = None
+        self._ok        = False
+        self._frame_id  = 0
+        self._frame_gen = None   # Pi-side frame counter, echoed back with select_point()
+        self._lock      = threading.Lock()
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
@@ -549,13 +821,15 @@ class _LiveCapture:
         while True:
             try:
                 data, _ = self._sock.recvfrom(1 << 16)  # 65536 bytes max UDP payload
-                arr   = np.frombuffer(data, dtype=np.uint8)
+                frame_gen, jpeg = _split_frame_gen(data)
+                arr   = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame is not None:
                     with self._lock:
-                        self._frame    = frame
-                        self._ok       = True
+                        self._frame     = frame
+                        self._ok        = True
                         self._frame_id += 1
+                        self._frame_gen = frame_gen
             except socket.timeout:
                 with self._lock:
                     self._ok = False   # no packet for 1 s → show waiting screen
@@ -563,17 +837,18 @@ class _LiveCapture:
                 print(f"[UDP] recv: {e}")
 
     def read(self):
-        """Return (ok, frame_copy, frame_id).  Never blocks more than the lock."""
+        """Return (ok, frame_copy, frame_id, frame_gen).  Never blocks more than the lock."""
         with self._lock:
             if self._frame is None:
-                return False, None, 0
-            return self._ok, self._frame.copy(), self._frame_id
+                return False, None, 0, None
+            return self._ok, self._frame.copy(), self._frame_id, self._frame_gen
+
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit
+    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit, _frame_gen
 
     data     = _get("status")
     launched = data.get("launched", False)
@@ -582,12 +857,13 @@ def main():
     else:
         set_status(f"Commands via UDP broadcast — waiting for video…")
 
-    cap = _LiveCapture(UDP_PORT)
+    cap     = _LiveCapture(UDP_PORT)
+    gamepad = _Gamepad()
 
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
     def on_mouse(event, x, y, flags, _):
-        global _confirm_quit
+        global _confirm_quit, _press_on_video, _press_start_ts
         _mouse_pos[0], _mouse_pos[1] = x, y
         if event == cv2.EVENT_LBUTTONDOWN:
             if _confirm_quit:
@@ -599,23 +875,30 @@ def main():
                                  and _CONFIRM_NO[1] <= y < _CONFIRM_NO[1] + _CONFIRM_NO[3]:
                     _confirm_quit = False
             elif x < _cur_video_w:
-                select_point(x, y)          # click on video → track target
+                _press_on_video = True      # commit on release, not on press
+                _press_start_ts = time.time()
             else:
                 for btn in _buttons:        # click on panel → button action
                     if btn.hit(x, y):
                         btn.action()
                         break
+        elif event == cv2.EVENT_LBUTTONUP:
+            if _press_on_video:
+                _press_on_video = False
+                fx, fy = _to_raw_coords(x, y)   # undo display-only stabilization shift
+                select_point(fx, fy)            # release → track target
+                _reset_loupe_blend()
 
     cv2.setMouseCallback("Mahat GCS", on_mouse)
 
-    last_frame_ts = None
-    last_frame_id = 0
-    last_rec_id   = 0
-    est_fps       = 0.0
-    FPS_A         = 0.9
+    last_frame_ts   = None
+    last_frame_id   = 0
+    last_rec_id     = 0
+    est_fps         = 0.0
+    FPS_A           = 0.9
 
     while not _quit.is_set():
-        ok, frame, frame_id = cap.read()
+        ok, frame, frame_id, frame_gen = cap.read()
 
         if not ok or frame is None:
             frame = _waiting_frame(_cur_video_w, _cur_video_h)
@@ -627,19 +910,33 @@ def main():
                 dh = int(fh * DISPLAY_W / fw)
                 frame = cv2.resize(frame, (DISPLAY_W, dh), interpolation=cv2.INTER_LINEAR)
 
+            is_new_frame = frame_id != last_frame_id
+
             # FPS — only count genuinely new UDP frames, not repeated buffer reads
-            if frame_id != last_frame_id:
+            if is_new_frame:
                 now = time.time()
                 if last_frame_ts is not None:
                     inst    = 1.0 / max(1e-6, now - last_frame_ts)
                     est_fps = FPS_A * est_fps + (1 - FPS_A) * inst if est_fps else inst
                 last_frame_ts = now
                 last_frame_id = frame_id
+                _frame_gen    = frame_gen
+
+            if _stab_enabled:
+                frame = _stabilize(frame, is_new_frame)
 
         h, w = frame.shape[:2]
 
-        # Rebuild button layout if display width changed
-        if w != _cur_video_w:
+        # Rebuild button layout if display size changed. Width alone isn't
+        # enough to detect this: the resize above always forces width to
+        # DISPLAY_W regardless of the stream's aspect ratio, so switching
+        # the Pi's MAIN resolution between 4:3 and 16:9 changes the real
+        # displayed height without changing w — leaving _cur_video_h stuck
+        # at a stale value and silently breaking ny normalization (worse the
+        # further from y=0, since the wrong denominator's effect grows with
+        # distance from the origin — this was the "top correct, bottom
+        # wrong" click bug).
+        if w != _cur_video_w or h != _cur_video_h:
             _cur_video_w = w
             _cur_video_h = h
             _build_buttons(w)
@@ -647,6 +944,20 @@ def main():
         est_fps_ref[0] = est_fps   # share live FPS with button lambdas
 
         draw_hud(frame, est_fps)
+
+        # ── Zoom loupe — appears only after a long press (a quick click just
+        # selects the cursor point directly) ─────────────────────────────────
+        if _zoom_enabled and _press_on_video and (time.time() - _press_start_ts) >= _ZOOM_HOLD_S:
+            mx, my = _mouse_pos
+            if mx < w:
+                mx_c, my_c = min(w - 1, mx), min(h - 1, my)
+                crop, x0, y0 = _smoothed_crop(frame, mx_c, my_c)
+                draw_zoom_loupe(frame, mx_c, my_c, crop, x0, y0)
+
+        # ── Gamepad lock — Square/rectangle button selects at mouse position ─
+        if gamepad.lock_pressed():
+            fx, fy = _to_raw_coords(min(w - 1, _mouse_pos[0]), min(h - 1, _mouse_pos[1]))
+            lock_target(fx, fy)
 
         # Write to local recorder (video + HUD, no panel) — only on genuinely
         # new frames, so recorded playback speed matches real time instead of
