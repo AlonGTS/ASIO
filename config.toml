@@ -51,7 +51,7 @@ filter_lr           = 0.25
 interface        = "wlan0"
 gcs_udp_port     = 5600
 gcs_cmd_port     = 5601
-gcs_jpeg_quality = 60     # was 60 — lower = smaller frames (~12 KB vs ~35 KB)
+gcs_jpeg_quality = 80     # was 60 — lower = smaller frames (~12 KB vs ~35 KB)
 gcs_stream_width = 640  # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 30fps)
 # Cap on JPEG-encode-and-send rate to the GCS, independent of camera capture/
 # active_fps — tracking and MAVLink still run at full active_fps regardless.
@@ -61,8 +61,22 @@ gcs_stream_fps   = 15
 
 # Video transport: "jpeg_udp" = current JPEG-over-UDP for gcs.py
 #                  "webrtc"   = H.264 WebRTC served at http://<pi>:8080
-video_mode           = "jpeg_udp"
+#                  "h264_udp" = H.264 over raw RTP/UDP (h264_udp_server.py +
+#                               gcs.py's _H264LiveCapture) — hardware encoder
+#                               (Pi 4/CM4) used automatically if present,
+#                               software (libx264) fallback otherwise. Lower
+#                               latency and bandwidth than jpeg_udp at the
+#                               same resolution; connectionless like jpeg_udp
+#                               (no handshake, auto-recovers after packet
+#                               loss/Wi-Fi drops at the next keyframe).
+video_mode           = "h264_udp"
 webrtc_bitrate_kbps  = 0   # 0 = unconstrained; set e.g. 800 for narrow RF links
+
+# h264_udp mode only. Reuses gcs_udp_port/gcs_stream_width/gcs_stream_fps
+# above for the socket, resize, and send-rate — these three are h264-specific:
+h264_bitrate_kbps = 2000   # target encoder bitrate
+h264_gop_seconds  = 0.5    # I-frame interval (~15 frames @ 30fps feed, less at a lower gcs_stream_fps)
+h264_rtp_payload  = 1200   # max NAL bytes per UDP/RTP packet — keeps packets MTU-safe (no IP fragmentation)
 
 [network.wlan0]
 bind_ip = "192.168.1.45"
@@ -92,12 +106,12 @@ gcs_port      = 14550
 local_port    = 14551
 # Dedicated unicast outputs — MAVProxy sends a copy to each IP:gcs_port
 # Add every QGC / GCS machine here that needs full telemetry
-extra_outputs = ["192.168.10.8", "10.50.117.41", "192.168.1.31", "192.168.1.43", "192.168.1.32"]
+extra_outputs = ["192.168.10.8", "10.50.117.41", "192.168.1.34", "192.168.1.43", "192.168.1.32"]
 
 [camera]
 # Safe/default resolutions for IMX708 path
 main_sizes  = [[640, 480], [960, 540], [1280, 720], [1640, 1232]]
-lores_sizes = [[320, 240], [416, 312], [512, 384], [640,  480]]
+lores_sizes = [[320, 240], [416, 312], [512, 384], [640,  480], [800, 600], [960, 720], [1280, 960], [1640, 1232]]
 
 # Capture starts at idle_fps (low CPU/heat) and only switches to active_fps
 # when the GCS operator explicitly toggles it (FPS button / F key in gcs.py).

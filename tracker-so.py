@@ -893,6 +893,23 @@ elif _VIDEO_MODE == "jpeg_udp":
 
     Thread(target=_udp_stream_worker, daemon=True).start()
 
+elif _VIDEO_MODE == "h264_udp":
+    import h264_udp_server
+    _h264_port = _cfg["network"].get("gcs_udp_port", 5600)
+    _h264_kbps = _cfg["network"].get("h264_bitrate_kbps", 2000)
+    h264_udp_server.start(
+        frame_buffer,
+        gcs_ip_getter = lambda: GCS_IP,
+        port          = _h264_port,
+        stream_width  = _cfg["network"].get("gcs_stream_width", 480),
+        stream_fps    = _cfg["network"].get("gcs_stream_fps", 15),
+        bitrate_kbps  = _h264_kbps,
+        gop_seconds   = _cfg["network"].get("h264_gop_seconds", 0.5),
+        rtp_payload   = _cfg["network"].get("h264_rtp_payload", 1200),
+    )
+    print(f"[H264]  udp://<gcs>:{_h264_port}  bitrate={_h264_kbps}kbps  "
+          f"(hardware encoder used if available, software fallback otherwise)")
+
 else:
     print(f"[WARN] Unknown video_mode '{_VIDEO_MODE}' in config.toml — no video stream started")
 
