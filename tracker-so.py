@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 # CLI args / timestamps / small GUI dialogs for file/duration picking
 import fcntl
+import os
 import signal
 import socket
 import struct
@@ -28,10 +29,35 @@ _HERE = Path(__file__).parent
 import argparse
 from datetime import datetime
 import tkinter as tk
-from tkinter import filedialog, simpledialog
+from tkinter import simpledialog
 
 import webrtc_server
 from gts_tracker import GTSTracker
+
+
+def _choose_video_file():
+    """Native macOS file picker via AppleScript, run in a completely
+    separate `osascript` process — deliberately NOT Tkinter. A Tk dialog
+    launched from a process VS Code's debugger spawned proved unreliable in
+    practice (the GCS window went unresponsive, spinning-cursor beachball,
+    clicks not registering) — likely a focus/window-server interaction
+    specific to how debugpy launches its debuggee. Running the dialog in an
+    unrelated process sidesteps that outright, and this process never
+    touches Tk/Cocoa itself, so it also doesn't get registered as a second,
+    unlabeled "Python" app in the Dock for the rest of its life the way
+    even a destroyed Tk window does."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e",
+             'POSIX path of (choose file of type {"avi","mp4","mov","mkv"} '
+             'with prompt "Select video file")'],
+            capture_output=True, text=True, timeout=120,
+        )
+        path = result.stdout.strip()
+        return path if path and result.returncode == 0 else None
+    except Exception as e:
+        print(f"[ERROR] File picker failed: {e}")
+        return None
 
 
 # ── Tracking Quality Monitor ─────────────────────────────────────────────────
@@ -456,23 +482,43 @@ def _set_camera_active(active: bool):
         print(f"[LIVE] Failed to set framerate {fps}: {e}")
 
 
+# === CLI args (moved ahead of MAVLink/Serial Setup below, which needs
+# args.mode to skip mavproxy/serial entirely in playback/record mode — there's
+# no flight controller to talk to there, and start_mavproxy() launches a real
+# subprocess against a real serial port that only exists on the Pi) ===
+parser = argparse.ArgumentParser()
+parser.add_argument('--mode', choices=['live', 'record', 'playback'], default='live')
+parser.add_argument('--video', help='Path to video file for playback')
+parser.add_argument('--duration', type=int, help='Duration to record (seconds)')
+parser.add_argument('--loop', action='store_true', help='Loop video in playback mode')
+args = parser.parse_args()
+
 # === MAVLink / Serial Setup ===
+# set_autopilot() just records a string, harmless in any mode. start_mavproxy()
+# and connect() are the two calls that actually touch hardware/subprocesses —
+# skipped outside 'live' since every mavlink_client function is already
+# internally gated on _enabled (stays False here), so playback/record mode
+# just runs with MAVLink silently disabled instead of crashing on a Mac/no-Pi
+# host (no mavproxy install, no /dev/serial/by-id path).
 import mavlink_client
 _mav_cfg = _cfg["mavlink"]
 AUTOPILOT = _mav_cfg.get("autopilot", "custom")
 mavlink_client.set_autopilot(AUTOPILOT)
-mavlink_client.start_mavproxy(
-    pixhawk_port  = _mav_cfg["pixhawk_port"],
-    pixhawk_baud  = _mav_cfg["pixhawk_baud"],
-    gcs_port      = _mav_cfg["gcs_port"],
-    local_port    = _mav_cfg["local_port"],
-    extra_outputs = _mav_cfg.get("extra_outputs", []),
-    mavproxy_path = _mav_cfg.get("mavproxy_path"),
-)
-mavlink_client.connect(
-    url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",
-    fallback_url=f"udpout:{GCS_IP}:{_mav_cfg['gcs_port']}",
-)
+if args.mode == 'live':
+    mavlink_client.start_mavproxy(
+        pixhawk_port  = _mav_cfg["pixhawk_port"],
+        pixhawk_baud  = _mav_cfg["pixhawk_baud"],
+        gcs_port      = _mav_cfg["gcs_port"],
+        local_port    = _mav_cfg["local_port"],
+        extra_outputs = _mav_cfg.get("extra_outputs", []),
+        mavproxy_path = _mav_cfg.get("mavproxy_path"),
+    )
+    mavlink_client.connect(
+        url=f"udpin:0.0.0.0:{_mav_cfg['local_port']}",
+        fallback_url=f"udpout:{GCS_IP}:{_mav_cfg['gcs_port']}",
+    )
+else:
+    print(f"[MAVLink] Skipped in --mode {args.mode} (no flight controller to connect to)")
 
 # Ensure MAVProxy is killed on SIGTERM (terminal closed) and SIGHUP,
 # not just on normal exit / Ctrl-C (which atexit already handles).
@@ -537,19 +583,17 @@ _VFOV_RAD = math.radians(45)   # ~45° vertical FOV
 # mavlink_client.py still clamps above that as a hard ceiling.
 _PX4_RATE_GAIN = math.radians(100) / (_HFOV_RAD / 2)
 
-# === Command-line arguments setup ===
-parser = argparse.ArgumentParser()
-parser.add_argument('--mode', choices=['live', 'record', 'playback'], default='live')
-parser.add_argument('--video', help='Path to video file for playback')
-parser.add_argument('--duration', type=int, help='Duration to record (seconds)')
-parser.add_argument('--loop', action='store_true', help='Loop video in playback mode')
-args = parser.parse_args()
+# (args parsed earlier, ahead of the MAVLink/Serial Setup block above)
 
 # If recording and duration not provided on CLI, ask with a small dialog (Tk)
 if args.mode == 'record' and not args.duration:
     root = tk.Tk(); root.withdraw()
     duration = simpledialog.askinteger("Recording Duration", "How many seconds to record?",
                                        minvalue=1, maxvalue=3600)
+    root.destroy()   # otherwise this process keeps a hidden Tk window alive for its whole
+                      # lifetime, which registers it as a second, unlabeled "Python" app in
+                      # the Dock alongside gcs.py's "Mahat GCS" — confusing, and can steal
+                      # keyboard/mouse focus from the actual GCS window
     if not duration:
         print("[ERROR] No duration selected. Exiting.")
         exit(1)
@@ -558,12 +602,12 @@ if args.mode == 'record' and not args.duration:
 
 # === Input Setup: file playback or live camera (each spawns a reader thread) ===
 if args.mode == 'playback':
-    if not args.video:
-        root = tk.Tk(); root.withdraw()
-        args.video = filedialog.askopenfilename(
-            title="Select video file",
-            filetypes=[("Video files", "*.avi *.mp4 *.mov *.mkv"), ("All files", "*.*")]
-        )
+    # Also falls through to the picker for a non-empty but nonexistent path
+    # (e.g. a stale/typo'd --video).
+    if not args.video or not os.path.isfile(args.video):
+        if args.video:
+            print(f"[INFO] '{args.video}' not found — opening file picker")
+        args.video = _choose_video_file()
         if not args.video:
             print("[ERROR] No file selected. Exiting...")
             exit(1)
@@ -802,18 +846,173 @@ app = flask_app.create_app(
     get_cpu_fn         = lambda: _cpu_percent,
     get_cpu_temp_fn    = lambda: _cpu_temp_c,
     get_frame_history_fn = _get_frame_history if args.mode in ('live', 'playback') else None,
+    # Lambdas, not bare references: set_video_mode/_current_video_mode are
+    # defined later in this file (the video-stream section) — deferring the
+    # name lookup to call time (well after the whole module has loaded)
+    # avoids a NameError here at import time.
+    set_video_mode_fn  = lambda mode: set_video_mode(mode),
+    get_video_mode_fn  = lambda: _current_video_mode,
 )
 
 # === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
+# flask_port defaults to 5000 (unset in config.toml on every Pi in the fleet)
+# but is overridable — mainly for local/offline testing on a Mac, where
+# macOS's own AirPlay Receiver squats on 5000 by default.
+_FLASK_PORT = _cfg["network"].get("flask_port", 5000)
 from waitress import serve as _waitress_serve
-print(f"[Flask]  http://{BIND_IP}:5000  (waitress)")
-flask_thread = Thread(target=lambda: _waitress_serve(app, host="0.0.0.0", port=5000, threads=8, _quiet=True))
+print(f"[Flask]  http://{BIND_IP}:{_FLASK_PORT}  (waitress)")
+flask_thread = Thread(target=lambda: _waitress_serve(app, host="0.0.0.0", port=_FLASK_PORT, threads=8, _quiet=True))
 flask_thread.daemon = True
 flask_thread.start()
 
-# === Video stream (mode selected by config.toml video_mode) ===
+# === Video stream (mode selected by config.toml video_mode, switchable live
+#     between jpeg_udp and h264_udp via /set_video_mode — see below) ===
+#
+# webrtc is deliberately NOT part of the switchable set: it's a different
+# connection model entirely (HTTP/ICE signaling, not just a UDP port), and
+# isn't the "comms degraded, drop to something loss-tolerant" case this
+# exists for. If video_mode is "webrtc", it just starts once, as before,
+# and /set_video_mode has nothing to switch away from.
 
 import socket as _socket   # needed by command channel regardless of video_mode
+
+_UDP_PORT = _cfg["network"].get("gcs_udp_port", 5600)   # shared by jpeg_udp and h264_udp
+
+_video_thread     = None   # currently running jpeg_udp/h264_udp sender thread, or None
+_video_stop_event = None   # its stop signal, or None
+_current_video_mode = None  # "jpeg_udp" / "h264_udp" (whatever's actually running), or None
+                             # if video_mode is "webrtc"/unknown — those aren't switchable
+
+def _start_jpeg_udp():
+    """(Re)start the JPEG-over-UDP sender. Its own thread + socket, torn
+    down cleanly by _stop_video_stream() before anything else starts on
+    the same port."""
+    global _video_thread, _video_stop_event
+    _jpeg_quality = _cfg["network"].get("gcs_jpeg_quality", 40)
+    _stream_width = _cfg["network"].get("gcs_stream_width", 480)
+    # Encode+send rate to the GCS is independent of capture/tracking fps — the
+    # operator's video view doesn't need every frame, but the tracker/MAVLink
+    # loop does. Throttling this is the cheapest way to cut CPU without
+    # slowing down tracking. 0 = uncapped (encode every published frame).
+    _stream_fps      = _cfg["network"].get("gcs_stream_fps", 15)
+    _stream_interval = (1.0 / _stream_fps) if _stream_fps > 0 else 0.0
+
+    _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)
+    _jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, _jpeg_quality]
+    _udp_max = 65400
+
+    stop_event = threading.Event()
+
+    def _udp_stream_worker():
+        last_gen      = -1
+        _t0           = time.time()
+        _sent         = 0
+        _last_send_ts = 0.0
+        print(f"[UDP]  stream worker ready — waiting for GCS to announce "
+              f"(cap {_stream_fps if _stream_fps > 0 else 'uncapped'} fps)")
+        while not stop_event.is_set():
+            frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
+            if frame is None:
+                continue
+            last_gen = gen
+
+            if GCS_IP is None:
+                continue
+
+            _now_gate = time.time()
+            if _stream_interval > 0 and (_now_gate - _last_send_ts) < _stream_interval:
+                continue   # skip encode+send for this frame — capture/tracking keep running at full fps
+            _last_send_ts = _now_gate
+
+            _sent += 1
+            _now = time.time()
+            if _now - _t0 >= 5.0:
+                print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)  → {GCS_IP}")
+                _t0, _sent = _now, 0
+
+            h_f, w_f = frame.shape[:2]
+            if w_f > _stream_width:
+                scale = _stream_width / w_f
+                frame = cv2.resize(frame, (_stream_width, int(h_f * scale)), interpolation=cv2.INTER_LINEAR)
+
+            ok, buf = cv2.imencode('.jpg', frame, _jpeg_params)
+            if not ok:
+                continue
+            # 4-byte big-endian frame_gen header + JPEG bytes. GCS must strip
+            # the first 4 bytes before decoding, and echo that value back as
+            # frame_gen on /select_point so the Pi can init tracking against
+            # the frame the operator actually clicked on (see
+            # STABILIZATION.md — "the stale-click problem").
+            data = struct.pack('>I', gen & 0xFFFFFFFF) + buf.tobytes()
+            if len(data) > _udp_max:
+                continue
+            try:
+                _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))
+            except Exception as e:
+                print(f"[UDP]  send error: {e}")
+
+        try:
+            _udp_sock.close()
+        except Exception:
+            pass
+        print("[UDP]  stream worker stopped")
+
+    _video_thread = Thread(target=_udp_stream_worker, daemon=True)
+    _video_thread.start()
+    _video_stop_event = stop_event
+
+def _start_h264_udp():
+    global _video_thread, _video_stop_event
+    import h264_udp_server
+    _h264_kbps = _cfg["network"].get("h264_bitrate_kbps", 2000)
+    _video_thread, _video_stop_event = h264_udp_server.start(
+        frame_buffer,
+        gcs_ip_getter = lambda: GCS_IP,
+        port          = _UDP_PORT,
+        stream_width  = _cfg["network"].get("gcs_stream_width", 480),
+        stream_fps    = _cfg["network"].get("gcs_stream_fps", 15),
+        bitrate_kbps  = _h264_kbps,
+        gop_seconds   = _cfg["network"].get("h264_gop_seconds", 0.5),
+        rtp_payload   = _cfg["network"].get("h264_rtp_payload", 1200),
+    )
+    print(f"[H264]  udp://<gcs>:{_UDP_PORT}  bitrate={_h264_kbps}kbps  "
+          f"(hardware encoder used if available, software fallback otherwise)")
+
+def _stop_video_stream():
+    """Signal whichever of jpeg_udp/h264_udp is running to stop, and wait
+    (briefly) for its socket/encoder to actually release the port."""
+    global _video_thread, _video_stop_event
+    if _video_stop_event is not None:
+        _video_stop_event.set()
+    if _video_thread is not None:
+        _video_thread.join(timeout=2.0)
+    _video_thread = None
+    _video_stop_event = None
+
+def set_video_mode(mode):
+    """Live-switch between jpeg_udp and h264_udp — called from
+    flask_app.py's /set_video_mode, itself reached via gcs.py's VIDEO
+    button over the UDP command channel. A real operational need: H.264
+    depends on reference frames, so packet loss over a degraded link can
+    corrupt everything until the next keyframe; jpeg_udp sends independent
+    per-frame JPEGs, where a lost packet only ever costs that one frame.
+    Returns True/False so the Flask route can report success."""
+    global _current_video_mode
+    if mode not in ("jpeg_udp", "h264_udp"):
+        print(f"[VIDEO] Ignoring unsupported mode for live switch: {mode!r}")
+        return False
+    if _current_video_mode is None:
+        print(f"[VIDEO] Not currently in a switchable mode (video_mode="
+              f"{_VIDEO_MODE!r} at startup) — ignoring switch request")
+        return False
+    if mode == _current_video_mode:
+        return True
+    print(f"[VIDEO] Switching {_current_video_mode} -> {mode}")
+    _stop_video_stream()
+    (_start_jpeg_udp if mode == "jpeg_udp" else _start_h264_udp)()
+    _current_video_mode = mode
+    return True
 
 if _VIDEO_MODE == "webrtc":
     _webrtc_kbps = _cfg["network"].get("webrtc_bitrate_kbps", 0)
@@ -827,88 +1026,12 @@ if _VIDEO_MODE == "webrtc":
     webrtc_thread.start()
 
 elif _VIDEO_MODE == "jpeg_udp":
-    _UDP_PORT     = _cfg["network"].get("gcs_udp_port", 5600)
-    _JPEG_QUALITY = _cfg["network"].get("gcs_jpeg_quality", 40)
-    _STREAM_WIDTH = _cfg["network"].get("gcs_stream_width", 480)
-    # Encode+send rate to the GCS is independent of capture/tracking fps — the
-    # operator's video view doesn't need every frame, but the tracker/MAVLink
-    # loop does. Throttling this is the cheapest way to cut CPU without
-    # slowing down tracking. 0 = uncapped (encode every published frame).
-    _STREAM_FPS   = _cfg["network"].get("gcs_stream_fps", 15)
-    _STREAM_INTERVAL = (1.0 / _STREAM_FPS) if _STREAM_FPS > 0 else 0.0
-
-    _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-    _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)
-
-    _JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
-    _UDP_MAX     = 65400
-
-    def _udp_stream_worker():
-        last_gen      = -1
-        _t0           = time.time()
-        _sent         = 0
-        _last_send_ts = 0.0
-        print(f"[UDP]  stream worker ready — waiting for GCS to announce "
-              f"(cap {_STREAM_FPS if _STREAM_FPS > 0 else 'uncapped'} fps)")
-        while True:
-            frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
-            if frame is None:
-                continue
-            last_gen = gen
-
-            if GCS_IP is None:
-                continue
-
-            _now_gate = time.time()
-            if _STREAM_INTERVAL > 0 and (_now_gate - _last_send_ts) < _STREAM_INTERVAL:
-                continue   # skip encode+send for this frame — capture/tracking keep running at full fps
-            _last_send_ts = _now_gate
-
-            _sent += 1
-            _now = time.time()
-            if _now - _t0 >= 5.0:
-                print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)  → {GCS_IP}")
-                _t0, _sent = _now, 0
-
-            h_f, w_f = frame.shape[:2]
-            if w_f > _STREAM_WIDTH:
-                scale = _STREAM_WIDTH / w_f
-                frame = cv2.resize(frame, (_STREAM_WIDTH, int(h_f * scale)), interpolation=cv2.INTER_LINEAR)
-
-            ok, buf = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
-            if not ok:
-                continue
-            # 4-byte big-endian frame_gen header + JPEG bytes. GCS must strip
-            # the first 4 bytes before decoding, and echo that value back as
-            # frame_gen on /select_point so the Pi can init tracking against
-            # the frame the operator actually clicked on (see
-            # STABILIZATION.md — "the stale-click problem").
-            data = struct.pack('>I', gen & 0xFFFFFFFF) + buf.tobytes()
-            if len(data) > _UDP_MAX:
-                continue
-            try:
-                _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))
-            except Exception as e:
-                print(f"[UDP]  send error: {e}")
-
-    Thread(target=_udp_stream_worker, daemon=True).start()
+    _start_jpeg_udp()
+    _current_video_mode = "jpeg_udp"
 
 elif _VIDEO_MODE == "h264_udp":
-    import h264_udp_server
-    _h264_port = _cfg["network"].get("gcs_udp_port", 5600)
-    _h264_kbps = _cfg["network"].get("h264_bitrate_kbps", 2000)
-    h264_udp_server.start(
-        frame_buffer,
-        gcs_ip_getter = lambda: GCS_IP,
-        port          = _h264_port,
-        stream_width  = _cfg["network"].get("gcs_stream_width", 480),
-        stream_fps    = _cfg["network"].get("gcs_stream_fps", 15),
-        bitrate_kbps  = _h264_kbps,
-        gop_seconds   = _cfg["network"].get("h264_gop_seconds", 0.5),
-        rtp_payload   = _cfg["network"].get("h264_rtp_payload", 1200),
-    )
-    print(f"[H264]  udp://<gcs>:{_h264_port}  bitrate={_h264_kbps}kbps  "
-          f"(hardware encoder used if available, software fallback otherwise)")
+    _start_h264_udp()
+    _current_video_mode = "h264_udp"
 
 else:
     print(f"[WARN] Unknown video_mode '{_VIDEO_MODE}' in config.toml — no video stream started")
@@ -941,7 +1064,7 @@ def _udp_cmd_listener():
             ep  = msg.pop("endpoint", None)
             if ep:   # "hello" heartbeats have no endpoint — skip the Flask call
                 print(f"[CMD]  ← {addr[0]}  {ep}  {msg}")
-                _req.post(f"http://127.0.0.1:5000/{ep}", data=msg, timeout=1)
+                _req.post(f"http://127.0.0.1:{_FLASK_PORT}/{ep}", data=msg, timeout=1)
         except Exception as e:
             if "timed out" not in str(e).lower():
                 print(f"[CMD]  {e}")
@@ -1316,10 +1439,7 @@ while True:
         if key == ord('r') and _playback_ended:
             _restart_playback()                      # replay current file from start
         elif key == ord('o'):
-            new_path = filedialog.askopenfilename(
-                title="Select video file",
-                filetypes=[("Video files", "*.avi *.mp4 *.mov *.mkv"), ("All files", "*.*")]
-            )
+            new_path = _choose_video_file()
             if new_path:
                 _restart_playback(new_path)          # switch to new file
         elif key == ord('f'):

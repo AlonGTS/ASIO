@@ -33,6 +33,7 @@ current mouse position, same as releasing a mouse-drag.
 """
 
 import argparse
+import math
 import os
 import socket
 import struct
@@ -83,6 +84,10 @@ parser = argparse.ArgumentParser(description="Mahat GCS client")
 parser.add_argument("--pi",   default=None,  help="Pi IP (overrides config.toml)")
 parser.add_argument("--port", type=int, default=5000, help="Flask API port  (default 5000)")
 parser.add_argument("--udp",  type=int, default=5600, help="UDP video port  (default 5600)")
+parser.add_argument("--file", default=None,
+                     help="Play a local video file instead of connecting to a Pi "
+                          "(offline testing — e.g. one of the gcs_rec_*.mp4 recordings). "
+                          "Loops when it reaches the end. All Pi commands become no-ops.")
 args = parser.parse_args()
 
 PI_IP    = args.pi or _load_toml() or "192.168.1.100"
@@ -117,7 +122,7 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 694     # minimum canvas height so all buttons fit
+PANEL_MIN_H = 826     # minimum canvas height so all buttons fit
 DISPLAY_W   = 1200    # video is always stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -172,6 +177,8 @@ def set_status(msg, *, log=True):
 def send_cmd(cmd):
     _post("command", cmd=cmd)
     set_status({"r": "Reset", "s": "Stop", "q": "Quit"}.get(cmd, cmd))
+    if cmd == 'r':
+        _vt_clear()   # no active target anymore
 
 def quit_gcs():
     """Close the GCS window and tell the Pi to quit."""
@@ -258,6 +265,7 @@ def select_point(x, y):
     extra = {"frame_gen": _frame_gen} if _frame_gen is not None else {}
     _post("select_point", nx=nx, ny=ny, **extra)
     set_status(f"Selected ({x}, {y})")
+    _vt_reset(x, y)
 
 def lock_target(x, y):
     """Commit (x, y) — the current mouse position — as the tracking target.
@@ -266,6 +274,431 @@ def lock_target(x, y):
     global _pi_tracking
     select_point(x, y)
     _pi_tracking = True   # optimistic — confirmed/corrected by the next /status poll
+
+# ── Feature tracking — detect, track, and expose their shared motion ───────
+#
+# Detects a set of "good" corners (goodFeaturesToTrack), tracks them frame-
+# to-frame via optical flow, and re-seeds a fresh set whenever too few
+# survive. Dots stay glued to the same physical features as the camera pans
+# — the FEATURES toggle draws them so that can be visually confirmed.
+#
+# Also the single source of "how did the background move this frame" for
+# virtual-target propagation (see _vt_update below): every frame, alongside
+# tracking, it computes the median x/y displacement of whichever points
+# survived (robust to the odd bad point without needing a full RANSAC/affine
+# fit — points already excluded from contaminated zones before this, so a
+# plain median of what's left is enough). One shared computation for both
+# consumers instead of a second, separate optical-flow pass — tracking runs
+# whenever either consumer needs it, independent of whether the dots
+# themselves are being drawn.
+
+_feat_enabled     = False
+_feat_points      = None   # Nx1x2 float32 tracked points, or None
+_feat_prev_gray   = None
+_feat_last_delta  = None   # (median_dx, median_dy) this frame's background translation, or None
+_feat_last_scale  = None   # this frame's background scale factor (>1 = zoomed in), or None
+_feat_last_angle  = None   # this frame's background rotation, degrees (+ = counterclockwise), or None
+_feat_last_ts     = 0.0    # wall-clock time of the last processed frame, for gap detection
+_FEAT_MIN         = 40     # re-seed a fresh set once fewer survivors than this
+_FEAT_MAX         = 200
+_FEAT_MIN_DELTA     = 8    # need at least this many surviving points to trust their median motion
+_FEAT_MIN_BASELINE_PX = 20 # ignore a point-pair this close together when estimating scale/angle —
+                            # a small denominator turns ordinary tracking noise into a wild ratio
+_FEAT_SCALE_CLAMP   = (0.85, 1.15)   # reject a single frame implying more than +/-15% zoom —
+                                      # generous for a genuine fast approach, tight enough to
+                                      # catch estimation noise (a bad scale/angle reading here
+                                      # happens on every approach/retreat or camera roll, not
+                                      # occasionally, so it matters more than it would elsewhere)
+_FEAT_ANGLE_CLAMP   = 3.0  # reject a single frame implying more than +/-3deg of rotation (degrees)
+_FEAT_GAP_RESET_S = 1.0    # don't compute a delta across a long interruption — resync instead
+
+# OpenCV's calcOpticalFlowPyrLK defaults (21x21 window, 3 pyramid levels) only
+# reliably track small frame-to-frame motion — too little for a fast whip-pan
+# (observed live: the virtual target "misses" a fast out-of-frame move).
+# Widening the window/pyramid alone isn't enough on its own, though — past a
+# point it just makes points converge to the wrong (but similar-looking)
+# nearby match while still reporting "success" (see _LK_MAX_ERR below for how
+# that's caught). Widened anyway since it measurably extends the range where
+# a *correct* match is even reachable in the first place.
+_LK_PARAMS = dict(winSize=(41, 41), maxLevel=4,
+                   criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+_LK_MAX_ERR = 10   # reject a "successful" point whose LK match residual is still this high —
+                   # see _feat_update() for the measurement behind this number
+
+def toggle_features():
+    global _feat_enabled, _feat_points, _feat_prev_gray
+    _feat_enabled = not _feat_enabled
+    _feat_points = None
+    _feat_prev_gray = None
+    set_status(f"Feature tracking: {'ON' if _feat_enabled else 'OFF'}")
+
+_BOX_COLORS_BGR = [(0, 200, 0), (0, 140, 255), (0, 0, 255)]   # tracker-so.py's good/uncertain/unstable box colors
+_BOX_COLOR_TOL  = 40    # per-channel tolerance for JPEG/H264 compression blur around the exact color
+
+def _box_color_mask(frame_bgr):
+    """Raw (undilated) mask of pixels matching one of the Pi's tracking-box
+    colors — the box border plus its small center crosshair, both drawn in
+    the same color. Used by the exclusion mask below to keep the box's own
+    pixels out of the background feature tracking it moves independently of."""
+    box_hit = np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
+    for b, g, r in _BOX_COLORS_BGR:
+        lo = (max(0, b - _BOX_COLOR_TOL), max(0, g - _BOX_COLOR_TOL), max(0, r - _BOX_COLOR_TOL))
+        hi = (min(255, b + _BOX_COLOR_TOL), min(255, g + _BOX_COLOR_TOL), min(255, r + _BOX_COLOR_TOL))
+        box_hit |= cv2.inRange(frame_bgr, lo, hi)
+    return box_hit
+
+def _text_zone_mask(shape):
+    """255 everywhere except the Pi's baked-in status text zones (top
+    status/timestamp block — including the red "Launched" line, which
+    otherwise color-matches the box's own "unstable" red — and the
+    bottom-left LAUNCHED badge). Screen-locked, so a fixed position works."""
+    h, w = shape
+    mask = np.full((h, w), 255, dtype=np.uint8)
+    mask[:int(0.22 * h), :] = 0                 # top status/timestamp/"Launched" block
+    mask[int(0.92 * h):, :int(0.15 * w)] = 0    # bottom-left "LAUNCHED" badge
+    return mask
+
+def _feat_exclude_mask(frame_bgr):
+    """Combined exclusion mask: the Pi's baked-in status text zones, plus
+    any pixel close to one of its tracking-box colors (including the small
+    center crosshair). The box tracks the TARGET, not the background, and
+    moves — so unlike the text it can't be excluded by a fixed screen
+    position, only by its distinctive color."""
+    mask = _text_zone_mask(frame_bgr.shape[:2])
+    box_hit = _box_color_mask(frame_bgr)
+    if box_hit.any():
+        box_hit = cv2.dilate(box_hit, np.ones((9, 9), np.uint8))   # cover the anti-aliased/compressed halo
+        mask[box_hit > 0] = 0
+    return mask
+
+def _feat_update(frame, is_new_frame):
+    """Track existing points forward one frame, dropping any optical flow
+    lost or that drifted into an excluded zone (baked-in text, or the Pi's
+    tracking-box color); re-seed a fresh set if too few survive. Also
+    updates _feat_last_delta/_feat_last_scale/_feat_last_angle — this
+    frame's background motion, for _vt_update() to consume. `frame` must be
+    raw (pre-stabilization-warp) coordinates. Runs whenever the FEATURES
+    diagnostic is on OR a virtual target is selected — either one needs
+    this same tracking."""
+    global _feat_points, _feat_prev_gray, _feat_last_delta, _feat_last_scale, _feat_last_angle, _feat_last_ts
+    if not (_feat_enabled or _virtual_target is not None) or not is_new_frame:
+        return
+
+    now = time.time()
+    if _feat_last_ts and (now - _feat_last_ts) > _FEAT_GAP_RESET_S:
+        _feat_prev_gray = None   # long interruption — resync instead of comparing across the gap
+    _feat_last_ts = now
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    mask = _feat_exclude_mask(frame)
+
+    _feat_last_delta = None
+    _feat_last_scale = None
+    _feat_last_angle = None
+    if (_feat_prev_gray is not None and _feat_points is not None
+            and len(_feat_points) > 0 and _feat_prev_gray.shape == gray.shape):
+        old_pts = _feat_points
+        new_pts, status, err = cv2.calcOpticalFlowPyrLK(_feat_prev_gray, gray, old_pts, None, **_LK_PARAMS)
+        status = status.reshape(-1).astype(bool)
+        # status alone means "converged to *something*", not "converged to the
+        # right thing" — on a fast pan, points can lock onto the wrong match
+        # (aliasing against similar-looking nearby texture) while still
+        # reporting success. Measured on a real frame: at a 150px synthetic
+        # jump, ~90% of "successful" points had actually converged to the
+        # wrong spot, silently corrupting the median with garbage. err (LK's
+        # own match residual) reliably separates the two — err<10 gave the
+        # exact correct median through 150px, and safely fell below
+        # _FEAT_MIN_DELTA (skip the frame) beyond that, rather than
+        # confidently returning a wrong answer.
+        good = status & (err.reshape(-1) < _LK_MAX_ERR)
+        old_pts, new_pts = old_pts[good], new_pts[good]
+        if len(new_pts) > 0:
+            pts2 = new_pts.reshape(-1, 2)
+            xi = np.clip(pts2[:, 0].astype(int), 0, w - 1)
+            yi = np.clip(pts2[:, 1].astype(int), 0, h - 1)
+            keep = mask[yi, xi] > 0
+            old_pts, new_pts = old_pts[keep], new_pts[keep]
+        if len(new_pts) >= _FEAT_MIN_DELTA:
+            old_xy = old_pts.reshape(-1, 2)
+            new_xy = new_pts.reshape(-1, 2)
+            # Scale and rotation, estimated the same "smart average" way,
+            # from the SAME point pairs: how did each pair's connecting
+            # vector change, new frame vs old. Both are pivot-independent —
+            # neither needs a "center" chosen up front — which is exactly
+            # why this avoids the old rotation-amplification bug: that one
+            # came from a single noisy RANSAC-fit angle applied via a matrix
+            # pivoted at the frame's (0,0) corner, not from rotation itself
+            # being inherently unsafe. A robust median over every pair, each
+            # measured relative to the OTHER tracked points rather than an
+            # arbitrary corner, doesn't have that failure mode — verified via
+            # a real recorded session where an uncompensated real camera
+            # rotation was steadily walking the marker away from a
+            # confirmed-fixed target even while fully tracked (translation-
+            # and-scale-only couldn't represent it; this can).
+            #   scale_ij = dist(new_i,new_j) / dist(old_i,old_j)
+            #   angle_ij = angle(new_j-new_i) - angle(old_j-old_i)
+            # Both clamped hard per frame — scale because it matters on
+            # every approach/retreat, not occasionally, so an unclamped bad
+            # reading would be a frequent problem; angle because that's
+            # exactly the failure mode being reintroduced here, just via a
+            # more robust estimator this time, not an excuse to skip the
+            # safety margin entirely.
+            n = len(old_xy)
+            iu = np.triu_indices(n, k=1)
+            vec_old = old_xy[iu[1]] - old_xy[iu[0]]
+            vec_new = new_xy[iu[1]] - new_xy[iu[0]]
+            d_old = np.linalg.norm(vec_old, axis=1)
+            d_new = np.linalg.norm(vec_new, axis=1)
+            valid = d_old > _FEAT_MIN_BASELINE_PX   # a near-coincident pair's ratio/angle is pure noise
+            enough = valid.sum() >= _FEAT_MIN_DELTA
+
+            scale = float(np.median(d_new[valid] / d_old[valid])) if enough else 1.0
+            scale = max(_FEAT_SCALE_CLAMP[0], min(_FEAT_SCALE_CLAMP[1], scale))
+
+            if enough:
+                ang_old = np.degrees(np.arctan2(vec_old[valid, 1], vec_old[valid, 0]))
+                ang_new = np.degrees(np.arctan2(vec_new[valid, 1], vec_new[valid, 0]))
+                dangle = float(np.median(_wrap_deg(ang_new - ang_old)))
+            else:
+                dangle = 0.0
+            dangle = max(-_FEAT_ANGLE_CLAMP, min(_FEAT_ANGLE_CLAMP, dangle))
+
+            a = np.radians(dangle)
+            c, s = np.cos(a), np.sin(a)
+            R = scale * np.array([[c, -s], [s, c]])   # 2x2 similarity (scale + rotation) linear part
+
+            translation = new_xy - old_xy @ R.T
+            _feat_last_delta = (float(np.median(translation[:, 0])), float(np.median(translation[:, 1])))
+            _feat_last_scale = scale
+            _feat_last_angle = dangle
+        _feat_points = new_pts
+    else:
+        _feat_points = None
+
+    if _feat_points is None or len(_feat_points) < _FEAT_MIN:
+        detected = cv2.goodFeaturesToTrack(gray, maxCorners=_FEAT_MAX, qualityLevel=0.01,
+                                            minDistance=8, blockSize=7, mask=mask)
+        _feat_points = detected if detected is not None else np.empty((0, 1, 2), dtype=np.float32)
+
+    _feat_prev_gray = gray
+
+def draw_feature_points(frame):
+    if not _feat_enabled or _feat_points is None:
+        return
+    for p in _feat_points.reshape(-1, 2):
+        cv2.circle(frame, (int(p[0]), int(p[1])), 3, (0, 255, 0), -1, cv2.LINE_AA)
+
+# ── Shared global-motion estimator ─────────────────────────────────────────
+#
+# One background-motion estimate, reused by stabilization (and, later,
+# anything like virtual-target propagation) instead of duplicating the same
+# optical-flow work. Detects fresh features each call (stateless — no
+# persistent point identity to manage), tracks them, and fits a similarity
+# transform via RANSAC. Returns only rotation+translation: scale is fit
+# internally by estimateAffinePartial2D but deliberately discarded here and
+# never returned, since accumulating a fitted scale over many frames is what
+# caused runaway shrinkage in an earlier version of this code — the caller
+# gets no way to (accidentally) accumulate it.
+
+_GM_MIN_FEATURES = 12
+
+def _estimate_global_motion(prev_gray, gray, mask=None):
+    """Return (dx, dy, dangle_deg, n_features, n_inliers), or None if too
+    few reliable points to trust the estimate."""
+    pts_prev = cv2.goodFeaturesToTrack(prev_gray, maxCorners=300, qualityLevel=0.01,
+                                        minDistance=8, blockSize=7, mask=mask)
+    if pts_prev is None or len(pts_prev) < _GM_MIN_FEATURES:
+        return None
+    n_features = len(pts_prev)
+
+    pts_cur, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts_prev, None)
+    status = status.reshape(-1).astype(bool)
+    good_prev, good_cur = pts_prev[status], pts_cur[status]
+    if len(good_prev) < _GM_MIN_FEATURES:
+        return None
+
+    M, inliers = cv2.estimateAffinePartial2D(good_prev, good_cur, method=cv2.RANSAC)
+    if M is None or inliers is None:
+        return None
+    n_inliers = int(inliers.sum())
+    if n_inliers < _GM_MIN_FEATURES:
+        return None
+    if not np.all(np.isfinite(M)):
+        return None
+
+    dx, dy = float(M[0, 2]), float(M[1, 2])
+    dangle = float(np.degrees(np.arctan2(M[1, 0], M[0, 0])))
+    return dx, dy, dangle, n_features, n_inliers
+
+# ── Affine composition helpers (rotation+translation, scale always 1) ─────
+
+def _compose(M_second, M_first):
+    """2x3 affine composition: apply M_first, then M_second."""
+    A1 = np.vstack([M_first, [0, 0, 1]])
+    A2 = np.vstack([M_second, [0, 0, 1]])
+    return (A2 @ A1)[:2].astype(np.float32)
+
+def _wrap_deg(a):
+    """Wrap a degree value into (-180, 180] — angle is a circular quantity,
+    treating it as a plain linear number breaks at the ±180° discontinuity
+    (this exact bug caused a runaway correction in an earlier version)."""
+    return (a + 180.0) % 360.0 - 180.0
+
+def _decompose_xya(M):
+    """(x, y, angle_deg) from a similarity matrix — self-consistent with
+    _recompose_xya(); ignores/discards any scale in M."""
+    angle = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
+    return float(M[0, 2]), float(M[1, 2]), float(angle)
+
+def _recompose_xya(x, y, angle_deg):
+    """Build a rotation+translation matrix with scale forced to exactly 1."""
+    a = np.radians(angle_deg)
+    c, s = np.cos(a), np.sin(a)
+    return np.float32([[c, -s, x], [s, c, y]])
+
+# ── Virtual target — estimates where the selected point currently is even
+# when it's outside the frame ──────────────────────────────────────────────
+#
+# GCS-only, no Pi telemetry needed. Doesn't try to re-detect the target
+# itself — once it's gone, there's nothing left to match against. Instead:
+# the same feature points FEATURES already tracks are anchored to the
+# background (goodFeaturesToTrack + optical flow, excluded from the Pi's
+# text/tracking-box zones), so however THEY moved this frame is exactly how
+# a background-anchored point should move too. _feat_update() computes that
+# shared median motion once per frame (_feat_last_delta); this just applies
+# it directly to the point — every frame, the same way, whether the target
+# is on-screen or not. No separate estimation pass, no rotation (rotation's
+# error grows with a point's distance from the frame origin and was a
+# measured, real source of drift — see STABILIZATION.md), no special-casing
+# "in view" vs "out of view".
+#
+# The propagated point is allowed to go negative or past the frame edge —
+# that's the whole idea: "250px left of frame" is still a valid, useful
+# estimate, not an error, and lets us know where to look — and re-lock —
+# once the camera swings back.
+#
+# Reset to the freshly clicked point on every select_point() call, so drift
+# only accumulates over however long the point has actually been
+# unconfirmed, not over the whole session.
+
+_vt_enabled     = False   # opt-in — still being tuned; select_point() won't anchor a target,
+                          # and _feat_update()/draw_virtual_target() won't run for it, while off
+_virtual_target = None   # (x, y) in raw-frame px, or None if nothing selected
+_vt_last_log_ts = 0.0     # throttles the [VT] debug print
+_vt_miss_count  = 0       # consecutive frames with no valid delta/scale to propagate by
+_VT_MAX_MISSES  = 5       # clear the target after this many in a row — mirrors the Pi's own
+                          # "Drift — re-select target" recovery: past this point the last known
+                          # position was measured against a scene that (per _FEAT_GAP_RESET_S's
+                          # time-based reset, or a genuine hard content cut a time-based check
+                          # can't catch) may no longer have anything to do with the current one,
+                          # so continuing to show it is actively misleading, not just stale
+
+def toggle_virtual_target():
+    global _vt_enabled
+    _vt_enabled = not _vt_enabled
+    _vt_clear()   # stale/no target either way once the mode changes
+    set_status(f"Virtual target: {'ON' if _vt_enabled else 'OFF'}")
+
+def _vt_reset(x, y):
+    global _virtual_target, _vt_miss_count
+    if not _vt_enabled:
+        return
+    _virtual_target = (float(x), float(y))
+    _vt_miss_count = 0
+
+def _vt_clear():
+    global _virtual_target, _vt_miss_count
+    _virtual_target = None
+    _vt_miss_count = 0
+
+def _vt_update(frame, is_new_frame):
+    """Propagate _virtual_target by this frame's shared background-feature
+    motion (_feat_last_delta/_feat_last_scale/_feat_last_angle, computed in
+    _feat_update() — call that first). `frame` must be raw
+    (pre-stabilization-warp) coordinates — the same space select_point()
+    and _to_raw_coords() use."""
+    global _virtual_target, _vt_last_log_ts, _vt_miss_count
+    if _virtual_target is None or not is_new_frame:
+        return
+    if _feat_last_delta is None or _feat_last_scale is None or _feat_last_angle is None:
+        _vt_miss_count += 1
+        if _vt_miss_count >= _VT_MAX_MISSES:
+            print(f"[VT] lost tracking for {_vt_miss_count} consecutive frames — "
+                  f"clearing (re-select target)")
+            _virtual_target = None
+        return
+    _vt_miss_count = 0
+    dx, dy = _feat_last_delta
+    scale = _feat_last_scale
+    angle = _feat_last_angle
+    a = math.radians(angle)
+    c, s = math.cos(a), math.sin(a)
+    x, y = _virtual_target
+    nx = scale * (c * x - s * y) + dx
+    ny = scale * (s * x + c * y) + dy
+    if not (math.isfinite(nx) and math.isfinite(ny)):
+        return
+    now = time.time()
+    if now - _vt_last_log_ts > 0.5:
+        print(f"[VT] delta=({dx:+5.1f},{dy:+5.1f}) scale={scale:.3f} angle={angle:+5.2f}  "
+              f"point ({x:7.1f},{y:7.1f}) -> ({nx:7.1f},{ny:7.1f})")
+        _vt_last_log_ts = now
+    _virtual_target = (nx, ny)
+
+def _vt_to_display(x, y):
+    """Raw-frame point -> current display-frame point — applies the full
+    stabilization transform forward (the inverse of _to_raw_coords())."""
+    if _stab_M is None:
+        return x, y
+    return (_stab_M[0, 0] * x + _stab_M[0, 1] * y + _stab_M[0, 2],
+            _stab_M[1, 0] * x + _stab_M[1, 1] * y + _stab_M[1, 2])
+
+def draw_virtual_target(frame):
+    """Marker at the virtual target if it's on-screen; otherwise an arrow at
+    the frame edge pointing toward it, with its off-screen distance."""
+    if _virtual_target is None:
+        return
+    h, w = frame.shape[:2]
+    dx, dy = _vt_to_display(*_virtual_target)
+    if not (math.isfinite(dx) and math.isfinite(dy)):
+        return
+    color = (0, 220, 220)
+
+    if 0 <= dx < w and 0 <= dy < h:
+        p = (int(dx), int(dy))
+        cv2.drawMarker(frame, p, color, cv2.MARKER_CROSS, 22, 2, cv2.LINE_AA)
+        cv2.circle(frame, p, 14, color, 2, cv2.LINE_AA)
+        return
+
+    margin = 30
+    cx, cy = w / 2.0, h / 2.0
+    vx, vy = dx - cx, dy - cy
+    if vx == 0 and vy == 0:
+        return
+    t_candidates = []
+    if vx > 0: t_candidates.append((w - margin - cx) / vx)
+    elif vx < 0: t_candidates.append((margin - cx) / vx)
+    if vy > 0: t_candidates.append((h - margin - cy) / vy)
+    elif vy < 0: t_candidates.append((margin - cy) / vy)
+    t = min(t for t in t_candidates if t > 0)
+    ex, ey = cx + vx * t, cy + vy * t
+    angle = math.atan2(vy, vx)
+
+    size = 15
+    tip   = (ex + size * math.cos(angle),        ey + size * math.sin(angle))
+    base1 = (ex - size * math.cos(angle - 0.5),  ey - size * math.sin(angle - 0.5))
+    base2 = (ex - size * math.cos(angle + 0.5),  ey - size * math.sin(angle + 0.5))
+    pts = np.array([tip, base1, base2], dtype=np.int32)
+    cv2.fillConvexPoly(frame, pts, color, cv2.LINE_AA)
+    cv2.polylines(frame, [pts], True, (0, 0, 0), 1, cv2.LINE_AA)
+
+    dist_px = math.hypot(dx - cx, dy - cy)
+    label = f"{dist_px:.0f}px"
+    (tw, th), _ = cv2.getTextSize(label, _FONT, 0.45, 1)
+    lx, ly = int(ex - tw / 2), int(ey + (th + 20 if math.sin(angle) < 0 else -14))
+    cv2.putText(frame, label, (lx, ly), _FONT, 0.45, (0, 0, 0),   3, cv2.LINE_AA)
+    cv2.putText(frame, label, (lx, ly), _FONT, 0.45, color,       1, cv2.LINE_AA)
 
 def toggle_local_record(frame_w=640, frame_h=480):
     global _local_recording, _local_writer
@@ -314,42 +747,98 @@ def cycle_lores(delta):
     _post("cycle_lores", delta=delta)
     set_status(f"TRACK {'up' if delta > 0 else 'down'}")
 
-# ── Whole-frame stabilization ──────────────────────────────────────────────────
+# ── Video transport switch (jpeg_udp <-> h264_udp, live) ───────────────────────
 #
-# Cancels camera shake/vibration so the whole displayed picture holds still.
-# Estimates the frame-to-frame global shift (phase correlation on a
-# downsampled frame — cheap), accumulates it into a raw trajectory, low-pass
-# filters that trajectory to get the "intended" slow motion, and shifts each
-# frame by the difference (raw - smoothed) so fast jitter cancels out while
-# genuine panning still comes through. Translation only (no rotation) — a
-# rotation-aware version was tried and reverted after repeated real-world
-# failures (runaway drift, scale creep); this simpler version is reliable.
+# cap/_gcs_video_mode are module-level (not local to main()) so this can
+# reassign the active capture object from a button click mid-session. The
+# capture classes (_LiveCapture/_H264LiveCapture) are defined later in this
+# file — fine, since this function's body isn't evaluated until it's
+# actually called, well after the whole module has loaded.
+
+cap = None               # current capture object — set by main(), swapped by toggle_video_mode()
+_gcs_video_mode = None   # "jpeg_udp" or "h264_udp", whichever `cap` currently is; None in --file
+                          # mode, or if starting mode is "webrtc" (not switchable — see tracker-so.py)
+
+def toggle_video_mode():
+    """Live-switch the video transport (jpeg_udp <-> h264_udp) without
+    restarting either side. Tells the Pi to make the same switch, then
+    rebuilds the local capture object on the same UDP port. A few seconds
+    of no video during the swap is expected on both ends — this exists for
+    exactly the case where the current transport (typically h264_udp) is
+    struggling under poor comms and dropping to the simpler, loss-tolerant
+    jpeg_udp (independent per-frame JPEGs — one lost packet loses one
+    frame, not everything until the next keyframe) is worth a brief gap."""
+    global cap, _gcs_video_mode
+    if _gcs_video_mode is None:
+        set_status("Video mode switch not available in this mode")
+        return
+    new_mode = "jpeg_udp" if _gcs_video_mode == "h264_udp" else "h264_udp"
+    set_status(f"Switching video -> {new_mode}…")
+    _post("set_video_mode", mode=new_mode)
+    cap.close()
+    cap = _H264LiveCapture(UDP_PORT) if new_mode == "h264_udp" else _LiveCapture(UDP_PORT)
+    _gcs_video_mode = new_mode
+
+# ── Whole-frame stabilization (feature-based) ──────────────────────────────────
+#
+# Cancels camera shake/vibration — including rotation, not just translation —
+# so the whole displayed picture holds still. Uses _estimate_global_motion()
+# (features + optical flow + RANSAC, same foundation as the FEATURES
+# diagnostic, with the same text/tracking-box exclusion mask) instead of the
+# old phaseCorrelate approach, so a genuine tilt/rotation event gets tracked
+# properly instead of only being approximated as a shift.
+#
+# Maintains a cumulative RAW trajectory (x, y, angle) — scale is never part
+# of it; each per-frame increment is rebuilt via _recompose_xya() with scale
+# forced to 1 before being composed in, so nothing can accumulate scale
+# drift the way an earlier version of this code did. The trajectory is
+# low-pass filtered (_STAB_SLOW_ALPHA) to separate "intended" slow motion
+# from fast jitter — the angle component of that filter update wraps
+# through _wrap_deg() at every step, fixing the ±180° discontinuity bug
+# that caused a runaway correction in that earlier version.
 #
 # select_point() must be called with RAW-frame coordinates (matching what the
-# Pi's own live frame looks like), so _to_raw_coords() undoes this shift on
-# whatever pixel was clicked in the now-stabilized display.
+# Pi's own live frame looks like), so _to_raw_coords() undoes the full
+# stabilization transform (not just an x/y shift) on whatever was clicked.
 
-_STAB_DOWNSCALE  = 4     # phase correlation runs at 1/this resolution, for speed
 _STAB_ALPHA_MIN  = 0.01
 _STAB_ALPHA_MAX  = 0.50
 _STAB_ALPHA_STEP = 0.01
 
 _stab_enabled    = True
 _STAB_SLOW_ALPHA = 0.05  # how fast the "intended" trajectory adapts (lower = more shake removed)
-_STAB_MAX_SHIFT  = 75    # clamp (px) so one bad correlation can't wildly warp the frame
+_STAB_MAX_SHIFT  = 75    # clamp (px) — reject a per-frame estimate implying a bigger jump than this
+_STAB_MAX_ANGLE  = 6.0   # clamp (degrees) — same, for rotation
+_STAB_GAP_RESET_S = 1.0  # if this long since the last successful update, don't estimate motion
+                          # across the gap — treat the next frame as a fresh reference instead
 
-_stab_prev_gray  = None
-_stab_hann       = None
-_stab_traj       = np.array([0.0, 0.0])   # cumulative raw (unfiltered) trajectory
-_stab_smooth     = np.array([0.0, 0.0])   # low-pass filtered trajectory
-_stab_correction = (0.0, 0.0)             # (cx, cy) applied to the currently displayed frame
+# Adaptive smoothing: a single fixed alpha can't be both "strong for tiny
+# jitter" and "quick to catch up on a genuine big pan" — a low alpha strong
+# enough to remove shake also makes the smoothed trajectory lag far behind
+# during a real fast pan, so the correction (raw - smoothed) grows large and
+# warps a big strip of BORDER_REPLICATE padding into view. Instead, blend
+# toward a faster alpha as the per-frame motion itself gets larger — small
+# jitter still gets the full _STAB_SLOW_ALPHA smoothing, but a big frame-to-
+# frame jump (a real pan/tilt, not shake) lets the trajectory adapt quickly
+# so the correction — and the border it reveals — stays small.
+_STAB_FAST_ALPHA     = 0.45   # ceiling for how responsive it gets during a big move
+_STAB_BIG_MOVE_PX    = 18     # per-frame translation magnitude that's fully "big move"
+_STAB_BIG_MOVE_ANGLE = 2.5    # per-frame rotation magnitude (degrees) that's fully "big move"
+
+_stab_prev_gray   = None
+_stab_last_ts     = 0.0   # wall-clock time of the last processed new frame, for gap detection
+_stab_cum         = np.float32([[1, 0, 0], [0, 1, 0]])   # cumulative raw transform: reference -> now
+_stab_smooth_xya  = np.array([0.0, 0.0, 0.0])             # low-pass filtered [x, y, angle_deg]
+_stab_M           = None   # the actual transform last applied to the displayed frame — for inversion
+_stab_last_log_ts = 0.0    # throttles the [STAB] debug print
 
 def _reset_stabilizer():
-    global _stab_prev_gray, _stab_traj, _stab_smooth, _stab_correction
+    global _stab_prev_gray, _stab_last_ts, _stab_cum, _stab_smooth_xya, _stab_M
     _stab_prev_gray  = None
-    _stab_traj       = np.array([0.0, 0.0])
-    _stab_smooth     = np.array([0.0, 0.0])
-    _stab_correction = (0.0, 0.0)
+    _stab_last_ts    = 0.0
+    _stab_cum        = np.float32([[1, 0, 0], [0, 1, 0]])
+    _stab_smooth_xya = np.array([0.0, 0.0, 0.0])
+    _stab_M          = None
 
 def toggle_stabilization():
     global _stab_enabled
@@ -440,39 +929,91 @@ def draw_zoom_loupe(frame, mx, my, crop, x0, y0):
 
 def _stabilize(frame, is_new_frame):
     """Warp `frame` by the current shake-cancelling correction, recomputing
-    that correction only when a genuinely new frame has arrived."""
-    global _stab_prev_gray, _stab_hann, _stab_traj, _stab_smooth, _stab_correction
+    that correction only when a genuinely new frame has arrived. `frame`
+    must be raw (undistorted by any previous warp) — this is always called
+    before any stabilization warp is applied, and the reference frame it
+    keeps for the next comparison is taken from this same raw input, never
+    from the warped output."""
+    global _stab_prev_gray, _stab_last_ts, _stab_cum, _stab_smooth_xya, _stab_M, _stab_last_log_ts
     h, w = frame.shape[:2]
 
     if is_new_frame:
-        sw, sh = max(1, w // _STAB_DOWNSCALE), max(1, h // _STAB_DOWNSCALE)
-        small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
-        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        now = time.time()
+        if _stab_last_ts and (now - _stab_last_ts) > _STAB_GAP_RESET_S:
+            # Long interruption (e.g. dropped/late frames) — don't estimate
+            # motion across that gap, just resync on the next frame.
+            _stab_prev_gray = None
+        _stab_last_ts = now
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        n_feat = n_inliers = 0
+        dx = dy = dangle = 0.0
 
         if _stab_prev_gray is not None and _stab_prev_gray.shape == gray.shape:
-            if _stab_hann is None or _stab_hann.shape != (sh, sw):
-                _stab_hann = cv2.createHanningWindow((sw, sh), cv2.CV_32F)
-            (dx, dy), resp = cv2.phaseCorrelate(_stab_prev_gray, gray, _stab_hann)
-            if resp > 0.05:   # low confidence (e.g. near-blank frame) → skip this sample
-                dx = max(-_STAB_MAX_SHIFT, min(_STAB_MAX_SHIFT, dx * _STAB_DOWNSCALE))
-                dy = max(-_STAB_MAX_SHIFT, min(_STAB_MAX_SHIFT, dy * _STAB_DOWNSCALE))
-                _stab_traj += (dx, dy)
+            mask = _feat_exclude_mask(frame)   # skip Pi status text + tracking-box pixels
+            result = _estimate_global_motion(_stab_prev_gray, gray, mask=mask)
+            if result is not None:
+                dx, dy, dangle, n_feat, n_inliers = result
+                if abs(dx) <= _STAB_MAX_SHIFT and abs(dy) <= _STAB_MAX_SHIFT and abs(dangle) <= _STAB_MAX_ANGLE:
+                    M_frame = _recompose_xya(dx, dy, dangle)   # scale forced to 1, never accumulated
+                    _stab_cum = _compose(M_frame, _stab_cum)
+                # else: unreliable-looking jump — keep the previous _stab_cum unchanged
 
         _stab_prev_gray = gray
-        _stab_smooth += _STAB_SLOW_ALPHA * (_stab_traj - _stab_smooth)
-        corr = np.clip(_stab_smooth - _stab_traj, -_STAB_MAX_SHIFT, _STAB_MAX_SHIFT)
-        _stab_correction = (float(corr[0]), float(corr[1]))
 
-    cx, cy = _stab_correction
-    M = np.float32([[1, 0, cx], [0, 1, cy]])
-    return cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        # Blend toward a faster alpha when THIS frame's own motion looks like
+        # a real pan/tilt rather than shake — keeps small jitter smoothed as
+        # strongly as configured, while a genuine big move gets caught up to
+        # quickly instead of dragging a large, slowly-shrinking correction
+        # (and the border padding it reveals) behind it.
+        move_frac = max(min(1.0, math.hypot(dx, dy) / _STAB_BIG_MOVE_PX),
+                         min(1.0, abs(dangle) / _STAB_BIG_MOVE_ANGLE))
+        alpha = _STAB_SLOW_ALPHA + (_STAB_FAST_ALPHA - _STAB_SLOW_ALPHA) * move_frac
+
+        x, y, a = _decompose_xya(_stab_cum)
+        diff = np.array([x, y, a]) - _stab_smooth_xya
+        diff[2] = _wrap_deg(diff[2])   # angle is circular — a raw difference can spike near ±180°
+        _stab_smooth_xya += alpha * diff
+        _stab_smooth_xya[2] = _wrap_deg(_stab_smooth_xya[2])
+        M_smooth_cum = _recompose_xya(*_stab_smooth_xya)
+        # Where the smoothed/intended path would be, minus where the shaky raw
+        # path actually is → the correction to apply to the current raw frame.
+        M_candidate = _compose(M_smooth_cum, cv2.invertAffineTransform(_stab_cum))
+
+        # Safety net: a correctly-behaving correction should never need to be
+        # huge. If it is, something upstream went wrong — reset rather than
+        # apply a runaway warp that could blank/distort the display.
+        ccx, ccy, cca = _decompose_xya(M_candidate)
+        if abs(ccx) > 4 * _STAB_MAX_SHIFT or abs(ccy) > 4 * _STAB_MAX_SHIFT or abs(cca) > 4 * _STAB_MAX_ANGLE:
+            _reset_stabilizer()
+            M_candidate = np.float32([[1, 0, 0], [0, 1, 0]])
+            ccx = ccy = cca = 0.0
+
+        _stab_M = M_candidate
+
+        now2 = time.time()
+        if now2 - _stab_last_log_ts > 0.5:
+            print(f"[STAB] feat={n_feat:3d} inliers={n_inliers:3d} alpha={alpha:.2f}  "
+                  f"dx={dx:+6.1f} dy={dy:+6.1f} dangle={dangle:+5.2f}  "
+                  f"-> correction=({ccx:+6.1f},{ccy:+6.1f},{cca:+5.2f}°)")
+            _stab_last_log_ts = now2
+
+    if _stab_M is None:
+        return frame
+    return cv2.warpAffine(frame, _stab_M, (w, h), borderMode=cv2.BORDER_REPLICATE)
 
 def _to_raw_coords(px, py):
-    """Undo the current stabilization shift — use before select_point()/lock_target()
-    so the Pi (which sees its own unwarped live frame) gets the right pixel."""
-    cx, cy = _stab_correction
-    rx = max(0, min(_cur_video_w - 1, int(round(px - cx))))
-    ry = max(0, min(_cur_video_h - 1, int(round(py - cy))))
+    """Undo the current stabilization transform — use before select_point()/
+    lock_target() so the Pi (which sees its own unwarped live frame) gets the
+    right pixel, including when rotation is part of the correction."""
+    if _stab_M is None:
+        rx, ry = px, py
+    else:
+        Minv = cv2.invertAffineTransform(_stab_M)
+        rx = Minv[0, 0] * px + Minv[0, 1] * py + Minv[0, 2]
+        ry = Minv[1, 0] * px + Minv[1, 1] * py + Minv[1, 2]
+    rx = max(0, min(_cur_video_w - 1, int(round(rx))))
+    ry = max(0, min(_cur_video_h - 1, int(round(ry))))
     return rx, ry
 
 def toggle_pi_record(cur_fps=0.0):
@@ -631,6 +1172,30 @@ def _build_buttons(vx: int):
         lambda: "ZOOM: ON" if _zoom_enabled else "ZOOM: OFF",
         36, toggle_zoom,
         lambda: (30, 140, 50) if _zoom_enabled else (90, 90, 30),
+    )
+    y += 44
+
+    # ── Feature tracking diagnostic (green dots) ────────────────────────────
+    btn(
+        lambda: "FEATURES: ON" if _feat_enabled else "FEATURES: OFF",
+        36, toggle_features,
+        lambda: (30, 140, 50) if _feat_enabled else (90, 90, 30),
+    )
+    y += 44
+
+    # ── Virtual target (yellow marker — estimates position out of FOV) ──────
+    btn(
+        lambda: "VT: ON" if _vt_enabled else "VT: OFF",
+        36, toggle_virtual_target,
+        lambda: (30, 140, 50) if _vt_enabled else (90, 90, 30),
+    )
+    y += 44
+
+    # ── Video transport (jpeg_udp <-> h264_udp, live) ────────────────────────
+    btn(
+        lambda: f"VIDEO: {_gcs_video_mode.replace('_udp', '').upper()}" if _gcs_video_mode else "VIDEO: n/a",
+        36, toggle_video_mode,
+        lambda: (55, 55, 85) if _gcs_video_mode else (60, 60, 60),
     )
     y += 44
 
@@ -827,11 +1392,12 @@ class _LiveCapture:
         self._frame_id  = 0
         self._frame_gen = None   # Pi-side frame counter, echoed back with select_point()
         self._lock      = threading.Lock()
+        self._closed    = False
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
         """Receive JPEG datagrams and decode them; marks _ok=False on timeout."""
-        while True:
+        while not self._closed:
             try:
                 data, _ = self._sock.recvfrom(1 << 16)  # 65536 bytes max UDP payload
                 frame_gen, jpeg = _split_frame_gen(data)
@@ -846,6 +1412,8 @@ class _LiveCapture:
             except socket.timeout:
                 with self._lock:
                     self._ok = False   # no packet for 1 s → show waiting screen
+            except OSError:
+                break   # socket closed via close() — exit cleanly, not an error
             except Exception as e:
                 print(f"[UDP] recv: {e}")
 
@@ -855,6 +1423,15 @@ class _LiveCapture:
             if self._frame is None:
                 return False, None, 0, None
             return self._ok, self._frame.copy(), self._frame_id, self._frame_gen
+
+    def close(self):
+        """Stop the reader thread and release the socket — call before
+        switching to a different capture class on the same UDP port."""
+        self._closed = True
+        try:
+            self._sock.close()
+        except Exception:
+            pass
 
 
 # ── H.264/RTP live capture (video_mode = "h264_udp") ───────────────────────────
@@ -931,6 +1508,7 @@ class _H264LiveCapture:
         self._au_gen    = None
         self._fu_buf    = None
         self._fu_type   = None
+        self._closed    = False
 
         threading.Thread(target=self._reader, daemon=True).start()
 
@@ -948,13 +1526,15 @@ class _H264LiveCapture:
 
     def _reader(self):
         self._new_decoder()
-        while True:
+        while not self._closed:
             try:
                 data, _ = self._sock.recvfrom(2048)
             except socket.timeout:
                 with self._lock:
                     self._ok = False
                 continue
+            except OSError:
+                break   # socket closed via close() — exit cleanly, not an error
             except Exception as e:
                 print(f"[H264] recv: {e}")
                 continue
@@ -1029,22 +1609,84 @@ class _H264LiveCapture:
                 return False, None, 0, None
             return self._ok, self._frame.copy(), self._frame_id, self._frame_gen
 
+    def close(self):
+        """Stop the reader thread and release the socket — call before
+        switching to a different capture class on the same UDP port."""
+        self._closed = True
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+# ── Local file capture (--file, no Pi needed) ───────────────────────────────
+#
+# Same read() contract as _LiveCapture/_H264LiveCapture — (ok, frame,
+# frame_id, frame_gen) — so every downstream consumer (HUD, stabilization,
+# feature tracking, virtual target, zoom loupe, recording) works unmodified.
+# frame_gen is always None: select_point()'s stale-click replay is a Pi-side
+# feature with nothing to replay against here, and _post's absent-frame_gen
+# fallback already handles that. Loops back to frame 0 at end of file so a
+# short recording is still useful for an extended test session.
+
+class _FileCapture:
+    def __init__(self, path):
+        self._cap = cv2.VideoCapture(str(path))
+        if not self._cap.isOpened():
+            raise SystemExit(f"Could not open video file: {path}")
+        src_fps   = self._cap.get(cv2.CAP_PROP_FPS)
+        self._delay = 1.0 / src_fps if src_fps and src_fps > 1 else 1.0 / 30.0
+
+        self._frame    = None
+        self._ok       = False
+        self._frame_id = 0
+        self._lock     = threading.Lock()
+
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        while True:
+            ok, frame = self._cap.read()
+            if not ok:
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # loop
+                continue
+            with self._lock:
+                self._frame     = frame
+                self._ok        = True
+                self._frame_id += 1
+            time.sleep(self._delay)
+
+    def read(self):
+        """Return (ok, frame_copy, frame_id, frame_gen). Same contract as _LiveCapture."""
+        with self._lock:
+            if self._frame is None:
+                return False, None, 0, None
+            return self._ok, self._frame.copy(), self._frame_id, None
+
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
     global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit, _frame_gen
+    global cap, _gcs_video_mode
 
-    data     = _get("status")
-    launched = data.get("launched", False)
-    if data:
-        set_status(f"Connected to {PI_IP}")
+    if args.file:
+        cap = _FileCapture(args.file)
+        set_status(f"Offline: playing {args.file}")
+        print(f"[GCS] video_mode=file ({args.file}) — no Pi connection, commands are no-ops")
     else:
-        set_status(f"Commands via UDP broadcast — waiting for video…")
+        data     = _get("status")
+        launched = data.get("launched", False)
+        if data:
+            set_status(f"Connected to {PI_IP}")
+        else:
+            set_status(f"Commands via UDP broadcast — waiting for video…")
 
-    video_mode = _load_video_mode()
-    cap = _H264LiveCapture(UDP_PORT) if video_mode == "h264_udp" else _LiveCapture(UDP_PORT)
-    print(f"[GCS] video_mode={video_mode}")
+        video_mode = _load_video_mode()
+        cap = _H264LiveCapture(UDP_PORT) if video_mode == "h264_udp" else _LiveCapture(UDP_PORT)
+        if video_mode in ("jpeg_udp", "h264_udp"):
+            _gcs_video_mode = video_mode
+        print(f"[GCS] video_mode={video_mode}")
     gamepad = _Gamepad()
 
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
@@ -1109,6 +1751,12 @@ def main():
                 last_frame_id = frame_id
                 _frame_gen    = frame_gen
 
+            _feat_update(frame, is_new_frame)   # raw-frame coords — must run before the stabilization warp,
+                                                 # and before _vt_update, which consumes its _feat_last_delta
+            _vt_update(frame, is_new_frame)
+            draw_feature_points(frame)          # drawn here (pre-warp) so dots move WITH the content, no
+                                                 # separate raw->display coordinate conversion needed yet
+
             if _stab_enabled:
                 frame = _stabilize(frame, is_new_frame)
 
@@ -1127,10 +1775,12 @@ def main():
             _cur_video_w = w
             _cur_video_h = h
             _build_buttons(w)
+            _reset_stabilizer()   # stale trajectory/reference frame would no longer match this size
 
         est_fps_ref[0] = est_fps   # share live FPS with button lambdas
 
         draw_hud(frame, est_fps)
+        draw_virtual_target(frame)
 
         # ── Zoom loupe — appears only after a long press (a quick click just
         # selects the cursor point directly) ─────────────────────────────────

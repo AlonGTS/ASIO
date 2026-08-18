@@ -35,10 +35,11 @@ class FrameBuffer:
         self._gen = 0   # incremented on every put(); consumers track last seen gen
 
     def put(self, frame, gen=None):
-        """gen lets the caller stamp this frame with an externally-meaningful
-        id (tracker-so.py passes its own state.frame_gen, so consumers can
-        correlate a published frame back to the raw capture it came from).
-        Self-increments as before if omitted."""
+        """gen: the caller's own authoritative frame counter (e.g. tracker-so.py's
+        raw-capture frame_gen), so consumers (h264_udp_server's frame_gen RTP
+        extension, _get_frame_history) see the same id the frame was captured
+        under instead of a second, disconnected counter. Omit to fall back to
+        auto-incrementing (tracker.py's legacy caller has no such counter)."""
         with self._cond:
             self._frame = frame
             self._gen = gen if gen is not None else self._gen + 1
@@ -102,11 +103,11 @@ WEBRTC_HTML = """
 <html>
   <head>
     <meta charset="utf-8">
-    <title>GTS Ground Control</title>
+    <title>Mahat Live Video &amp; Control</title>
     <style>
       * { box-sizing: border-box; }
       body { font-family: sans-serif; background:#f0f0f0; margin:0; padding:24px; }
-      h1 { margin:0 0 12px 0; text-align:center; width:100%; }
+      h1 { margin:0 0 16px 0; text-align:center; }
 
       .layout {
         display:grid;
@@ -168,9 +169,9 @@ WEBRTC_HTML = """
     </style>
   </head>
   <body>
+    <h1>Mahat Live Video &amp; Control</h1>
     <div class="layout">
       <div class="video-panel">
-        <h1>GTS Ground Control</h1>
         <div id="wrap"><video id="video" autoplay playsinline></video></div>
         <div id="status"></div>
         <div class="hint">
@@ -231,7 +232,6 @@ WEBRTC_HTML = """
       window.addEventListener('resize', fitWrap);
 
       async function sendCmd(cmd){
-        if (cmd === 'q' && !confirm('Are you sure you want to quit?')) return;
         try{
           const r = await fetch('http://' + location.hostname + ':5000/command', {
             method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
@@ -442,8 +442,7 @@ WEBRTC_HTML = """
             }
           };
 
-          pc.addTransceiver('video', { direction: 'recvonly' });
-          const offer = await pc.createOffer();
+          const offer = await pc.createOffer({ offerToReceiveVideo: true });
           await pc.setLocalDescription(offer);
 
           // Wait for ICE gathering so the offer SDP has all host candidates.

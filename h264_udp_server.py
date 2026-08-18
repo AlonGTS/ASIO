@@ -139,7 +139,7 @@ def _send_nal(sock, addr, nal, frame_gen, is_last_nal, ts, ssrc, seq_box, max_pa
 
 
 def _h264_stream_worker(frame_buffer, gcs_ip_getter, port, stream_width, stream_fps,
-                         bitrate_kbps, gop_seconds, rtp_payload):
+                         bitrate_kbps, gop_seconds, rtp_payload, stop_event):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
 
@@ -164,7 +164,7 @@ def _h264_stream_worker(frame_buffer, gcs_ip_getter, port, stream_width, stream_
           f"(cap {stream_fps if stream_fps > 0 else 'uncapped'} fps, "
           f"gop={gop}f/{gop_seconds}s)")
 
-    while True:
+    while not stop_event.is_set():
         frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
         if frame is None:
             continue
@@ -221,18 +221,34 @@ def _h264_stream_worker(frame_buffer, gcs_ip_getter, port, stream_width, stream_
                 _send_nal(sock, (gcs_ip, port), nal, gen, i == len(nals) - 1,
                           ts, ssrc, seq_box, rtp_payload)
 
+    # stop_event was set — tear down cleanly so the port/encoder are free
+    # for whatever starts next (e.g. switching back to jpeg_udp)
+    try:
+        sock.close()
+    except Exception:
+        pass
+    if encoder is not None:
+        try:
+            encoder.close()
+        except Exception:
+            pass
+    print("[H264] stream worker stopped")
+
 
 def start(frame_buffer, gcs_ip_getter, port=5600, stream_width=480, stream_fps=15,
           bitrate_kbps=2000, gop_seconds=0.5, rtp_payload=1200):
     """Spawn the H.264/RTP-over-UDP sender as a daemon thread. Non-blocking.
     gcs_ip_getter: zero-arg callable returning the current GCS IP (or None
     until it's learned), matching tracker-so.py's dynamically-updated
-    GCS_IP module global."""
+    GCS_IP module global. Returns (thread, stop_event) — call
+    stop_event.set() then thread.join() to cleanly tear this down before
+    starting a different video transport on the same port."""
+    stop_event = threading.Event()
     t = threading.Thread(
         target=_h264_stream_worker,
         args=(frame_buffer, gcs_ip_getter, port, stream_width, stream_fps,
-              bitrate_kbps, gop_seconds, rtp_payload),
+              bitrate_kbps, gop_seconds, rtp_payload, stop_event),
         daemon=True,
     )
     t.start()
-    return t
+    return t, stop_event

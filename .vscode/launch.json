@@ -5,6 +5,7 @@
             "name": "tracker-so: live",
             "type": "debugpy",
             "request": "launch",
+            "python": "/opt/homebrew/bin/python3.14",
             "program": "${workspaceFolder}/tracker-so.py",
             "args": ["--mode", "live"],
             "console": "integratedTerminal"
@@ -13,14 +14,17 @@
             "name": "tracker-so: playback",
             "type": "debugpy",
             "request": "launch",
+            "python": "/opt/homebrew/bin/python3.14",
             "program": "${workspaceFolder}/tracker-so.py",
             "args": ["--mode", "playback", "--loop"],
-            "console": "integratedTerminal"
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
         },
         {
             "name": "GCS: Pi (auto from config.toml)",
             "type": "debugpy",
             "request": "launch",
+            "python": "/opt/homebrew/bin/python3.14",
             "program": "${workspaceFolder}/gcs.py",
             "args": [],
             "console": "integratedTerminal"
@@ -29,9 +33,26 @@
             "name": "GCS: connect to Pi (manual IP)",
             "type": "debugpy",
             "request": "launch",
+            "python": "/opt/homebrew/bin/python3.14",
             "program": "${workspaceFolder}/gcs.py",
             "args": ["--pi", "${input:piIp}"],
             "console": "integratedTerminal"
+        },
+        {
+            "name": "GCS: local playback (127.0.0.1:5050)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/opt/homebrew/bin/python3.14",
+            "program": "${workspaceFolder}/gcs.py",
+            "args": ["--pi", "127.0.0.1", "--port", "5050"],
+            "console": "integratedTerminal"
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Local playback (tracker-so + GCS, no Pi)",
+            "configurations": ["tracker-so: playback", "GCS: local playback (127.0.0.1:5050)"],
+            "stopAll": true
         }
     ],
     "inputs": [
@@ -40,6 +61,33 @@
             "type": "promptString",
             "description": "Pi IP address",
             "default": "192.168.1.34"
+        },
+        {
+            "id": "videoFile",
+            "type": "pickString",
+            "description": "Video file to play back — pick from the dropdown. To use a file that isn't listed, add its name to the \"videoFile\" options in .vscode/launch.json, or run tracker-so.py directly from a terminal with --video <path> instead.",
+            "options": [
+                "gcs_rec_20260813_124204.mp4",
+                "gcs_rec_20260813_114456.mp4",
+                "gcs_rec_20260813_104253.mp4",
+                "gcs_rec_20260813_091139.mp4",
+                "gcs_rec_20260813_072734.mp4",
+                "gcs_rec_20260730_113112.mp4",
+                "gcs_rec_20260729_135249.mp4",
+                "gcs_rec_20260729_123117.mp4",
+                "gcs_rec_20260729_111852.mp4",
+                "gcs_rec_20260729_093937.mp4",
+                "gcs_rec_20260729_081115.mp4",
+                "gcs_rec_20260729_070847.mp4",
+                "gcs_rec_20260706_191114.mp4",
+                "gcs_rec_20260705_113700.mp4",
+                "gcs_rec_20260705_091414.mp4",
+                "gcs_rec_20260616_135402.mp4",
+                "gcs_rec_20260616_113836.mp4",
+                "gcs_rec_20260616_085713.mp4",
+                "gcs_rec_20260616_072816.mp4"
+            ],
+            "default": "gcs_rec_20260813_124204.mp4"
         }
     ]
 }
