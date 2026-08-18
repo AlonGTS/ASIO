@@ -11,6 +11,30 @@ import cv2
 from flask import Flask, request
 from flask_cors import CORS
 
+# Selection-box size, scaled from a fixed pixel size at the 640x480
+# baseline (moving 22x22, fixed 58x58, nudge-default 43x43 — ~28% smaller
+# than the original 30/80/60) so the box covers roughly the same
+# real-world target size no matter which MAIN capture resolution is
+# active. The box is always square: it's scaled by a single factor
+# (geometric mean of the width and height ratios to the baseline) rather
+# than independent width/height fractions, so switching to a non-4:3
+# resolution (e.g. 1280x720) can't skew it into a rectangle.
+BOX_BASE_MOVING        = 22
+BOX_BASE_FIXED         = 58
+BOX_BASE_NUDGE_DEFAULT = 43
+
+
+def _scaled_square(base, mw, mh):
+    scale = ((mw / 640) * (mh / 480)) ** 0.5
+    side = max(2, round(base * scale))
+    return side, side
+
+
+def box_size(mw, mh, moving):
+    """Selection-box (w, h) in MAIN pixels, scaled to the mw x mh frame. Always square."""
+    base = BOX_BASE_MOVING if moving else BOX_BASE_FIXED
+    return _scaled_square(base, mw, mh)
+
 
 def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None, get_cpu_temp_fn=None, get_frame_history_fn=None):
     """
@@ -84,7 +108,7 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
                 x = max(0, min(mw - 1, int(request.form.get("x"))))
                 y = max(0, min(mh - 1, int(request.form.get("y"))))
 
-            w, h = (30, 30) if state.bMoovingTgt else (80, 80)
+            w, h = box_size(mw, mh, state.bMoovingTgt)
             x0 = max(0, min(mw - w, x - w // 2))
             y0 = max(0, min(mh - h, y - h // 2))
 
@@ -170,7 +194,7 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
             sx = lw / mw; sy = lh / mh
 
             if state.bbox is None:
-                bw = bh = 60
+                bw, bh = _scaled_square(BOX_BASE_NUDGE_DEFAULT, mw, mh)
                 x = max(0, mw // 2 - bw // 2)
                 y = max(0, mh // 2 - bh // 2)
             else:
