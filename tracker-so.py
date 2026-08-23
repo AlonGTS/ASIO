@@ -221,17 +221,8 @@ _net_iface  = _cfg["network"]["interface"]
 _net        = _cfg["network"][_net_iface]
 BIND_IP     = _get_iface_ip(_net_iface) or _net["bind_ip"]
 _VIDEO_MODE = _cfg["network"].get("video_mode", "jpeg_udp")
-GCS_IP      = None   # the controller — learned dynamically from whoever announces
-                      # itself over the command channel (see _udp_cmd_listener)
+GCS_IP     = None   # learned dynamically when GCS announces itself over the command channel
 print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs=<waiting for GCS hello>")
-
-# Video is sent once, to a multicast group, regardless of viewer count — see
-# config.toml's video_multicast_group comment. Streaming is still gated on
-# GCS_IP (don't burn CPU encoding before any controller has shown up), but
-# there's no more per-viewer registration/fan-out list needed: the network
-# handles delivering the one stream to however many clients have joined.
-_MCAST_GROUP = _cfg["network"].get("video_multicast_group", "239.5.5.5")
-_MCAST_TTL   = _cfg["network"].get("video_multicast_ttl", 1)
 
 # Shared frame buffer for WebRTC
 frame_buffer = webrtc_server.FrameBuffer()
@@ -908,17 +899,6 @@ def _start_jpeg_udp():
 
     _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)
-    _udp_sock.setsockopt(_socket.IPPROTO_IP, _socket.IP_MULTICAST_TTL, _MCAST_TTL)
-    try:
-        # Pins multicast egress to BIND_IP's interface — needed on a
-        # multi-homed Pi (wlan0 vs wlan1) so it doesn't go out the wrong
-        # radio. Best-effort: on local (non-Pi) testing, BIND_IP may not
-        # be a real local address here, so just fall back to the OS
-        # default route rather than failing to start streaming.
-        _udp_sock.setsockopt(_socket.IPPROTO_IP, _socket.IP_MULTICAST_IF, _socket.inet_aton(BIND_IP))
-    except OSError as e:
-        print(f"[UDP]  IP_MULTICAST_IF({BIND_IP}) failed ({e}) — using default route")
-    _mcast_addr = (_MCAST_GROUP, _UDP_PORT)
     _jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, _jpeg_quality]
     _udp_max = 65400
 
@@ -937,7 +917,7 @@ def _start_jpeg_udp():
                 continue
             last_gen = gen
 
-            if GCS_IP is None:   # nobody's shown up yet — don't burn CPU encoding
+            if GCS_IP is None:
                 continue
 
             _now_gate = time.time()
@@ -948,7 +928,7 @@ def _start_jpeg_udp():
             _sent += 1
             _now = time.time()
             if _now - _t0 >= 5.0:
-                print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)  → {_MCAST_GROUP}:{_UDP_PORT}")
+                print(f"[UDP]  {_sent / (_now - _t0):.1f} fps  ({_sent} frames in {_now-_t0:.1f}s)  → {GCS_IP}")
                 _t0, _sent = _now, 0
 
             h_f, w_f = frame.shape[:2]
@@ -967,11 +947,8 @@ def _start_jpeg_udp():
             data = struct.pack('>I', gen & 0xFFFFFFFF) + buf.tobytes()
             if len(data) > _udp_max:
                 continue
-            # One send, one copy on the wire — every joined viewer (any
-            # count) receives this same datagram via multicast; no per-
-            # recipient loop needed.
             try:
-                _udp_sock.sendto(data, _mcast_addr)
+                _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))
             except Exception as e:
                 print(f"[UDP]  send error: {e}")
 
@@ -991,10 +968,7 @@ def _start_h264_udp():
     _h264_kbps = _cfg["network"].get("h264_bitrate_kbps", 2000)
     _video_thread, _video_stop_event = h264_udp_server.start(
         frame_buffer,
-        gate_getter     = lambda: GCS_IP is not None,
-        multicast_group = _MCAST_GROUP,
-        multicast_ttl   = _MCAST_TTL,
-        bind_ip         = BIND_IP,
+        gcs_ip_getter = lambda: GCS_IP,
         port          = _UDP_PORT,
         stream_width  = _cfg["network"].get("gcs_stream_width", 480),
         stream_fps    = _cfg["network"].get("gcs_stream_fps", 15),
@@ -1002,7 +976,7 @@ def _start_h264_udp():
         gop_seconds   = _cfg["network"].get("h264_gop_seconds", 0.5),
         rtp_payload   = _cfg["network"].get("h264_rtp_payload", 1200),
     )
-    print(f"[H264]  udp://{_MCAST_GROUP}:{_UDP_PORT}  bitrate={_h264_kbps}kbps  "
+    print(f"[H264]  udp://<gcs>:{_UDP_PORT}  bitrate={_h264_kbps}kbps  "
           f"(hardware encoder used if available, software fallback otherwise)")
 
 def _stop_video_stream():
@@ -1080,14 +1054,14 @@ def _udp_cmd_listener():
     while True:
         try:
             data, addr = _cmd_sock.recvfrom(4096)
-            msg = _json.loads(data.decode())
 
-            # Learn / update the controller's IP dynamically from sender address
+            # Learn / update GCS IP dynamically from sender address
             if GCS_IP != addr[0]:
-                print(f"[NET]  Controller GCS IP {'learned' if GCS_IP is None else 'updated'}: {addr[0]}  (was {GCS_IP})")
+                print(f"[NET]  GCS IP {'learned' if GCS_IP is None else 'updated'}: {addr[0]}  (was {GCS_IP})")
                 GCS_IP = addr[0]
 
-            ep = msg.pop("endpoint", None)
+            msg = _json.loads(data.decode())
+            ep  = msg.pop("endpoint", None)
             if ep:   # "hello" heartbeats have no endpoint — skip the Flask call
                 print(f"[CMD]  ← {addr[0]}  {ep}  {msg}")
                 _req.post(f"http://127.0.0.1:{_FLASK_PORT}/{ep}", data=msg, timeout=1)
