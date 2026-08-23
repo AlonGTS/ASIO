@@ -47,10 +47,20 @@ template_size       = 200
 filter_lr           = 0.25
 
 [network]
+flask_port = 5050  # temporary, local-testing only — macOS's AirPlay Receiver squats on
+                    # the default 5000; every real Pi is fine leaving this unset
 # "wlan0" = original network, "wlan1" = new USB dongle (MAHAT)
 interface        = "wlan0"
 gcs_udp_port     = 5600
 gcs_cmd_port     = 5601
+# Video is sent once as UDP multicast — the Pi's own bandwidth/CPU cost is
+# the same whether 1 or 10 GCS/viewers are watching; any number of clients
+# can join this group and receive the identical stream. 239.0.0.0/8 is the
+# administratively-scoped range (safe to pick arbitrarily for a LAN).
+# TTL=1 keeps it from crossing a router hop — raise it only if the Pi and
+# your GCS/viewers are ever on different subnets.
+video_multicast_group = "239.5.5.5"
+video_multicast_ttl   = 1
 gcs_jpeg_quality = 80     # was 60 — lower = smaller frames (~12 KB vs ~35 KB)
 gcs_stream_width = 640  # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 30fps)
 # Cap on JPEG-encode-and-send rate to the GCS, independent of camera capture/
@@ -79,7 +89,7 @@ h264_gop_seconds  = 0.5    # I-frame interval (~15 frames @ 30fps feed, less at 
 h264_rtp_payload  = 1200   # max NAL bytes per UDP/RTP packet — keeps packets MTU-safe (no IP fragmentation)
 
 [network.wlan0]
-bind_ip = "192.168.1.45"
+bind_ip = "192.168.1.36"
 # gcs_ip no longer needed — Pi learns GCS IP dynamically from heartbeat packets
 
 [network.wlan1]
@@ -111,7 +121,7 @@ extra_outputs = ["192.168.10.8", "10.50.117.41", "192.168.1.34", "192.168.1.43",
 [camera]
 # Safe/default resolutions for IMX708 path
 main_sizes  = [[640, 480], [960, 540], [1280, 720], [1640, 1232]]
-lores_sizes = [[320, 240], [416, 312], [512, 384], [640,  480], [800, 600], [960, 720], [1280, 960], [1640, 1232]]
+lores_sizes = [[320, 240], [416, 312], [512, 384], [640,  480], [800, 600], [960, 540], [1280, 720], [1640, 1232]]
 
 # Capture starts at idle_fps (low CPU/heat) and only switches to active_fps
 # when the GCS operator explicitly toggles it (FPS button / F key in gcs.py).

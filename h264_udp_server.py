@@ -3,14 +3,17 @@
 H.264-over-UDP video server for tracker-so.py (config.toml video_mode = "h264_udp").
 
 Connectionless by design: no handshake, no ACK/NACK, no retransmission. The
-sender just keeps pushing RTP packets at whatever GCS_IP it currently knows;
-a receiver can start decoding mid-stream at the next keyframe with no
-coordination needed from this side. See gcs.py's _H264LiveCapture for the
-matching receiver.
+sender pushes RTP packets to one UDP multicast group — any number of GCS/
+viewer clients can join that group and receive the identical stream, so
+this doesn't need to know who or how many are listening, only whether it
+should be streaming at all (gate_getter). A receiver can start decoding
+mid-stream at the next keyframe with no coordination needed from this
+side. See video_capture.py's H264LiveCapture for the matching receiver.
 
 Usage from tracker-so.py:
     import h264_udp_server
-    h264_udp_server.start(frame_buffer, gcs_ip_getter=lambda: GCS_IP, ...)
+    h264_udp_server.start(frame_buffer, gate_getter=lambda: GCS_IP is not None,
+                           multicast_group="239.5.5.5", bind_ip=BIND_IP, ...)
 """
 import os
 import socket
@@ -104,6 +107,9 @@ def _pack_rtp_header(seq: int, ts: int, marker: bool, ssrc: int, frame_gen: int)
 
 
 def _send_rtp(sock, addr, payload, seq_box, ts, marker, ssrc, frame_gen):
+    """Build and send one RTP packet to the multicast group. One sendto()
+    per packet regardless of how many clients are listening — the network
+    (not this process) is what duplicates it to each joined receiver."""
     seq = seq_box[0]
     seq_box[0] = (seq + 1) & 0xFFFF
     packet = _pack_rtp_header(seq, ts, marker, ssrc, frame_gen) + payload
@@ -138,10 +144,21 @@ def _send_nal(sock, addr, nal, frame_gen, is_last_nal, ts, ssrc, seq_box, max_pa
         first = False
 
 
-def _h264_stream_worker(frame_buffer, gcs_ip_getter, port, stream_width, stream_fps,
+def _h264_stream_worker(frame_buffer, gate_getter, multicast_group, multicast_ttl, bind_ip,
+                         port, stream_width, stream_fps,
                          bitrate_kbps, gop_seconds, rtp_payload, stop_event):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, multicast_ttl)
+    if bind_ip:
+        try:
+            # Best-effort: pins egress to bind_ip's interface on a multi-
+            # homed Pi; on local (non-Pi) testing bind_ip may not be a
+            # real local address, so fall back to the OS default route.
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(bind_ip))
+        except OSError as e:
+            print(f"[H264] IP_MULTICAST_IF({bind_ip}) failed ({e}) — using default route")
+    addr = (multicast_group, port)
 
     ssrc = struct.unpack('>I', os.urandom(4))[0]
     seq_box = [struct.unpack('>H', os.urandom(2))[0]]
@@ -170,8 +187,7 @@ def _h264_stream_worker(frame_buffer, gcs_ip_getter, port, stream_width, stream_
             continue
         last_gen = gen
 
-        gcs_ip = gcs_ip_getter()
-        if gcs_ip is None:
+        if not gate_getter():
             continue
 
         now_gate = time.time()
@@ -182,7 +198,7 @@ def _h264_stream_worker(frame_buffer, gcs_ip_getter, port, stream_width, stream_
         sent += 1
         now = time.time()
         if now - t0 >= 5.0:
-            print(f"[H264] {sent / (now - t0):.1f} fps  ({sent} frames in {now-t0:.1f}s)  → {gcs_ip}")
+            print(f"[H264] {sent / (now - t0):.1f} fps  ({sent} frames in {now-t0:.1f}s)  → {multicast_group}:{port}")
             t0, sent = now, 0
 
         h_f, w_f = frame.shape[:2]
@@ -218,7 +234,7 @@ def _h264_stream_worker(frame_buffer, gcs_ip_getter, port, stream_width, stream_
                 continue
             ts = int(time.time() * 90000) & 0xFFFFFFFF
             for i, nal in enumerate(nals):
-                _send_nal(sock, (gcs_ip, port), nal, gen, i == len(nals) - 1,
+                _send_nal(sock, addr, nal, gen, i == len(nals) - 1,
                           ts, ssrc, seq_box, rtp_payload)
 
     # stop_event was set — tear down cleanly so the port/encoder are free
@@ -235,18 +251,25 @@ def _h264_stream_worker(frame_buffer, gcs_ip_getter, port, stream_width, stream_
     print("[H264] stream worker stopped")
 
 
-def start(frame_buffer, gcs_ip_getter, port=5600, stream_width=480, stream_fps=15,
+def start(frame_buffer, gate_getter, multicast_group, multicast_ttl=1, bind_ip=None,
+          port=5600, stream_width=480, stream_fps=15,
           bitrate_kbps=2000, gop_seconds=0.5, rtp_payload=1200):
     """Spawn the H.264/RTP-over-UDP sender as a daemon thread. Non-blocking.
-    gcs_ip_getter: zero-arg callable returning the current GCS IP (or None
-    until it's learned), matching tracker-so.py's dynamically-updated
-    GCS_IP module global. Returns (thread, stop_event) — call
-    stop_event.set() then thread.join() to cleanly tear this down before
-    starting a different video transport on the same port."""
+    gate_getter: zero-arg callable — stream only while it returns True (e.g.
+    "a controller has shown up"), so nothing is encoded before anyone's
+    listening. Every RTP packet is sent once, to multicast_group:port;
+    any number of clients can join and receive the identical stream, so
+    encoding and sending cost don't scale with listener count. bind_ip
+    selects the outbound interface on a multi-homed Pi (e.g. wlan0 vs
+    wlan1) — without it, multicast can go out the wrong interface.
+    Returns (thread, stop_event) — call stop_event.set() then thread.join()
+    to cleanly tear this down before starting a different video transport
+    on the same port."""
     stop_event = threading.Event()
     t = threading.Thread(
         target=_h264_stream_worker,
-        args=(frame_buffer, gcs_ip_getter, port, stream_width, stream_fps,
+        args=(frame_buffer, gate_getter, multicast_group, multicast_ttl, bind_ip,
+              port, stream_width, stream_fps,
               bitrate_kbps, gop_seconds, rtp_payload, stop_event),
         daemon=True,
     )
