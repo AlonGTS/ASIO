@@ -122,8 +122,26 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 826     # minimum canvas height so all buttons fit
-DISPLAY_W   = 1200    # video is always stretched to this width for display
+PANEL_MIN_H = 870     # minimum canvas height so all buttons fit (was 826 — +44 for the WHITE TARGET button)
+
+def _screen_display_width(panel_w, fallback=1200):
+    """Video display width sized to fill most of the screen at startup —
+    cv2's own window (WINDOW_AUTOSIZE) always matches the rendered canvas
+    size exactly, so picking a big DISPLAY_W here is what makes the window
+    open large instead of needing a manual resize. Falls back to the old
+    fixed width if the screen size can't be read (e.g. no display attached)."""
+    try:
+        import tkinter as _tk
+        _root = _tk.Tk()
+        _root.withdraw()
+        sw = _root.winfo_screenwidth()
+        _root.destroy()
+        # Margin for OS chrome (menu bar/dock/title bar) plus the button panel.
+        return max(640, sw - panel_w - 60)
+    except Exception:
+        return fallback
+
+DISPLAY_W   = _screen_display_width(PANEL_W)   # video is stretched to this width for display
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -133,6 +151,7 @@ _pi_recording   = False   # Pi-side recording state (optimistic: toggled on each
 _local_recording = False  # GCS-side recording state
 _local_writer    = None   # cv2.VideoWriter when local recording is active
 cam_active      = False   # Pi camera fps state: False=idle (power-save), True=full fps
+white_target_enabled = False   # Pi-side white-target aim refinement/recovery on/off
 _cpu_percent    = None    # Pi CPU usage %, polled from /status; None until first poll
 _cpu_temp_c     = None    # Pi SoC temperature °C, polled from /status; None until first poll
 _pi_tracking    = False   # Pi-side tracking state, polled from /status
@@ -724,10 +743,19 @@ def toggle_fps():
     _post("set_fps", active=1 if cam_active else 0)
     set_status("Pi camera: FULL FPS" if cam_active else "Pi camera: IDLE (power-save)")
 
+def toggle_white_target():
+    """Explicitly tell the Pi to turn white-target aim refinement/recovery on
+    or off. Off = tracking behaves exactly as plain bbox-center tracking."""
+    global white_target_enabled
+    white_target_enabled = not white_target_enabled
+    _post("set_white_target", enabled=1 if white_target_enabled else 0)
+    set_status("White target: ON" if white_target_enabled else "White target: OFF")
+
 def _status_poller():
     """Background: poll /status every 2s to keep cam_active/_cpu_percent/_cpu_temp_c/
-    _pi_tracking fresh even when nothing else is triggering a request (e.g. after Pi restarts)."""
-    global cam_active, _cpu_percent, _cpu_temp_c, _pi_tracking
+    _pi_tracking/white_target_enabled fresh even when nothing else is triggering
+    a request (e.g. after Pi restarts)."""
+    global cam_active, _cpu_percent, _cpu_temp_c, _pi_tracking, white_target_enabled
     while not _quit.is_set():
         data = _get("status")
         if data:
@@ -735,6 +763,7 @@ def _status_poller():
             _cpu_percent = data.get("cpu_percent", _cpu_percent)
             _cpu_temp_c  = data.get("cpu_temp", _cpu_temp_c)
             _pi_tracking = data.get("tracking", _pi_tracking)
+            white_target_enabled = data.get("white_target", white_target_enabled)
         time.sleep(2.0)
 
 threading.Thread(target=_status_poller, daemon=True).start()
@@ -1153,6 +1182,14 @@ def _build_buttons(vx: int):
         lambda: "FPS: FULL" if cam_active else "FPS: IDLE",
         36, toggle_fps,
         lambda: (30, 140, 50) if cam_active else (90, 90, 30),
+    )
+    y += 44
+
+    # ── White target mode ────────────────────────────────────────────────────
+    btn(
+        lambda: "WHITE TARGET: ON" if white_target_enabled else "WHITE TARGET: OFF",
+        36, toggle_white_target,
+        lambda: (30, 140, 50) if white_target_enabled else (90, 90, 30),
     )
     y += 44
 

@@ -198,6 +198,15 @@ with open(_HERE / "config.toml", "rb") as _f:
 SHOW_LOCAL    = _cfg["display"]["show_local"]
 MAX_BB_WIDTH  = _cfg["tracking"]["max_bb_width"]
 MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
+# White-target refinement/recentering only helps while the target is small/
+# medium in frame — up close (last few seconds before touchdown) the target
+# fills much of the box with uneven brightness (glare, foreshortening), and
+# the brightness-based center detection starts landing on a bright corner
+# instead of the sheet's true center. The plain tracker box alone is already
+# reliable at that range, so auto-disable white-target refinement this many
+# seconds after launch — 0 = never auto-disable (stays on for the whole
+# flight, tune this per typical launch-to-touchdown duration).
+WHITE_TARGET_DISABLE_AFTER_S = _cfg["tracking"].get("white_target_disable_after_s", 0)
 MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 _CAM_IDLE_FPS   = _cfg["camera"].get("idle_fps", 5)
@@ -303,6 +312,17 @@ picam2 = None
 _reader_thread = None
 _stop_reader = threading.Event()
 _camera_active = False   # False = idle (low fps, power-save); True = full fps. GCS-controlled.
+
+# GCS-controlled: when True, the white/bright-blob aim refinement, periodic
+# bbox recentering onto it, and the independent no-blob drift check are all
+# active (see _refine_aim_point and its call site). When False, tracking
+# behaves exactly as it did before any of that — plain bbox center only.
+_white_target_enabled = False
+
+def _set_white_target(enabled: bool):
+    global _white_target_enabled
+    _white_target_enabled = enabled
+    print(f"[WT]   White-target mode {'ON' if enabled else 'OFF'}")
 
 def _reader_playback(path, loop=False):
     """
@@ -626,6 +646,99 @@ else:
 def create_gts_tracker(moving: bool):
     return GTSTracker(mode="moving" if moving else "fixed")
 
+# Finds the white/bright blob within the tracker's bbox (e.g. a target
+# sheet or marker sitting in a loose box that also covers plain terrain).
+# Used both to refine the displayed aim point and to periodically re-center
+# the tracker's own box onto it (see the periodic-resync block in the main
+# loop, which reuses the same reinit approach as flask_app.py's /nudge
+# endpoint). Picks the BRIGHTEST sufficiently-large blob (99th-percentile
+# threshold keeps this specific to genuinely bright things, not just
+# generally-lighter terrain texture) — this works the same way whether the
+# target is a faint dot at long range or fills most of the box up close.
+# The area cap is intentionally generous (not "small blob only"): during a
+# landing approach the target grows continuously from a speck to filling
+# most of the frame, and a tight area cap excludes the real target once
+# it's grown past it — leaving only small brightness-noise fragments as
+# candidates, which can land anywhere including box corners. Only when the
+# "bright" region is nearly the entire crop (no real feature left to find,
+# just uniform brightness) does this fall back to the plain bbox center.
+_BLOB_PERCENTILE    = 99.0   # top ~1% brightest pixels = candidate blob pixels
+_BLOB_MIN_AREA      = 2      # px — smaller than this is more likely sensor noise
+_BLOB_MAX_AREA_FRAC = 0.90   # essentially the whole crop being "bright" isn't a real blob
+_BLOB_MIN_CONTRAST  = 15     # blob must be at least this much brighter than the crop average
+
+_STICKY_MAX_JUMP_FRAC = 0.6   # prev_point search radius, as a fraction of max(bw, bh)
+
+def _refine_aim_point(frame, x, y, bw, bh, fallback_cx, fallback_cy, prev_point=None):
+    """Return (cx, cy, found) — the centroid of a qualifying bright blob
+    inside bbox (x,y,bw,bh) and found=True, or (fallback_cx, fallback_cy,
+    False) — the plain bbox center — if no such blob is confidently present
+    this frame.
+
+    prev_point (MAIN coords, optional): when given, prefer whichever
+    qualifying blob is closest to it — falling back to the single brightest
+    blob only if none are within _STICKY_MAX_JUMP_FRAC of it (e.g. no
+    prev_point yet, or the target genuinely moved further than that this
+    frame). Without this, the pick is a fresh, memoryless "brightest blob
+    right now" decision every frame — if more than one bright thing is in
+    the box at once (the real target plus some incidental bright terrain/
+    clutter), tiny frame-to-frame brightness differences can flip which one
+    wins, making the point hop between them instead of tracking one object."""
+    if bw < 6 or bh < 6:
+        return fallback_cx, fallback_cy, False
+    crop = frame[y:y + bh, x:x + bw]
+    if crop.size == 0:
+        return fallback_cx, fallback_cy, False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+
+    # +1: a percentile that lands exactly on the background level (e.g. a
+    # near-uniform crop) would otherwise pull most of the background into
+    # the "bright" mask along with the blob.
+    thresh = np.percentile(gray, _BLOB_PERCENTILE) + 1
+    bright = (gray >= thresh).astype(np.uint8) * 255
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(bright, connectivity=8)
+    if n <= 1:
+        return fallback_cx, fallback_cy, False
+
+    area_crop = bw * bh
+    bg_mean = gray.mean()
+    candidates = []   # (label_idx, mean_val)
+    for i in range(1, n):
+        a = stats[i, cv2.CC_STAT_AREA]
+        if a < _BLOB_MIN_AREA or a / area_crop > _BLOB_MAX_AREA_FRAC:
+            continue
+        mean_val = gray[labels == i].mean()
+        if mean_val - bg_mean < _BLOB_MIN_CONTRAST:
+            continue
+        candidates.append((i, mean_val))
+    if not candidates:
+        return fallback_cx, fallback_cy, False
+
+    if prev_point is not None:
+        # Once locked onto something, proximity to where we were is the
+        # PRIMARY criterion — pick whichever qualifying candidate is closest
+        # to prev_point, not whichever is brightest. Brightness/contrast/size
+        # already qualified this pool above; ranking by brightness AGAIN here
+        # is what caused the flip-flop in the first place — two candidates
+        # close together (the real target + some incidental bright thing)
+        # would keep swapping places as whichever was marginally brighter
+        # changed frame to frame, even with a distance-based prefilter.
+        pcx, pcy = prev_point
+        max_jump = max(bw, bh) * _STICKY_MAX_JUMP_FRAC
+        dists = [(i, math.hypot(x + centroids[i][0] - pcx, y + centroids[i][1] - pcy))
+                 for i, _ in candidates]
+        nearest_idx, nearest_dist = min(dists, key=lambda t: t[1])
+        if nearest_dist <= max_jump:
+            best_idx = nearest_idx
+        else:
+            # Nothing plausible near the last position (real jump, or first
+            # lock after a gap) — fall back to brightest overall.
+            best_idx, _ = max(candidates, key=lambda t: t[1])
+    else:
+        best_idx, _ = max(candidates, key=lambda t: t[1])
+    cx_i, cy_i = centroids[best_idx]
+    return x + int(round(cx_i)), y + int(round(cy_i)), True
+
 # === Video Recording Setup (shared by 'record' mode and live toggle) ===
 import queue as _queue_mod
 
@@ -852,6 +965,8 @@ app = flask_app.create_app(
     # avoids a NameError here at import time.
     set_video_mode_fn  = lambda mode: set_video_mode(mode),
     get_video_mode_fn  = lambda: _current_video_mode,
+    set_white_target_fn = _set_white_target,
+    get_white_target_fn  = lambda: _white_target_enabled,
 )
 
 # === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
@@ -1134,6 +1249,29 @@ _log_session_id = 0            # increments on every new tracker instance
 _log_session_source = "unknown"      # why the current session started — see state.last_init_source
 _log_prev_cx = _log_prev_cy = None   # previous frame's MAIN-coord center, for jump distance
 
+# Independent drift signal: the correlation tracker's own quality score only
+# checks "does this still look like what I saw last frame" — a smooth lock
+# onto the wrong thing (e.g. rocks/clutter that happens to look self-similar
+# frame to frame) can pass that check indefinitely while still being wrong.
+# Since the actual target is known to be a bright/white blob, treat "no such
+# blob found in or near the box for many consecutive frames" as drift too,
+# even when the tracker's own score looks fine.
+_no_blob_streak     = 0
+_NO_BLOB_DRIFT_LIMIT = 10   # consecutive blob-less frames before treating this as drift
+
+_blob_center_countdown = 0   # frames left until the next periodic re-center-on-blob
+_BLOB_CENTER_EVERY_N_FRAMES = 15   # how often to resync the box onto the blob, in frames
+
+_aim_smooth = None   # (cx, cy) EMA of the aim point in MAIN coords; None until first found
+_AIM_SMOOTH_ALPHA = 0.35   # higher = more responsive/less smooth, lower = smoother/more lag
+_AIM_SMOOTH_SNAP_FRAC = 0.25   # jump beyond this fraction of box size = real motion, snap
+                                # to it immediately instead of easing (avoids lagging the
+                                # smoothed point outside a fast-moving target)
+
+_launch_ts   = None    # time.time() of the False→True launch edge; None until launched
+_was_launched = False  # previous frame's launched state, to detect that edge
+_wt_disabled_by_timer = False   # edge-detects the timeout for a one-time log line
+
 while True:
     # Wait for a genuinely NEW frame (by generation, not just "not None") —
     # otherwise, once current_frame is set once, this would spin re-processing
@@ -1157,6 +1295,25 @@ while True:
     mh, mw = frame.shape[:2]
     lw, lh = state.lores_size
     lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_NEAREST)
+
+    # Track the launch edge so white-target mode can auto-disable itself late
+    # in the flight (see WHITE_TARGET_DISABLE_AFTER_S) — the plain tracker box
+    # is already reliable once the target is close/large, and that's exactly
+    # where brightness-based centering starts landing on a corner instead.
+    _now_launched = mavlink_client._launched
+    if _now_launched and not _was_launched:
+        _launch_ts = time.time()
+    elif not _now_launched:
+        _launch_ts = None
+    _was_launched = _now_launched
+
+    _wt_timed_out = (WHITE_TARGET_DISABLE_AFTER_S > 0 and _launch_ts is not None
+                      and (time.time() - _launch_ts) >= WHITE_TARGET_DISABLE_AFTER_S)
+    if _wt_timed_out and _white_target_enabled and not _wt_disabled_by_timer:
+        print(f"[WT]   {WHITE_TARGET_DISABLE_AFTER_S:.0f}s since launch — "
+              f"auto-disabling white-target refinement for final approach")
+    _wt_disabled_by_timer = _wt_timed_out
+    _wt_effective_enabled = _white_target_enabled and not _wt_timed_out
 
     if (mw, mh, lw, lh) != _cached_dims:
         old_mw, old_mh = _cached_dims[0], _cached_dims[1]
@@ -1208,6 +1365,8 @@ while True:
         _log_session_id += 1
         _log_session_source = state.last_init_source or "unknown"
         _log_prev_cx = _log_prev_cy = None
+        _no_blob_streak = 0
+        _aim_smooth = None
 
     if state.tracking and state.tracker is not None:
         try:
@@ -1246,6 +1405,72 @@ while True:
                     print(f"[INFO] BB limited to {bw}x{bh} (max {MAX_BB_WIDTH}x{MAX_BB_HEIGHT})")
 
                 state.bbox = (x, y, bw, bh)
+                # White-target mode gates ALL of: aim-point refinement (display +
+                # MAVLink), periodic bbox recentering onto the blob, and the
+                # independent no-blob drift check below. Off = plain bbox-center
+                # tracking, exactly as before any of this existed. Also auto-
+                # disabled late in the flight — see WHITE_TARGET_DISABLE_AFTER_S.
+                if _wt_effective_enabled:
+                    aim_cx, aim_cy, _blob_found = _refine_aim_point(
+                        frame, x, y, bw, bh, cx, cy, prev_point=_aim_smooth)
+                    _no_blob_streak = 0 if _blob_found else _no_blob_streak + 1
+
+                    # Periodically resync the tracker's own box onto the blob — same
+                    # reinit approach as flask_app.py's /nudge endpoint (shift bbox
+                    # position, keep its size, reinit the tracker there), but only
+                    # every _BLOB_CENTER_EVERY_N_FRAMES frames, not continuously — a
+                    # fixed, simple cadence rather than continuously second-guessing
+                    # an otherwise-healthy track.
+                    _blob_center_countdown -= 1
+                    if _blob_center_countdown <= 0:
+                        _blob_center_countdown = _BLOB_CENTER_EVERY_N_FRAMES
+                        if _blob_found and (aim_cx != cx or aim_cy != cy):
+                            nx = max(0, min(mw - bw, aim_cx - bw // 2))
+                            ny = max(0, min(mh - bh, aim_cy - bh // 2))
+                            xb = int(nx * sx_m2l); yb = int(ny * sy_m2l)
+                            wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
+                            state.tracker = create_gts_tracker(state.bMoovingTgt)
+                            state.tracker.init(lores_frame, (xb, yb, wb, hb))
+                            state.last_init_source = "blob_center"
+                            state.bbox = (nx, ny, bw, bh)
+                            x, y, cx, cy = nx, ny, aim_cx, aim_cy
+                            aim_cx, aim_cy = cx, cy
+                            _last_tracker_id = id(state.tracker)
+                            _tq_needs_init   = True
+                            _tq_monitor.reset()
+                            _log_session_id += 1
+                            _log_session_source = "blob_center"
+                            _log_prev_cx = _log_prev_cy = None
+
+                    # Smooth the aim point so small frame-to-frame noise is
+                    # damped, WITHOUT lagging behind real fast motion (e.g. a
+                    # fast approach/descent shifting the target a lot between
+                    # frames): plain exponential smoothing always trails by a
+                    # proportional gap, which — under fast real motion — can
+                    # leave the smoothed point outside the target entirely
+                    # while the raw detection is still correctly on it. So:
+                    # ease toward small moves, but SNAP straight to the raw
+                    # point once it has moved far enough to be real motion
+                    # rather than noise, instead of easing toward it too.
+                    if _blob_found:
+                        if _aim_smooth is None:
+                            _aim_smooth = (aim_cx, aim_cy)
+                        else:
+                            _jump = math.hypot(aim_cx - _aim_smooth[0], aim_cy - _aim_smooth[1])
+                            if _jump > _AIM_SMOOTH_SNAP_FRAC * max(bw, bh):
+                                _aim_smooth = (aim_cx, aim_cy)   # real motion — don't lag behind it
+                            else:
+                                _aim_smooth = (
+                                    _AIM_SMOOTH_ALPHA * aim_cx + (1 - _AIM_SMOOTH_ALPHA) * _aim_smooth[0],
+                                    _AIM_SMOOTH_ALPHA * aim_cy + (1 - _AIM_SMOOTH_ALPHA) * _aim_smooth[1],
+                                )
+                        aim_cx, aim_cy = int(round(_aim_smooth[0])), int(round(_aim_smooth[1]))
+                    elif _aim_smooth is not None:
+                        aim_cx, aim_cy = int(round(_aim_smooth[0])), int(round(_aim_smooth[1]))
+                else:
+                    aim_cx, aim_cy = cx, cy
+                    _blob_found = False
+                    _no_blob_streak = 0
 
                 # Tracking quality: init on first frame, update on all subsequent ones
                 if _tq_needs_init:
@@ -1255,9 +1480,11 @@ while True:
                     _tq_monitor.update(lores_frame, (xl, yl, wl, hl))
                 tq = _tq_monitor.score
 
-                # Center offsets for attitude mapping (MAIN coords)
-                dx = cx - mw // 2
-                dy = cy - mh // 2
+                # Center offsets for attitude mapping (MAIN coords) — uses the
+                # refined aim point (the "+" mark when resolvable, else the
+                # plain bbox center), not the raw bbox center directly.
+                dx = aim_cx - mw // 2
+                dy = aim_cy - mh // 2
                 norm_dx = dx / mw
                 norm_dy = dy / mh
 
@@ -1271,16 +1498,66 @@ while True:
                     _tq_monitor.bad_frames = 0   # good frame resets the counter
                 _bad_frames_for_log = _tq_monitor.bad_frames   # snapshot before a drift reset zeroes it
 
-                _drift_event = _tq_monitor.bad_frames >= TrackingQualityMonitor.BAD_FRAMES_LIMIT
-                if _drift_event:
+                _no_blob_drift = _no_blob_streak >= _NO_BLOB_DRIFT_LIMIT
+                _drift_event = (_tq_monitor.bad_frames >= TrackingQualityMonitor.BAD_FRAMES_LIMIT
+                                 or _no_blob_drift)
+                if _drift_event and not _wt_effective_enabled:
+                    # White-target mode off (or auto-disabled late in flight) →
+                    # behave exactly as before any of this existed: give up
+                    # immediately, no search-based recovery attempt.
                     print(f"[TQ]   Drift detected ({_tq_monitor.bad_frames} bad frames, "
                           f"score={tq:.2f}) — tracking broken, re-select target")
                     state.tracking = False
                     state.tracker  = None
                     _tq_monitor.reset()
-                    # Skip the rest of the draw block — show lost message instead
                     cv2.putText(frame, "Drift — re-select target", (10, 140),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                elif _drift_event:
+                    _reason = (f"{_tq_monitor.bad_frames} bad frames, score={tq:.2f}"
+                               if not _no_blob_drift else
+                               f"no target blob for {_no_blob_streak} frames (tracker score still fine)")
+                    print(f"[TQ]   Drift detected ({_reason}) — searching nearby for target...")
+                    # Attempt automatic recovery: search a BOUNDED region around the
+                    # lost box (not the whole frame — an unbounded search risks locking
+                    # onto an unrelated bright object elsewhere in view, which would
+                    # steer real flight control toward the wrong thing) for the target,
+                    # and if found, reinit the tracker there instead of giving up. Only
+                    # runs on CONFIRMED drift — a still-valid track is never
+                    # second-guessed by this (that caused a worse bug previously: a
+                    # single noisy blob detection relocating a box that was fine).
+                    _SEARCH_EXPAND = 2.5
+                    ex_w = min(mw, int(bw * _SEARCH_EXPAND))
+                    ex_h = min(mh, int(bh * _SEARCH_EXPAND))
+                    ex_x = max(0, min(mw - ex_w, cx - ex_w // 2))
+                    ex_y = max(0, min(mh - ex_h, cy - ex_h // 2))
+                    _rx, _ry, _rfound = _refine_aim_point(frame, ex_x, ex_y, ex_w, ex_h,
+                                                           cx, cy)
+                    if _rfound:
+                        nx = max(0, min(mw - bw, _rx - bw // 2))
+                        ny = max(0, min(mh - bh, _ry - bh // 2))
+                        xb = int(nx * sx_m2l); yb = int(ny * sy_m2l)
+                        wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
+                        state.tracker = create_gts_tracker(state.bMoovingTgt)
+                        state.tracker.init(lores_frame, (xb, yb, wb, hb))
+                        state.last_init_source = "drift_recovery"
+                        state.bbox = (nx, ny, bw, bh)
+                        _last_tracker_id = id(state.tracker)
+                        _tq_needs_init   = True
+                        _tq_monitor.reset()
+                        _log_session_id += 1
+                        _log_session_source = "drift_recovery"
+                        _log_prev_cx = _log_prev_cy = None
+                        _no_blob_streak = 0
+                        _aim_smooth = None
+                        print(f"[TQ]   Recovered onto target near ({_rx}, {_ry})")
+                    else:
+                        print("[TQ]   Nothing found nearby — tracking broken, re-select target")
+                        state.tracking = False
+                        state.tracker  = None
+                        _tq_monitor.reset()
+                        # Skip the rest of the draw block — show lost message instead
+                        cv2.putText(frame, "Drift — re-select target", (10, 140),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 else:
                     # Only drive the drone when quality is sufficient
                     if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
@@ -1298,8 +1575,8 @@ while True:
                         box_color = (0, 0, 255)      # red    — unstable, counting down
 
                     cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
-                    cv2.line(frame, (cx - 10, cy), (cx + 10, cy), box_color, 1)
-                    cv2.line(frame, (cx, cy - 10), (cx, cy + 10), box_color, 1)
+                    cv2.line(frame, (aim_cx - 20, aim_cy), (aim_cx + 20, aim_cy), (0, 0, 255), 1)
+                    cv2.line(frame, (aim_cx, aim_cy - 20), (aim_cx, aim_cy + 20), (0, 0, 255), 1)
 
                 _cdx = (cx - _log_prev_cx) if _log_prev_cx is not None else None
                 _cdy = (cy - _log_prev_cy) if _log_prev_cy is not None else None
@@ -1377,6 +1654,17 @@ while True:
     # Launched indicator
     if mavlink_client._launched:
         cv2.putText(frame, "Launched", (8, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
+    # Time since launch — same _launch_ts used by the white-target
+    # auto-disable timer, so this is exactly what that's counting against.
+    # Offset 100px down/left from the top-right corner: GCS-side video
+    # stabilization crops/shifts the display, hiding text placed right at
+    # the frame edge most of the time.
+    if _launch_ts is not None:
+        _t_since = f"T+{now - _launch_ts:5.1f}s"
+        (_tw, _th), _ = cv2.getTextSize(_t_since, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.putText(frame, _t_since, (mw - _tw - 8 - 100, _th + 8 + 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
 
     # REC indicator — blinking dot + elapsed time (only when live-toggle recording is active)
     if _recording and _rec_start_time is not None:

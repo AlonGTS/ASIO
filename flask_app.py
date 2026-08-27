@@ -36,7 +36,7 @@ def box_size(mw, mh, moving):
     return _scaled_square(base, mw, mh)
 
 
-def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None, get_cpu_temp_fn=None, get_frame_history_fn=None, set_video_mode_fn=None, get_video_mode_fn=None):
+def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None, get_cpu_temp_fn=None, get_frame_history_fn=None, set_video_mode_fn=None, get_video_mode_fn=None, set_white_target_fn=None, get_white_target_fn=None):
     """
     Build and return the Flask app with all control routes bound to `state`.
     state is a SimpleNamespace with: command_from_remote, bbox, tracking,
@@ -274,6 +274,19 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
         except Exception as e:
             return f"Error: {e}", 400
 
+    @app.route('/set_white_target', methods=['POST'])
+    def set_white_target():
+        """Explicit GCS toggle: state=1 → white-target aim refinement/recovery
+        on, state=0 → plain bbox-center tracking (as before that feature)."""
+        if set_white_target_fn is None:
+            return "Not available in this mode", 400
+        try:
+            state_val = request.form.get("enabled")
+            set_white_target_fn(state_val == '1' if state_val is not None else True)
+            return "OK", 200
+        except Exception as e:
+            return f"Error: {e}", 400
+
     @app.route('/set_video_mode', methods=['POST'])
     def set_video_mode():
         """Live-switch the video transport: mode='jpeg_udp' or 'h264_udp'.
@@ -298,10 +311,12 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
         cpu_percent = get_cpu_fn()         if get_cpu_fn           else None
         cpu_temp    = get_cpu_temp_fn()    if get_cpu_temp_fn      else None
         video_mode  = get_video_mode_fn()  if get_video_mode_fn    else None
+        white_target = get_white_target_fn() if get_white_target_fn else False
         return jsonify({
             "launched": launched, "recording": recording,
             "active_fps": active_fps, "cpu_percent": cpu_percent,
             "cpu_temp": cpu_temp, "video_mode": video_mode,
+            "white_target": white_target,
         })
 
     @app.route('/cycle_lores', methods=['POST'])
