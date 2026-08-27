@@ -36,7 +36,7 @@ def box_size(mw, mh, moving):
     return _scaled_square(base, mw, mh)
 
 
-def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None, get_cpu_temp_fn=None, get_frame_history_fn=None, set_video_mode_fn=None, get_video_mode_fn=None, set_white_target_fn=None, get_white_target_fn=None):
+def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None, get_cpu_temp_fn=None, get_frame_history_fn=None, set_video_mode_fn=None, get_video_mode_fn=None, set_white_target_fn=None, get_white_target_fn=None, get_aim_phase_fn=None):
     """
     Build and return the Flask app with all control routes bound to `state`.
     state is a SimpleNamespace with: command_from_remote, bbox, tracking,
@@ -312,11 +312,12 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
         cpu_temp    = get_cpu_temp_fn()    if get_cpu_temp_fn      else None
         video_mode  = get_video_mode_fn()  if get_video_mode_fn    else None
         white_target = get_white_target_fn() if get_white_target_fn else False
+        aim_phase   = get_aim_phase_fn()   if get_aim_phase_fn    else "off"
         return jsonify({
             "launched": launched, "recording": recording,
             "active_fps": active_fps, "cpu_percent": cpu_percent,
             "cpu_temp": cpu_temp, "video_mode": video_mode,
-            "white_target": white_target,
+            "white_target": white_target, "aim_phase": aim_phase,
         })
 
     @app.route('/cycle_lores', methods=['POST'])

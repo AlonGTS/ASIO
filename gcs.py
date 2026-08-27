@@ -152,6 +152,7 @@ _local_recording = False  # GCS-side recording state
 _local_writer    = None   # cv2.VideoWriter when local recording is active
 cam_active      = False   # Pi camera fps state: False=idle (power-save), True=full fps
 white_target_enabled = False   # Pi-side white-target aim refinement/recovery on/off
+aim_phase       = "off"   # "off" | "blob" | "cross" — which detector is currently active, polled from /status
 _cpu_percent    = None    # Pi CPU usage %, polled from /status; None until first poll
 _cpu_temp_c     = None    # Pi SoC temperature °C, polled from /status; None until first poll
 _pi_tracking    = False   # Pi-side tracking state, polled from /status
@@ -753,9 +754,9 @@ def toggle_white_target():
 
 def _status_poller():
     """Background: poll /status every 2s to keep cam_active/_cpu_percent/_cpu_temp_c/
-    _pi_tracking/white_target_enabled fresh even when nothing else is triggering
-    a request (e.g. after Pi restarts)."""
-    global cam_active, _cpu_percent, _cpu_temp_c, _pi_tracking, white_target_enabled
+    _pi_tracking/white_target_enabled/aim_phase fresh even when nothing else is
+    triggering a request (e.g. after Pi restarts)."""
+    global cam_active, _cpu_percent, _cpu_temp_c, _pi_tracking, white_target_enabled, aim_phase
     while not _quit.is_set():
         data = _get("status")
         if data:
@@ -764,6 +765,7 @@ def _status_poller():
             _cpu_temp_c  = data.get("cpu_temp", _cpu_temp_c)
             _pi_tracking = data.get("tracking", _pi_tracking)
             white_target_enabled = data.get("white_target", white_target_enabled)
+            aim_phase    = data.get("aim_phase", aim_phase)
         time.sleep(2.0)
 
 threading.Thread(target=_status_poller, daemon=True).start()
@@ -1187,7 +1189,7 @@ def _build_buttons(vx: int):
 
     # ── White target mode ────────────────────────────────────────────────────
     btn(
-        lambda: "WHITE TARGET: ON" if white_target_enabled else "WHITE TARGET: OFF",
+        lambda: f"WHITE TARGET: {aim_phase.upper()}" if white_target_enabled else "WHITE TARGET: OFF",
         36, toggle_white_target,
         lambda: (30, 140, 50) if white_target_enabled else (90, 90, 30),
     )
