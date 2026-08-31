@@ -35,6 +35,7 @@ current mouse position, same as releasing a mouse-drag.
 import argparse
 import math
 import os
+import signal
 import socket
 import struct
 import sys
@@ -163,6 +164,16 @@ _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
 _press_on_video = False   # True from LBUTTONDOWN-on-video until release; commits select_point then
 _press_start_ts = 0.0     # time.time() when the press started; gates the zoom loupe's appearance
 _quit         = threading.Event()  # set to break the main loop from any thread
+
+def _handle_term_signal(signum, frame):
+    """SIGTERM/SIGINT (kill, Ctrl-C) → graceful shutdown via the normal
+    _quit path, so an in-progress local recording still gets its writer
+    released (finalizes the MP4's index) instead of being left corrupt.
+    Doesn't help against SIGKILL (kill -9) — nothing in-process can."""
+    _quit.set()
+
+signal.signal(signal.SIGTERM, _handle_term_signal)
+signal.signal(signal.SIGINT, _handle_term_signal)
 _confirm_quit = False             # True while the "are you sure?" overlay is shown
 _CONFIRM_YES  = None              # (x, y, w, h) of the Yes button in the overlay
 _CONFIRM_NO   = None              # (x, y, w, h) of the No  button in the overlay
@@ -1708,6 +1719,7 @@ class _FileCapture:
 def main():
     global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit, _frame_gen
     global cap, _gcs_video_mode
+    global _local_recording, _local_writer
 
     if args.file:
         cap = _FileCapture(args.file)
@@ -1900,6 +1912,16 @@ def main():
 
         if _quit.is_set():
             break
+
+    # Finalize any in-progress local recording — without this, quitting
+    # (window close, Q key, or an external kill/Ctrl-C now caught above)
+    # while still recording leaves the MP4 without its index, permanently
+    # unplayable rather than just missing its last few seconds.
+    if _local_writer is not None:
+        _local_writer.release()
+        _local_writer = None
+        _local_recording = False
+        print("[GCS] Local recording finalized on exit.")
 
     cv2.destroyAllWindows()
     print("[GCS] Bye.")
