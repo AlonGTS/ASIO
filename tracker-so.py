@@ -90,7 +90,14 @@ class TrackingQualityMonitor:
 
     SCORE_GOOD        = 0.60
     SCORE_UNCERTAIN   = 0.40
-    BAD_FRAMES_LIMIT  = 1      # 1 bad frame breaks tracking immediately
+    BAD_FRAMES_LIMIT  = 8      # consecutive bad frames required before treating this as real
+                                # drift — was 1 (a single noisy frame, e.g. compression artifact
+                                # or brief motion blur affecting the NCC/velocity/size gates,
+                                # triggered the FULL drift-recovery search: an unconstrained,
+                                # wider 2.5x-region fresh lookup with no stickiness at all). That
+                                # bypassed all the "require sustained evidence" tolerance already
+                                # applied to blob detection's own miss handling, since this is a
+                                # separate trigger. Same principle applied here now.
     _TMPL_SIZE        = (64, 64)   # canonical patch size for NCC
 
     def __init__(self):
@@ -727,26 +734,45 @@ def _refine_aim_point(frame, x, y, bw, bh, fallback_cx, fallback_cy, prev_point=
 
     if prev_point is not None:
         # Once locked onto something, proximity to where we were is the
-        # PRIMARY criterion — pick whichever qualifying candidate is closest
-        # to prev_point, not whichever is brightest. Brightness/contrast/size
-        # already qualified this pool above; ranking by brightness AGAIN here
-        # is what caused the flip-flop in the first place — two candidates
-        # close together (the real target + some incidental bright thing)
-        # would keep swapping places as whichever was marginally brighter
-        # changed frame to frame, even with a distance-based prefilter.
+        # ONLY criterion — pick whichever qualifying candidate is closest to
+        # prev_point, IF one is close enough. Brightness/contrast/size
+        # already qualified this pool above; ranking by brightness AGAIN
+        # here is what caused an early flip-flop bug — two candidates close
+        # together (the real target + some incidental bright thing) would
+        # keep swapping places as whichever was marginally brighter changed
+        # frame to frame.
+        #
+        # Deliberately no automatic "search for a replacement blob" of any
+        # kind — not a brightness override, not a delayed/confirmed
+        # escalation, nothing. Every version of that tried here caused a
+        # real, live jump onto the wrong thing (this feeds MAVLink guidance
+        # directly — an unsafe jump is unacceptable, not just cosmetic). If
+        # the tracked blob isn't near where it was, this always reports
+        # not-found; the caller already falls back to the plain CSRT box
+        # center in that case, which is exactly the reliable behavior plain
+        # tracking had before this refinement layer existed. The ONLY way
+        # to reacquire a genuinely different blob is the CSRT box naturally
+        # re-approaching the real target on its own (already reliable) so
+        # normal continuation finds it again nearby, or the operator
+        # manually re-selecting.
         pcx, pcy = prev_point
         max_jump = max(bw, bh) * _STICKY_MAX_JUMP_FRAC
         dists = [(i, math.hypot(x + centroids[i][0] - pcx, y + centroids[i][1] - pcy))
                  for i, _ in candidates]
         nearest_idx, nearest_dist = min(dists, key=lambda t: t[1])
-        if nearest_dist <= max_jump:
-            best_idx = nearest_idx
-        else:
-            # Nothing plausible near the last position (real jump, or first
-            # lock after a gap) — fall back to brightest overall.
-            best_idx, _ = max(candidates, key=lambda t: t[1])
+        if nearest_dist > max_jump:
+            return fallback_cx, fallback_cy, False
+        best_idx = nearest_idx
     else:
-        best_idx, _ = max(candidates, key=lambda t: t[1])
+        # No prev_point (first-ever lock, e.g. right after a manual click):
+        # pick whichever qualifying candidate is closest to the box's own
+        # center, not the brightest one anywhere in the box — the box was
+        # just placed/initialized right on the intended target, so its
+        # center is the trustworthy anchor even here.
+        best_idx = min(
+            (i for i, _ in candidates),
+            key=lambda i: math.hypot(x + centroids[i][0] - fallback_cx,
+                                      y + centroids[i][1] - fallback_cy))
     cx_i, cy_i = centroids[best_idx]
     return x + int(round(cx_i)), y + int(round(cy_i)), True
 
@@ -768,7 +794,20 @@ def _find_cross_centroid(frame, x, y, bw, bh, fallback_cx, fallback_cy):
     """Return (cx, cy, found) — the centroid of a dark "+"-shaped mark found
     within the bright sheet inside bbox (x,y,bw,bh), or (fallback_cx,
     fallback_cy, False) if no sheet-like region or no confidently-present
-    mark is found this frame."""
+    mark is found this frame.
+
+    Deliberately no prev_point/stickiness gate here (unlike
+    _refine_aim_point, which uses one to pick among several bright-blob
+    CANDIDATES) — this function computes a single deterministic result via
+    Otsu + connected components, so a hard, memory-less per-frame proximity
+    veto here doesn't add real selection value; it only adds a second
+    rejection path stacked on top of the caller's own confirm-streak jump
+    protection. Tried once: an intermittent reject (plausible near the fast,
+    changing final approach) breaks the confirm-streak's 2-consecutive-frame
+    requirement before it can ever accumulate, freezing the displayed aim
+    point at a stale position while the box keeps tracking correctly around
+    it — worse than the one-off bad pick it was meant to catch. The
+    caller's confirm-streak alone is the single source of jump protection."""
     if bw < 6 or bh < 6:
         return fallback_cx, fallback_cy, False
     crop = frame[y:y + bh, x:x + bw]
@@ -1341,25 +1380,22 @@ _log_session_id = 0            # increments on every new tracker instance
 _log_session_source = "unknown"      # why the current session started — see state.last_init_source
 _log_prev_cx = _log_prev_cy = None   # previous frame's MAIN-coord center, for jump distance
 
-# Independent drift signal: the correlation tracker's own quality score only
-# checks "does this still look like what I saw last frame" — a smooth lock
-# onto the wrong thing (e.g. rocks/clutter that happens to look self-similar
-# frame to frame) can pass that check indefinitely while still being wrong.
-# Since the actual target is known to be a bright/white blob (or, close
-# range, a dark cross within one), treat "nothing found in or near the box
-# for many consecutive frames" as drift too, even when the tracker's own
-# score looks fine.
-_no_aim_streak     = 0
-_NO_AIM_DRIFT_LIMIT = 10   # consecutive not-found frames before treating this as drift
-
 _blob_center_countdown = 0   # frames left until the next periodic re-center-on-blob
 _BLOB_CENTER_EVERY_N_FRAMES = 15   # how often to resync the box onto the blob, in frames
 
-_aim_smooth = None   # (cx, cy) EMA of the aim point in MAIN coords; None until first found
-_AIM_SMOOTH_ALPHA = 0.35   # higher = more responsive/less smooth, lower = smoother/more lag
-_AIM_SMOOTH_SNAP_FRAC = 0.25   # jump beyond this fraction of box size = real motion, snap
-                                # to it immediately instead of easing (avoids lagging the
-                                # smoothed point outside a fast-moving target)
+_aim_smooth = None   # (cx, cy) last-accepted aim point in MAIN coords; None until first found
+_AIM_SMOOTH_SNAP_FRAC = 0.25   # jump beyond this fraction of box size = candidate "real motion",
+                                # needs confirmation below before actually snapping to it
+_AIM_SMOOTH_SNAP_CONFIRM_N = 2   # a big jump must repeat this many consecutive frames (each
+                                   # frame just needs to stay far from the stale smoothed point,
+                                   # not match any particular new spot — real motion keeps moving)
+                                   # before it's trusted enough to move the displayed/guidance
+                                   # point — a single-frame jump (a one-off wrong candidate pick,
+                                   # box unchanged) is far more common than genuine one-frame
+                                   # teleportation, and snapping to it instantly sends a real, if
+                                   # brief, wrong MAVLink vector. An unconfirmed jump simply holds
+                                   # the last good point steady for that one frame instead.
+_aim_jump_streak = 0
 
 _launch_ts   = None    # time.time() of the False→True launch edge; None until launched
 _was_launched = False  # previous frame's launched state, to detect that edge
@@ -1460,8 +1496,8 @@ while True:
         _log_session_id += 1
         _log_session_source = state.last_init_source or "unknown"
         _log_prev_cx = _log_prev_cy = None
-        _no_aim_streak = 0
         _aim_smooth = None
+        _aim_jump_streak = 0
 
     if state.tracking and state.tracker is not None:
         try:
@@ -1513,20 +1549,53 @@ while True:
                     if _wt_close_range:
                         aim_cx, aim_cy, _aim_found = _find_cross_centroid(frame, x, y, bw, bh, cx, cy)
                     else:
+                        # prev_point is the CSRT box's own LIVE center (cx, cy),
+                        # recomputed fresh every frame — not the frozen last-
+                        # refined point. CSRT keeps tracking reliably on its own
+                        # even while the white blob isn't confidently found, so
+                        # anchoring to its current (moving) position means the
+                        # moment the blob becomes visible again anywhere near
+                        # wherever CSRT currently is, it's picked back up
+                        # immediately — no staleness, no escalation delay. A
+                        # frozen anchor (the previous design) could drift away
+                        # from the live box over a gap and never re-catch it.
                         aim_cx, aim_cy, _aim_found = _refine_aim_point(
-                            frame, x, y, bw, bh, cx, cy, prev_point=_aim_smooth)
-                    _no_aim_streak = 0 if _aim_found else _no_aim_streak + 1
+                            frame, x, y, bw, bh, cx, cy, prev_point=(cx, cy))
 
                     # Periodically resync the tracker's own box onto the aim point —
                     # same reinit approach as flask_app.py's /nudge endpoint (shift
                     # bbox position, keep its size, reinit the tracker there), but
                     # only every _BLOB_CENTER_EVERY_N_FRAMES frames, not continuously
                     # — a fixed, simple cadence rather than continuously second-
-                    # guessing an otherwise-healthy track.
+                    # guessing an otherwise-healthy track. Deliberately reuses the
+                    # already-computed sticky aim_cx/aim_cy here — NOT a fresh,
+                    # memoryless re-search — matching the actual design intent:
+                    # keep tracking the same blob and never reconsider other
+                    # candidates while it's still valid; only _refine_aim_point's
+                    # own fallback (nothing qualifying left near the last
+                    # position) should ever trigger a search for a different one.
+                    # An earlier version deliberately took a fresh look at this
+                    # checkpoint to self-correct a stuck-on-the-wrong-blob lock —
+                    # that traded one bug for another (a single noisy frame at
+                    # the checkpoint could now cause a real, if brief, wrong
+                    # jump), so it's removed.
                     _blob_center_countdown -= 1
                     if _blob_center_countdown <= 0:
                         _blob_center_countdown = _BLOB_CENTER_EVERY_N_FRAMES
-                        if _aim_found and (aim_cx != cx or aim_cy != cy):
+                        # Only trust a found candidate enough to actually MOVE
+                        # the box when the underlying CSRT tracker's own
+                        # confidence is currently good — not just "uncertain,
+                        # still sending" (orange). The search is anchored to
+                        # the box's own live center, so if that anchor is
+                        # already shaky (CSRT starting to waver), a found
+                        # candidate near it is exactly as likely to be
+                        # reinforcing a mistake as correcting one. Uses last
+                        # frame's score (this frame's isn't computed yet at
+                        # this point in the loop) — a one-frame-old read is
+                        # still a good enough proxy; quality doesn't swing
+                        # that fast frame to frame.
+                        if (_aim_found and (aim_cx != cx or aim_cy != cy)
+                                and _tq_monitor.score >= TrackingQualityMonitor.SCORE_GOOD):
                             nx = max(0, min(mw - bw, aim_cx - bw // 2))
                             ny = max(0, min(mh - bh, aim_cy - bh // 2))
                             xb = int(nx * sx_m2l); yb = int(ny * sy_m2l)
@@ -1544,35 +1613,50 @@ while True:
                             _log_session_source = "aim_center"
                             _log_prev_cx = _log_prev_cy = None
 
-                    # Smooth the aim point so small frame-to-frame noise is
-                    # damped, WITHOUT lagging behind real fast motion (e.g. a
-                    # fast approach/descent shifting the target a lot between
-                    # frames): plain exponential smoothing always trails by a
-                    # proportional gap, which — under fast real motion — can
-                    # leave the smoothed point outside the target entirely
-                    # while the raw detection is still correctly on it. So:
-                    # ease toward small moves, but SNAP straight to the raw
-                    # point once it has moved far enough to be real motion
-                    # rather than noise, instead of easing toward it too.
+                    # Track the raw aim point directly (no exponential lag) so
+                    # it never trails behind sustained real motion — e.g. the
+                    # camera/target panning steadily to one side: CSRT's own
+                    # box has no lag since it isn't smoothed, so a laggy aim
+                    # point visibly drifts away from an on-target box even
+                    # though nothing is actually wrong. The only thing worth
+                    # filtering is a single-frame OUTLIER (a one-off wrong
+                    # candidate pick while the box itself doesn't move) — a
+                    # big jump only counts once it repeats for
+                    # _AIM_SMOOTH_SNAP_CONFIRM_N consecutive frames (each
+                    # frame just needs to stay far from the last accepted
+                    # point, not match any particular new spot — real motion
+                    # keeps moving frame to frame, it doesn't hold still).
+                    # An unconfirmed jump holds the last good point steady for
+                    # that one frame; everything else (including sustained
+                    # motion, once confirmed) tracks the raw point instantly.
                     if _aim_found:
                         if _aim_smooth is None:
                             _aim_smooth = (aim_cx, aim_cy)
+                            _aim_jump_streak = 0
                         else:
                             _jump = math.hypot(aim_cx - _aim_smooth[0], aim_cy - _aim_smooth[1])
                             if _jump > _AIM_SMOOTH_SNAP_FRAC * max(bw, bh):
-                                _aim_smooth = (aim_cx, aim_cy)   # real motion — don't lag behind it
+                                _aim_jump_streak += 1
+                                if _aim_jump_streak >= _AIM_SMOOTH_SNAP_CONFIRM_N:
+                                    _aim_smooth = (aim_cx, aim_cy)   # confirmed real motion — snap
+                                    _aim_jump_streak = 0
+                                # else: not yet confirmed — _aim_smooth deliberately NOT
+                                # updated this frame, holding the last good point steady
                             else:
-                                _aim_smooth = (
-                                    _AIM_SMOOTH_ALPHA * aim_cx + (1 - _AIM_SMOOTH_ALPHA) * _aim_smooth[0],
-                                    _AIM_SMOOTH_ALPHA * aim_cy + (1 - _AIM_SMOOTH_ALPHA) * _aim_smooth[1],
-                                )
+                                _aim_smooth = (aim_cx, aim_cy)   # small move — track it directly, no lag
+                                _aim_jump_streak = 0
                         aim_cx, aim_cy = int(round(_aim_smooth[0])), int(round(_aim_smooth[1]))
-                    elif _aim_smooth is not None:
-                        aim_cx, aim_cy = int(round(_aim_smooth[0])), int(round(_aim_smooth[1]))
+                    # else: refinement found nothing this frame — aim_cx/aim_cy
+                    # already ARE the plain CSRT bbox center (cx, cy), the
+                    # fallback the detector itself returned. Don't hold a stale
+                    # smoothed point here: the CSRT tracker is still live and
+                    # its current center is a better, up-to-date fallback than
+                    # a point from several frames ago. This also means a
+                    # refinement miss never breaks lock on its own — only the
+                    # CSRT tracker's own quality score (below) can do that.
                 else:
                     aim_cx, aim_cy = cx, cy
                     _aim_found = False
-                    _no_aim_streak = 0
 
                 # Tracking quality: init on first frame, update on all subsequent ones
                 if _tq_needs_init:
@@ -1600,13 +1684,27 @@ while True:
                     _tq_monitor.bad_frames = 0   # good frame resets the counter
                 _bad_frames_for_log = _tq_monitor.bad_frames   # snapshot before a drift reset zeroes it
 
-                _no_aim_drift = _no_aim_streak >= _NO_AIM_DRIFT_LIMIT
-                _drift_event = (_tq_monitor.bad_frames >= TrackingQualityMonitor.BAD_FRAMES_LIMIT
-                                 or _no_aim_drift)
-                if _drift_event and not _wt_active:
-                    # White-target mode off → behave exactly as before any of
-                    # this existed: give up immediately, no search-based
-                    # recovery attempt.
+                # Drift is judged SOLELY by the CSRT tracker's own quality score
+                # (frame-to-frame self-consistency/velocity/size gates) — a
+                # refinement (blob/cross) miss never breaks lock on its own,
+                # since the CSRT box can still be correctly tracking the target
+                # even while the refinement layer briefly can't confirm a clean
+                # aim point within it (glare, a shadow, a rotation it doesn't
+                # like this frame). See the aim-smoothing block above: a miss
+                # there just falls back to the CSRT box's own current center.
+                _drift_event = _tq_monitor.bad_frames >= TrackingQualityMonitor.BAD_FRAMES_LIMIT
+                if _drift_event:
+                    # Always give up cleanly and ask the operator to re-select —
+                    # exactly the pre-white-target-mode behavior. An earlier
+                    # version tried auto-recovery here (search a bounded region
+                    # and relock automatically), but that risked locking onto
+                    # an unrelated bright object (measured on real footage: a
+                    # rock/crack cluster's contrast can be as high as, or
+                    # higher than, the real target's — brightness/contrast
+                    # alone can't reliably tell them apart in this terrain).
+                    # Since plain CSRT tracking never needed auto-recovery to
+                    # be reliable, don't guess here either — only an operator
+                    # confirming a new selection counts as valid reacquisition.
                     print(f"[TQ]   Drift detected ({_tq_monitor.bad_frames} bad frames, "
                           f"score={tq:.2f}) — tracking broken, re-select target")
                     state.tracking = False
@@ -1614,59 +1712,6 @@ while True:
                     _tq_monitor.reset()
                     cv2.putText(frame, "Drift — re-select target", (10, 140),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                elif _drift_event:
-                    _reason = (f"{_tq_monitor.bad_frames} bad frames, score={tq:.2f}"
-                               if not _no_aim_drift else
-                               f"nothing found for {_no_aim_streak} frames (tracker score still fine)")
-                    print(f"[TQ]   Drift detected ({_reason}) — searching nearby for target...")
-                    # Attempt automatic recovery: search a BOUNDED region around the
-                    # lost box (not the whole frame — an unbounded search risks locking
-                    # onto an unrelated bright object elsewhere in view, which would
-                    # steer real flight control toward the wrong thing) for the target,
-                    # and if found, reinit the tracker there instead of giving up. Only
-                    # runs on CONFIRMED drift — a still-valid track is never
-                    # second-guessed by this (that caused a worse bug previously: a
-                    # single noisy blob detection relocating a box that was fine).
-                    # Close range: try cross detection first (that's what's actually
-                    # reliable at this range), falling back to blob detection only
-                    # if that also fails.
-                    _SEARCH_EXPAND = 2.5
-                    ex_w = min(mw, int(bw * _SEARCH_EXPAND))
-                    ex_h = min(mh, int(bh * _SEARCH_EXPAND))
-                    ex_x = max(0, min(mw - ex_w, cx - ex_w // 2))
-                    ex_y = max(0, min(mh - ex_h, cy - ex_h // 2))
-                    if _wt_close_range:
-                        _rx, _ry, _rfound = _find_cross_centroid(frame, ex_x, ex_y, ex_w, ex_h, cx, cy)
-                        if not _rfound:
-                            _rx, _ry, _rfound = _refine_aim_point(frame, ex_x, ex_y, ex_w, ex_h, cx, cy)
-                    else:
-                        _rx, _ry, _rfound = _refine_aim_point(frame, ex_x, ex_y, ex_w, ex_h, cx, cy)
-                    if _rfound:
-                        nx = max(0, min(mw - bw, _rx - bw // 2))
-                        ny = max(0, min(mh - bh, _ry - bh // 2))
-                        xb = int(nx * sx_m2l); yb = int(ny * sy_m2l)
-                        wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
-                        state.tracker = create_gts_tracker(state.bMoovingTgt)
-                        state.tracker.init(lores_frame, (xb, yb, wb, hb))
-                        state.last_init_source = "drift_recovery"
-                        state.bbox = (nx, ny, bw, bh)
-                        _last_tracker_id = id(state.tracker)
-                        _tq_needs_init   = True
-                        _tq_monitor.reset()
-                        _log_session_id += 1
-                        _log_session_source = "drift_recovery"
-                        _log_prev_cx = _log_prev_cy = None
-                        _no_aim_streak = 0
-                        _aim_smooth = None
-                        print(f"[TQ]   Recovered onto target near ({_rx}, {_ry})")
-                    else:
-                        print("[TQ]   Nothing found nearby — tracking broken, re-select target")
-                        state.tracking = False
-                        state.tracker  = None
-                        _tq_monitor.reset()
-                        # Skip the rest of the draw block — show lost message instead
-                        cv2.putText(frame, "Drift — re-select target", (10, 140),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 else:
                     # Only drive the drone when quality is sufficient
                     if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:

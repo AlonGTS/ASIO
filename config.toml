@@ -21,7 +21,7 @@ max_bb_height = 120
 # to take over. 0 = never switch (stays on blob detection for the whole
 # flight). Tune to your typical launch-to-touchdown flight duration, with a
 # few seconds of margin before blob detection actually starts going wrong.
-white_target_close_range_after_s = 12
+white_target_close_range_after_s = 14
 
 # Close-range dark-cross detection tunables (see _find_cross_centroid in
 # tracker-so.py) — the cross must cover between these two fractions of the
@@ -99,7 +99,7 @@ h264_gop_seconds  = 0.5    # I-frame interval (~15 frames @ 30fps feed, less at 
 h264_rtp_payload  = 1200   # max NAL bytes per UDP/RTP packet — keeps packets MTU-safe (no IP fragmentation)
 
 [network.wlan0]
-bind_ip = "192.168.1.35"
+bind_ip = "192.168.1.36"
 # gcs_ip no longer needed — Pi learns GCS IP dynamically from heartbeat packets
 
 [network.wlan1]

@@ -126,19 +126,34 @@ PANEL_W     = 210     # right-side button panel width  (px)
 PANEL_MIN_H = 870     # minimum canvas height so all buttons fit (was 826 — +44 for the WHITE TARGET button)
 
 def _screen_display_width(panel_w, fallback=1200):
-    """Video display width sized to fill most of the screen at startup —
-    cv2's own window (WINDOW_AUTOSIZE) always matches the rendered canvas
-    size exactly, so picking a big DISPLAY_W here is what makes the window
-    open large instead of needing a manual resize. Falls back to the old
-    fixed width if the screen size can't be read (e.g. no display attached)."""
+    """Video display width sized to fill as much of the screen as possible
+    at startup — cv2's own window (WINDOW_AUTOSIZE) always matches the
+    rendered canvas size exactly, so picking a big DISPLAY_W here is what
+    makes the window open large instead of needing a manual resize.
+
+    Bounded by BOTH screen dimensions, not just width: the video's height is
+    derived from DISPLAY_W via the stream's own aspect ratio (gcs.py's main
+    loop resizes to (DISPLAY_W, dh)), which isn't known yet this early (no
+    frame has arrived) — sizing by width alone risks a window taller than
+    the actual screen for a narrower/taller stream. Assumes a conservative
+    worst-case aspect ratio matching this project's tallest configured
+    camera mode (4:3, config.toml's main_sizes) so the window fits
+    vertically regardless of which resolution ends up streaming.
+
+    Falls back to the old fixed width if the screen size can't be read
+    (e.g. no display attached)."""
     try:
         import tkinter as _tk
         _root = _tk.Tk()
         _root.withdraw()
-        sw = _root.winfo_screenwidth()
+        sw, sh = _root.winfo_screenwidth(), _root.winfo_screenheight()
         _root.destroy()
-        # Margin for OS chrome (menu bar/dock/title bar) plus the button panel.
-        return max(640, sw - panel_w - 60)
+        # Margin for OS chrome (menu bar/dock/title bar).
+        avail_w = sw - panel_w - 60
+        avail_h = sh - 100
+        _WORST_CASE_ASPECT_H_OVER_W = 0.76   # 4:3 (~0.75), this project's tallest configured mode
+        width_from_h = avail_h / _WORST_CASE_ASPECT_H_OVER_W
+        return max(640, min(avail_w, int(width_from_h)))
     except Exception:
         return fallback
 
