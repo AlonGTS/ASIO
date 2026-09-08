@@ -608,9 +608,23 @@ def _cpu_monitor():
 Thread(target=_cpu_monitor, daemon=True).start()
 
 
-# Precomputed FOV constants (avoid recomputing math.radians every frame)
-_HFOV_RAD = math.radians(60)   # ~60° horizontal FOV
+# Precomputed FOV constants (avoid recomputing math.radians every frame).
+# _VFOV_RAD is the calibrated anchor (~45° vertical FOV); _HFOV_RAD is derived
+# from it via the current capture aspect ratio (mw/mh) rather than hardcoded,
+# since main_size's aspect ratio varies across the resolution options in
+# config.toml's [camera] main_sizes (e.g. 4:3 vs 16:9 vs a custom crop like
+# 1920x720) — without this, delta_x and delta_y would represent different
+# degrees-per-normalized-unit and a single downstream gain (see
+# tracker-so.py's _mav_x/_mav_y → mavlink_client.send_vision_error, which the
+# MAHAT flight-control app applies one gain to for both axes) would over- or
+# under-correct yaw relative to pitch. Recomputed on every resolution change
+# in the main loop below (see _cached_dims).
 _VFOV_RAD = math.radians(45)   # ~45° vertical FOV
+# yaw_norm = norm_dx / (_HFOV_RAD/2) uses the SAME base scale as pitch_norm
+# (i.e. as if FOV were 1:1), then the aspect ratio (mw/mh) multiplies the
+# result up — dividing _VFOV_RAD by the aspect ratio here achieves that in
+# one step: norm_dx/((_VFOV_RAD/aspect)/2) == [norm_dx/(_VFOV_RAD/2)] * aspect.
+_HFOV_RAD = _VFOV_RAD / (main_size[0] / main_size[1])
 
 # PX4 rate-mode gain — px4 mode only, does not touch custom mode's _mav_x/_mav_y.
 # _px4_pitch_err/_px4_yaw_err are sent as body-RATE setpoints (see
@@ -1451,6 +1465,10 @@ while True:
         sx_m2l = lw / mw; sy_m2l = lh / mh
         sx_l2m = mw / lw; sy_l2m = mh / lh
         _cached_dims = (mw, mh, lw, lh)
+
+        # Aspect ratio changed with resolution — rederive HFOV from the fixed
+        # VFOV anchor so yaw/pitch stay on the same degrees-per-unit scale.
+        _HFOV_RAD = _VFOV_RAD / (mw / mh)
 
         # Reinit tracker at new resolution to prevent tracking point drift
         if state.tracking and state.tracker is not None and state.bbox is not None and old_mw > 0:
