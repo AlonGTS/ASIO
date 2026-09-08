@@ -479,7 +479,17 @@ def _reader_live_picam():
     global picam2
     print("[INFO] Live reader started (PiCamera2)")
     while not _stop_reader.is_set():
-        frame = picam2.capture_array()
+        try:
+            frame = picam2.capture_array()
+        except Exception as e:
+            # Expected when _restart_reader_live() stops the camera to unblock
+            # this exact call (see there) — exit quietly. Anything else, log
+            # and keep going rather than let an unhandled exception silently
+            # kill this thread (no more frames, no visible error anywhere).
+            if _stop_reader.is_set():
+                break
+            print(f"[LIVE] capture_array error: {e}")
+            continue
         if frame is None:
             continue
         with frame_ready:
@@ -489,13 +499,28 @@ def _reader_live_picam():
             frame_ready.notify_all()
         with _frame_history_lock:
             _frame_history.append((gen, frame))
+    print("[INFO] Live reader stopped")
 
 def _restart_reader_live():
     """Stop live reader, reinit camera (for new MAIN size), and restart reader."""
     global _reader_thread
     _stop_reader.set()
+    # Stop the camera BEFORE joining, not after — the reader thread is very
+    # likely blocked inside picam2.capture_array() right now (it can legitimately
+    # take longer than any short join timeout, e.g. at idle FPS), and nothing
+    # else unblocks that call. Without this, a timed-out join used to let
+    # _init_live_camera() below stop/close/reconfigure the SAME camera object
+    # out from under that still-in-flight capture — an unsafe race that could
+    # hang the whole libcamera pipeline instead of raising a catchable error
+    # (observed as: GCS resolution change → video/control link stops
+    # responding entirely, not just failing to reconfigure).
+    if picam2 is not None:
+        try:
+            picam2.stop()
+        except Exception:
+            pass
     if _reader_thread and _reader_thread.is_alive():
-        _reader_thread.join(timeout=1.0)
+        _reader_thread.join(timeout=2.0)
     _stop_reader.clear()
     _init_live_camera()
     _reader_thread = Thread(target=_reader_live_picam, daemon=True)
