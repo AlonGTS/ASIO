@@ -81,9 +81,27 @@ def _load_video_mode():
             pass
     return "jpeg_udp"
 
+def _load_flask_port():
+    """Must match tracker-so.py's own [network] flask_port — a hardcoded
+    default here silently drifts from whatever the Pi is actually bound to
+    (e.g. config.toml sets 5050 to dodge macOS AirPlay squatting the default
+    5000 for local testing), leaving /status calls hitting a dead port with
+    no visible error — CPU/temp and everything else in the panel just goes
+    blank with no explanation."""
+    cfg_path = Path(__file__).parent / "config.toml"
+    if cfg_path.exists():
+        try:
+            import tomllib
+            with open(cfg_path, "rb") as f:
+                cfg = tomllib.load(f)
+            return cfg["network"].get("flask_port", 5000)
+        except Exception:
+            pass
+    return 5000
+
 parser = argparse.ArgumentParser(description="Mahat GCS client")
 parser.add_argument("--pi",   default=None,  help="Pi IP (overrides config.toml)")
-parser.add_argument("--port", type=int, default=5000, help="Flask API port  (default 5000)")
+parser.add_argument("--port", type=int, default=None, help="Flask API port (overrides config.toml, default 5000)")
 parser.add_argument("--udp",  type=int, default=5600, help="UDP video port  (default 5600)")
 parser.add_argument("--file", default=None,
                      help="Play a local video file instead of connecting to a Pi "
@@ -92,7 +110,7 @@ parser.add_argument("--file", default=None,
 args = parser.parse_args()
 
 PI_IP    = args.pi or _load_toml() or "192.168.1.100"
-FLASK    = f"http://{PI_IP}:{args.port}"
+FLASK    = f"http://{PI_IP}:{args.port if args.port is not None else _load_flask_port()}"
 UDP_PORT = args.udp
 
 CMD_PORT = 5601
