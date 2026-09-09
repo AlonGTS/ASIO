@@ -22,6 +22,8 @@ import socket
 import struct
 import subprocess
 import sys
+import platform
+import shutil
 import tomllib
 from pathlib import Path
 
@@ -29,32 +31,68 @@ _HERE = Path(__file__).parent
 import argparse
 from datetime import datetime
 import tkinter as tk
-from tkinter import simpledialog
+from tkinter import filedialog, simpledialog
 
 import webrtc_server
 from gts_tracker import GTSTracker
 
 
 def _choose_video_file():
-    """Native macOS file picker via AppleScript, run in a completely
-    separate `osascript` process — deliberately NOT Tkinter. A Tk dialog
-    launched from a process VS Code's debugger spawned proved unreliable in
-    practice (the GCS window went unresponsive, spinning-cursor beachball,
-    clicks not registering) — likely a focus/window-server interaction
-    specific to how debugpy launches its debuggee. Running the dialog in an
-    unrelated process sidesteps that outright, and this process never
-    touches Tk/Cocoa itself, so it also doesn't get registered as a second,
+    """Native file picker, platform-dependent.
+
+    On macOS this shells out to AppleScript in a completely separate
+    `osascript` process — deliberately NOT Tkinter. A Tk dialog launched
+    from a process VS Code's debugger spawned proved unreliable in practice
+    (the GCS window went unresponsive, spinning-cursor beachball, clicks not
+    registering) — likely a focus/window-server interaction specific to how
+    debugpy launches its debuggee. Running the dialog in an unrelated
+    process sidesteps that outright, and this process never touches
+    Tk/Cocoa itself, so it also doesn't get registered as a second,
     unlabeled "Python" app in the Dock for the rest of its life the way
-    even a destroyed Tk window does."""
+    even a destroyed Tk window does.
+
+    Elsewhere (e.g. the Raspberry Pi) there's no debugpy/Cocoa interaction
+    to dodge, so we use zenity/kdialog if present and fall back to Tkinter.
+    """
+    if platform.system() == "Darwin":
+        try:
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'POSIX path of (choose file of type {"avi","mp4","mov","mkv"} '
+                 'with prompt "Select video file")'],
+                capture_output=True, text=True, timeout=120,
+            )
+            path = result.stdout.strip()
+            return path if path and result.returncode == 0 else None
+        except Exception as e:
+            print(f"[ERROR] File picker failed: {e}")
+            return None
+
+    for tool, cmd in (
+        ("zenity", ["zenity", "--file-selection",
+                     "--title=Select video file",
+                     "--file-filter=Video | *.avi *.mp4 *.mov *.mkv"]),
+        ("kdialog", ["kdialog", "--getopenfilename", ".",
+                      "*.avi *.mp4 *.mov *.mkv|Video files"]),
+    ):
+        if shutil.which(tool):
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                path = result.stdout.strip()
+                return path if path and result.returncode == 0 else None
+            except Exception as e:
+                print(f"[ERROR] File picker ({tool}) failed: {e}")
+                return None
+
     try:
-        result = subprocess.run(
-            ["osascript", "-e",
-             'POSIX path of (choose file of type {"avi","mp4","mov","mkv"} '
-             'with prompt "Select video file")'],
-            capture_output=True, text=True, timeout=120,
+        root = tk.Tk()
+        root.withdraw()
+        path = filedialog.askopenfilename(
+            title="Select video file",
+            filetypes=[("Video files", "*.avi *.mp4 *.mov *.mkv")],
         )
-        path = result.stdout.strip()
-        return path if path and result.returncode == 0 else None
+        root.destroy()
+        return path or None
     except Exception as e:
         print(f"[ERROR] File picker failed: {e}")
         return None
@@ -1415,6 +1453,22 @@ while True:
             frame = state.current_frame.copy()
             _last_frame_gen = state.frame_gen
 
+    # Handle remote commands every iteration — independent of whether a new
+    # frame arrived, so a remote 'q' still works once frame reads stall
+    # (e.g. after file playback ends and the reader thread stops producing
+    # new frames; without this the block below never runs and the process
+    # never sees the quit request).
+    if state.command_from_remote == 'r':
+        state.tracking = False; state.bbox = None; state.tracker = None
+        print("[INFO] Tracker reset from remote")
+        state.command_from_remote = None
+    elif state.command_from_remote == 's':
+        state.tracking = False
+        state.command_from_remote = None
+    elif state.command_from_remote == 'q':
+        print("[INFO] Quit requested from remote")
+        break
+
     if frame is None:
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -1471,18 +1525,6 @@ while True:
             state.tracker = new_tracker
             state.bbox = (x0, y0, bw, bh)
             print(f"[INFO] Tracker reinitialized after resolution change: MAIN {mw}x{mh} LORES {lw}x{lh}")
-
-    # Handle commands
-    if state.command_from_remote == 'r':
-        state.tracking = False; state.bbox = None; state.tracker = None
-        print("[INFO] Tracker reset from remote")
-        state.command_from_remote = None
-    elif state.command_from_remote == 's':
-        state.tracking = False
-        state.command_from_remote = None
-    elif state.command_from_remote == 'q':
-        print("[INFO] Quit requested from remote")
-        break
 
     # Tracking on LORES (lores_frame computed above, before dims check)
     _mav_x, _mav_y = 100.0, 100.0  # sentinel: not tracking ("custom" mode)
