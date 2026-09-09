@@ -671,31 +671,46 @@ def _cpu_monitor():
 Thread(target=_cpu_monitor, daemon=True).start()
 
 
+def _vfov_for_aspect(mw, mh):
+    """Camera Module 3 vertical FOV for a given capture aspect ratio.
+
+    Calibrated (datasheet) anchors for the two aspect-ratio families used in
+    config.toml's [camera] main_sizes: 49° VFOV at 4:3, 40° VFOV at 16:9.
+    Any other aspect ratio falls back to the pinhole-lens approximation
+    (tan(HFOV/2) = aspect * tan(VFOV/2)) anchored to the fixed 66° HFOV.
+    """
+    aspect = mw / mh
+    if abs(aspect - 4 / 3) < 0.05:
+        return math.radians(49)
+    if abs(aspect - 16 / 9) < 0.05:
+        return math.radians(40)
+    return 2 * math.atan(math.tan(math.radians(66) / 2) / aspect)
+
+
 # Precomputed FOV constants (avoid recomputing math.radians every frame).
-# _VFOV_RAD is the calibrated anchor (~45° vertical FOV); _HFOV_RAD is derived
-# from it via the current capture aspect ratio (mw/mh) rather than hardcoded,
-# since main_size's aspect ratio varies across the resolution options in
-# config.toml's [camera] main_sizes (e.g. 4:3 vs 16:9 vs a custom crop like
-# 1920x720) — without this, delta_x and delta_y would represent different
-# degrees-per-normalized-unit and a single downstream gain (see
+# Camera Module 3's horizontal FOV is fixed by the lens/sensor at 66°
+# regardless of aspect ratio — only the vertical FOV changes, because the
+# different aspect-ratio modes crop sensor rows (not columns). VFOV is
+# therefore derived from the fixed HFOV anchor via the current capture
+# aspect ratio (mw/mh) rather than hardcoded, since main_size's aspect ratio
+# varies across the resolution options in config.toml's [camera] main_sizes
+# (e.g. 4:3 vs 16:9) — without this, delta_x and delta_y would represent
+# different degrees-per-normalized-unit and a single downstream gain (see
 # tracker-so.py's _mav_x/_mav_y → mavlink_client.send_vision_error, which the
 # MAHAT flight-control app applies one gain to for both axes) would over- or
 # under-correct yaw relative to pitch. Recomputed on every resolution change
 # in the main loop below (see _cached_dims).
-_VFOV_RAD = math.radians(45)   # ~45° vertical FOV
-# yaw_norm = norm_dx / (_HFOV_RAD/2) uses the SAME base scale as pitch_norm
-# (i.e. as if FOV were 1:1), then the aspect ratio (mw/mh) multiplies the
-# result up — dividing _VFOV_RAD by the aspect ratio here achieves that in
-# one step: norm_dx/((_VFOV_RAD/aspect)/2) == [norm_dx/(_VFOV_RAD/2)] * aspect.
-_HFOV_RAD = _VFOV_RAD / (main_size[0] / main_size[1])
+_HFOV_RAD = math.radians(66)   # fixed — Camera Module 3 horizontal FOV
+_VFOV_RAD = _vfov_for_aspect(*main_size)
 
 # PX4 rate-mode gain — px4 mode only, does not touch custom mode's _mav_x/_mav_y.
 # _px4_pitch_err/_px4_yaw_err are sent as body-RATE setpoints (see
 # mavlink_client.send_attitude_target), but their raw FOV-derived value tops
-# out at the frame edge around ±22.5° (pitch) / ±30° (yaw) — nowhere near a
-# meaningful rate. This gain scales that up so a target pinned at the frame
-# edge commands ~100°/s on the larger (yaw) axis; MAX_ANGLE in
-# mavlink_client.py still clamps above that as a hard ceiling.
+# out at the frame edge around ±33° (yaw, fixed HFOV/2) / ±24.5° or ±20°
+# (pitch, VFOV/2 depending on aspect ratio) — nowhere near a meaningful rate.
+# This gain scales that up so a target pinned at the frame edge commands
+# ~100°/s on the larger (yaw) axis; MAX_ANGLE in mavlink_client.py still
+# clamps above that as a hard ceiling.
 _PX4_RATE_GAIN = math.radians(100) / (_HFOV_RAD / 2)
 
 # (args parsed earlier, ahead of the MAVLink/Serial Setup block above)
@@ -1545,9 +1560,9 @@ while True:
         sx_l2m = mw / lw; sy_l2m = mh / lh
         _cached_dims = (mw, mh, lw, lh)
 
-        # Aspect ratio changed with resolution — rederive HFOV from the fixed
-        # VFOV anchor so yaw/pitch stay on the same degrees-per-unit scale.
-        _HFOV_RAD = _VFOV_RAD / (mw / mh)
+        # Aspect ratio changed with resolution — rederive VFOV from the fixed
+        # HFOV anchor so yaw/pitch stay on the same degrees-per-unit scale.
+        _VFOV_RAD = _vfov_for_aspect(mw, mh)
 
         # Reinit tracker at new resolution to prevent tracking point drift
         if state.tracking and state.tracker is not None and state.bbox is not None and old_mw > 0:
@@ -1759,9 +1774,18 @@ while True:
                 norm_dx = dx / mw
                 norm_dy = dy / mh
 
-                # Normalize to -1..1: 0 = centred, ±1 = target at frame edge
-                pitch_norm = -norm_dy / (_VFOV_RAD / 2)
-                yaw_norm   =  norm_dx / (_HFOV_RAD / 2)
+                # Normalize against the VFOV edge (0 = centred, ±1 = target at
+                # the top/bottom frame edge) for BOTH axes — norm_dx/norm_dy
+                # are dimensionless pixel fractions (±0.5 at their own edge),
+                # not angles, so dividing by an absolute FOV_RAD/2 (radians)
+                # doesn't cancel to ±1; multiplying by 2 does, since 0.5 is
+                # exactly norm_dy's own edge value. Yaw reuses the SAME VFOV
+                # reference (not HFOV/2) so a single downstream gain (see
+                # send_vision_error) stays calibrated to the same
+                # degrees-per-unit on both axes — yaw then naturally exceeds
+                # ±1 at the (wider) HFOV edge, scaled by HFOV/VFOV.
+                pitch_norm = -norm_dy * 2
+                yaw_norm   =  norm_dx * 2 * (_HFOV_RAD / _VFOV_RAD)
                 # Count consecutive bad frames — break tracking if drift sustained
                 if tq < TrackingQualityMonitor.SCORE_UNCERTAIN:
                     _tq_monitor.bad_frames += 1
