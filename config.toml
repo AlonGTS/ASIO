@@ -138,3 +138,10 @@ lores_sizes = [[320, 240], [416, 312], [512, 384], [640,  480], [800, 600], [960
 # MAVLink keeps flowing at either rate — it's handled by mavproxy, not this loop.
 idle_fps   = 10
 active_fps = 30
+
+# Size (native-resolution pixels, per side) of the hi-res pre-launch zoom
+# crop (see gcs.py's HIRES ZOOM button / tracker-so.py's _capture_hires_crop)
+# — a full-native-sensor still capture, cropped down to just this window
+# around the cursor before sending, so the response stays small despite the
+# underlying capture being much larger.
+hires_crop_size = 480

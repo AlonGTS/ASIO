@@ -141,7 +141,7 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 870     # minimum canvas height so all buttons fit (was 826 — +44 for the WHITE TARGET button)
+PANEL_MIN_H = 914     # minimum canvas height so all buttons fit (was 870 — +44 for the HIRES ZOOM button)
 
 def _screen_display_width(panel_w, fallback=1200):
     """Video display width sized to fill as much of the screen as possible
@@ -1031,6 +1031,67 @@ def draw_zoom_loupe(frame, mx, my, crop, x0, y0):
 
     frame[ly:ly + out, lx:lx + out] = zoom
 
+# ── Hi-res pre-launch zoom (optional) — long-press requests a full-native-
+# sensor-resolution crop from the Pi instead of a digital upscale, so real
+# detail is visible around the cursor rather than just enlarged pixels.
+# Takes over the long-press gesture from the plain zoom loupe while
+# enabled. Only usable pre-launch: the capture briefly stutters the live
+# video (a genuine camera reconfigure on the Pi), which is only acceptable
+# when nothing flight-critical is happening — enforced both here (so the
+# button/gesture give instant feedback) and on the Pi side (authoritative).
+
+_hires_zoom_enabled = False
+_hires_pending      = False   # a fetch is currently in flight
+_hires_crop_img     = None    # decoded numpy array of the last fetched crop, or None
+_hires_request_id   = 0       # bumped per request; lets a stale in-flight response be ignored
+
+def toggle_hires_zoom():
+    global _hires_zoom_enabled
+    if launched:
+        set_status("Hires zoom: not available after launch")
+        return
+    _hires_zoom_enabled = not _hires_zoom_enabled
+    set_status(f"Hires zoom: {'ON' if _hires_zoom_enabled else 'OFF'}")
+
+def _fetch_hires_crop(nx, ny, req_id):
+    global _hires_crop_img, _hires_pending
+    try:
+        r = requests.get(f"{FLASK}/hires_crop", params={"nx": nx, "ny": ny}, timeout=8)
+        if req_id != _hires_request_id:
+            return   # superseded by a new press, or this one already released
+        if r.status_code == 200:
+            arr = np.frombuffer(r.content, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if req_id == _hires_request_id and img is not None:
+                _hires_crop_img = img
+        else:
+            set_status(f"Hires zoom: {r.text}", log=False)
+    except Exception as e:
+        if req_id == _hires_request_id:
+            set_status(f"Hires zoom failed: {e}", log=False)
+    finally:
+        if req_id == _hires_request_id:
+            _hires_pending = False
+
+def draw_hires_loupe(frame, mx, my, crop_img):
+    """Picture-in-picture magnifier showing a real hi-res capture instead of
+    a digital crop — always centered exactly on the requested point (the Pi
+    crops it that way already), so the crosshair goes at the image's own
+    center rather than needing a source-offset like the digital loupe."""
+    h, w = frame.shape[:2]
+    out = min(_ZOOM_OUT, w, h)
+    zoom = cv2.resize(crop_img, (out, out), interpolation=cv2.INTER_AREA)
+
+    cx = cy = out // 2
+    cv2.line(zoom, (cx - 12, cy), (cx + 12, cy), (50, 50, 230), 1, cv2.LINE_AA)
+    cv2.line(zoom, (cx, cy - 12), (cx, cy + 12), (50, 50, 230), 1, cv2.LINE_AA)
+    cv2.rectangle(zoom, (0, 0), (out - 1, out - 1), (255, 255, 255), 2)
+
+    y_bias = out // 4
+    lx = max(0, min(w - out, mx - out // 2))
+    ly = max(0, min(h - out, my - out // 2 - y_bias))
+    frame[ly:ly + out, lx:lx + out] = zoom
+
 def _stabilize(frame, is_new_frame):
     """Warp `frame` by the current shake-cancelling correction, recomputing
     that correction only when a genuinely new frame has arrived. `frame`
@@ -1284,6 +1345,16 @@ def _build_buttons(vx: int):
         lambda: "ZOOM: ON" if _zoom_enabled else "ZOOM: OFF",
         36, toggle_zoom,
         lambda: (30, 140, 50) if _zoom_enabled else (90, 90, 30),
+    )
+    y += 44
+
+    # ── Hi-res pre-launch zoom (long-press on video, real sensor detail) ────
+    btn(
+        lambda: "HIRES ZOOM: LOCKED" if launched else
+                ("HIRES ZOOM: ON" if _hires_zoom_enabled else "HIRES ZOOM: OFF"),
+        36, toggle_hires_zoom,
+        lambda: (90, 40, 40) if launched else
+                ((30, 140, 50) if _hires_zoom_enabled else (90, 90, 30)),
     )
     y += 44
 
@@ -1782,6 +1853,7 @@ def main():
     global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit, _frame_gen
     global cap, _gcs_video_mode
     global _local_recording, _local_writer
+    global _hires_pending, _hires_crop_img, _hires_request_id
 
     if args.file:
         cap = _FileCapture(args.file)
@@ -1805,7 +1877,7 @@ def main():
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
     def on_mouse(event, x, y, flags, _):
-        global _confirm_quit, _press_on_video, _press_start_ts
+        global _confirm_quit, _press_on_video, _press_start_ts, _hires_crop_img
         _mouse_pos[0], _mouse_pos[1] = x, y
         if event == cv2.EVENT_LBUTTONDOWN:
             if _confirm_quit:
@@ -1820,6 +1892,7 @@ def main():
                 _press_on_video = True      # commit on release, not on press
                 _press_start_ts = time.time()
                 _drag_start[0], _drag_start[1] = x, y
+                _hires_crop_img = None      # new press — drop any stale hires result
             else:
                 for btn in _buttons:        # click on panel → button action
                     if btn.hit(x, y):
@@ -1946,9 +2019,37 @@ def main():
             ry0, ry1 = sorted((_drag_start[1], min(my, h - 1)))
             cv2.rectangle(frame, (rx0, ry0), (rx1, ry1), (0, 255, 255), 1, cv2.LINE_AA)
 
+        # ── Hires zoom — takes over the long-press gesture from the plain
+        # zoom loupe while enabled (pre-launch only; the button/gesture
+        # already refuse post-launch, this is just the render side).
+        # One fetch per press: triggered the moment the hold threshold is
+        # crossed, shown once it arrives, held steady until release starts
+        # a fresh press (see on_mouse's LBUTTONDOWN reset of _hires_crop_img).
+        hires_active = (_hires_zoom_enabled and not launched
+                        and _press_on_video and not dragging_area
+                        and (time.time() - _press_start_ts) >= _ZOOM_HOLD_S)
+        if hires_active:
+            mx, my = _mouse_pos
+            if mx < w:
+                if _hires_crop_img is None and not _hires_pending:
+                    _hires_pending = True
+                    _hires_request_id += 1
+                    fx, fy = _to_raw_coords(min(w - 1, mx), min(h - 1, my))
+                    nx_req = fx / _cur_video_w
+                    ny_req = fy / _cur_video_h
+                    threading.Thread(target=_fetch_hires_crop,
+                                      args=(nx_req, ny_req, _hires_request_id),
+                                      daemon=True).start()
+                if _hires_crop_img is not None:
+                    draw_hires_loupe(frame, min(w - 1, mx), min(h - 1, my), _hires_crop_img)
+                else:
+                    cv2.putText(frame, "Capturing hi-res...",
+                                (min(w - 220, mx + 15), max(20, my - 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 220), 1, cv2.LINE_AA)
+
         # ── Zoom loupe — appears only after a long press (a quick click just
         # selects the cursor point directly) ─────────────────────────────────
-        if (_zoom_enabled and _press_on_video and not dragging_area
+        elif (_zoom_enabled and _press_on_video and not dragging_area
                 and (time.time() - _press_start_ts) >= _ZOOM_HOLD_S):
             mx, my = _mouse_pos
             if mx < w:

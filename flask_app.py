@@ -8,7 +8,7 @@ Usage:
     # then run app in a thread
 """
 import cv2
-from flask import Flask, request
+from flask import Flask, request, Response
 from flask_cors import CORS
 
 # Selection-box size, scaled from a fixed pixel size at the 640x480
@@ -36,7 +36,7 @@ def box_size(mw, mh, moving):
     return _scaled_square(base, mw, mh)
 
 
-def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None, get_cpu_temp_fn=None, get_frame_history_fn=None, set_video_mode_fn=None, get_video_mode_fn=None, set_white_target_fn=None, get_white_target_fn=None, get_aim_phase_fn=None):
+def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None, launch_fn=None, get_launch_state_fn=None, toggle_record_fn=None, get_record_state_fn=None, set_fps_fn=None, get_fps_state_fn=None, get_cpu_fn=None, get_cpu_temp_fn=None, get_frame_history_fn=None, set_video_mode_fn=None, get_video_mode_fn=None, set_white_target_fn=None, get_white_target_fn=None, get_aim_phase_fn=None, capture_hires_crop_fn=None):
     """
     Build and return the Flask app with all control routes bound to `state`.
     state is a SimpleNamespace with: command_from_remote, bbox, tracking,
@@ -316,6 +316,31 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
             state_val = request.form.get("enabled")
             set_white_target_fn(state_val == '1' if state_val is not None else True)
             return "OK", 200
+        except Exception as e:
+            return f"Error: {e}", 400
+
+    @app.route('/hires_crop', methods=['GET'])
+    def hires_crop():
+        """Pre-launch only: capture one still at the sensor's true full
+        native resolution, crop a small window around the given normalized
+        (nx, ny) point, and return it as a JPEG image. Causes a real,
+        visible stutter in the live video for its duration (a genuine
+        camera reconfigure, same class of event as a resolution change) —
+        deliberately refused once launched, unlike every other read/toggle
+        endpoint here, since that stutter is only acceptable when nothing
+        flight-critical is happening."""
+        if capture_hires_crop_fn is None:
+            return "Not available in this mode", 400
+        launched = get_launch_state_fn() if get_launch_state_fn else False
+        if launched:
+            return "Not available after launch", 400
+        try:
+            nx = max(0.0, min(1.0, float(request.args.get("nx"))))
+            ny = max(0.0, min(1.0, float(request.args.get("ny"))))
+            jpeg_bytes = capture_hires_crop_fn(nx, ny)
+            if jpeg_bytes is None:
+                return "Capture failed", 500
+            return Response(jpeg_bytes, mimetype="image/jpeg")
         except Exception as e:
             return f"Error: {e}", 400
 

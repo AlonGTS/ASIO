@@ -539,19 +539,20 @@ def _reader_live_picam():
             _frame_history.append((gen, frame))
     print("[INFO] Live reader stopped")
 
-def _restart_reader_live():
-    """Stop live reader, reinit camera (for new MAIN size), and restart reader."""
-    global _reader_thread
+def _pause_reader_live():
+    """Stop the reader thread and camera cleanly, for a caller that needs
+    exclusive access to picam2 (a resolution change, or a one-off hires
+    still capture). Stop the camera BEFORE joining, not after — the reader
+    thread is very likely blocked inside picam2.capture_array() right now
+    (it can legitimately take longer than any short join timeout, e.g. at
+    idle FPS), and nothing else unblocks that call. Without this, a
+    timed-out join used to let a reconfigure below stop/close/reconfigure
+    the SAME camera object out from under that still-in-flight capture —
+    an unsafe race that could hang the whole libcamera pipeline instead of
+    raising a catchable error (observed as: GCS resolution change →
+    video/control link stops responding entirely, not just failing to
+    reconfigure). Pair with _resume_reader_live()."""
     _stop_reader.set()
-    # Stop the camera BEFORE joining, not after — the reader thread is very
-    # likely blocked inside picam2.capture_array() right now (it can legitimately
-    # take longer than any short join timeout, e.g. at idle FPS), and nothing
-    # else unblocks that call. Without this, a timed-out join used to let
-    # _init_live_camera() below stop/close/reconfigure the SAME camera object
-    # out from under that still-in-flight capture — an unsafe race that could
-    # hang the whole libcamera pipeline instead of raising a catchable error
-    # (observed as: GCS resolution change → video/control link stops
-    # responding entirely, not just failing to reconfigure).
     if picam2 is not None:
         try:
             picam2.stop()
@@ -560,9 +561,58 @@ def _restart_reader_live():
     if _reader_thread and _reader_thread.is_alive():
         _reader_thread.join(timeout=2.0)
     _stop_reader.clear()
+
+def _resume_reader_live():
+    """Rebuild the normal live camera config and restart the reader thread
+    — the other half of _pause_reader_live()."""
+    global _reader_thread
     _init_live_camera()
     _reader_thread = Thread(target=_reader_live_picam, daemon=True)
     _reader_thread.start()
+
+def _restart_reader_live():
+    """Stop live reader, reinit camera (for new MAIN size), and restart reader."""
+    _pause_reader_live()
+    _resume_reader_live()
+
+_HIRES_CROP_SIZE = _cfg["camera"].get("hires_crop_size", 480)   # native-res px per side of the returned crop
+
+def _capture_hires_crop(nx, ny):
+    """Briefly pause the live camera, capture ONE still at the sensor's true
+    full native resolution (not the downscaled/binned mode used for normal
+    live tracking), crop a small window around the given normalized (nx, ny)
+    point, restore normal live operation, and return the crop as JPEG bytes
+    (or None on failure/if not in live mode). This causes a real, visible
+    stutter in the live video for its duration (same reconfigure the reader
+    already tolerates on a resolution change) — intended for occasional
+    pre-launch use to inspect the target area in real detail, not continuous
+    operation; the caller (flask_app.py's /hires_crop) is expected to gate
+    that (only pre-launch) rather than this function guessing at intent."""
+    if picam2 is None:
+        return None
+    _pause_reader_live()
+    full = None
+    try:
+        still_config = picam2.create_still_configuration()
+        picam2.configure(still_config)
+        picam2.start()
+        full = picam2.capture_array()
+        picam2.stop()
+    except Exception as e:
+        print(f"[HIRES] capture failed: {e}")
+    finally:
+        _resume_reader_live()
+
+    if full is None:
+        return None
+    fh, fw = full.shape[:2]
+    cx, cy = int(nx * fw), int(ny * fh)
+    half = _HIRES_CROP_SIZE // 2
+    x0 = max(0, min(fw - _HIRES_CROP_SIZE, cx - half))
+    y0 = max(0, min(fh - _HIRES_CROP_SIZE, cy - half))
+    crop = full[y0:y0 + _HIRES_CROP_SIZE, x0:x0 + _HIRES_CROP_SIZE]
+    ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return buf.tobytes() if ok else None
 
 def _set_camera_active(active: bool):
     """
@@ -1190,6 +1240,7 @@ app = flask_app.create_app(
         "cross" if _white_target_enabled and _wt_close_range else
         "blob"  if _white_target_enabled else
         "off"),
+    capture_hires_crop_fn = _capture_hires_crop if args.mode == 'live' else None,
 )
 
 # === Launch Flask in separate thread (production WSGI server, not Werkzeug's dev server) ===
