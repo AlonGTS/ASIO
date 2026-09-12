@@ -590,27 +590,35 @@ def _capture_hires_crop(nx, ny):
     that (only pre-launch) rather than this function guessing at intent."""
     if picam2 is None:
         return None
+    full_w, full_h = picam2.sensor_resolution
+    half = _HIRES_CROP_SIZE // 2
+    x0 = max(0, min(full_w - _HIRES_CROP_SIZE, int(nx * full_w) - half))
+    y0 = max(0, min(full_h - _HIRES_CROP_SIZE, int(ny * full_h) - half))
+
     _pause_reader_live()
-    full = None
+    crop = None
     try:
-        still_config = picam2.create_still_configuration()
+        # ScalerCrop reads out just this window at the sensor level instead
+        # of pulling the full native frame and cropping in software — the
+        # full-frame capture used to hold the camera (and stall the live
+        # feed) for much longer than this small region needs, which was the
+        # likely cause of occasional stream hiccups/decode errors coinciding
+        # with a hires capture.
+        still_config = picam2.create_still_configuration(
+            main={"size": (_HIRES_CROP_SIZE, _HIRES_CROP_SIZE)},
+            controls={"ScalerCrop": (x0, y0, _HIRES_CROP_SIZE, _HIRES_CROP_SIZE)},
+        )
         picam2.configure(still_config)
         picam2.start()
-        full = picam2.capture_array()
+        crop = picam2.capture_array()
         picam2.stop()
     except Exception as e:
         print(f"[HIRES] capture failed: {e}")
     finally:
         _resume_reader_live()
 
-    if full is None:
+    if crop is None:
         return None
-    fh, fw = full.shape[:2]
-    cx, cy = int(nx * fw), int(ny * fh)
-    half = _HIRES_CROP_SIZE // 2
-    x0 = max(0, min(fw - _HIRES_CROP_SIZE, cx - half))
-    y0 = max(0, min(fh - _HIRES_CROP_SIZE, cy - half))
-    crop = full[y0:y0 + _HIRES_CROP_SIZE, x0:x0 + _HIRES_CROP_SIZE]
     ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return buf.tobytes() if ok else None
 
