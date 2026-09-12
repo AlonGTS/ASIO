@@ -64,8 +64,12 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
     @app.route('/select_point', methods=['POST'])
     def select_point():
         """
-        Initialize tracker around a clicked point.
-        Prefer normalized coords (nx, ny in [0..1]); fall back to absolute (x, y).
+        Initialize tracker around a clicked point, or a manually-dragged
+        rectangle if nx0/ny0/nx1/ny1 (normalized, any drag direction) are
+        present instead — lets the GCS operator mark a whole area directly
+        when the video is shaking too much to click one exact point. Falls
+        back to a fixed-size box around a single point: prefer normalized
+        coords (nx, ny in [0..1]), else absolute (x, y).
 
         If the request includes frame_gen (the id of the frame the GCS
         operator actually saw — echoed back from the frame_gen embedded in
@@ -97,20 +101,44 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
                 return "No frame", 400
 
             mh, mw = frame_snap.shape[:2]
-            nx = request.form.get("nx")
-            ny = request.form.get("ny")
-            if nx is not None and ny is not None:
-                nx = max(0.0, min(1.0, float(nx)))
-                ny = max(0.0, min(1.0, float(ny)))
-                x = int(round(nx * (mw - 1)))
-                y = int(round(ny * (mh - 1)))
+            nx0_f = request.form.get("nx0")
+            ny0_f = request.form.get("ny0")
+            nx1_f = request.form.get("nx1")
+            ny1_f = request.form.get("ny1")
+            is_area_search = None not in (nx0_f, ny0_f, nx1_f, ny1_f)
+            if is_area_search:
+                # Manually-dragged rectangle (GCS: press-drag-release forms a
+                # box directly) instead of a fixed-size box around a single
+                # point — lets the operator mark a whole area when the video
+                # is shaking too much to click one exact spot. MIN_BOX_SIDE
+                # guards against a degenerate near-zero box from a drag that
+                # was just barely over the GCS's own click-vs-drag threshold.
+                MIN_BOX_SIDE = 10
+                xa = max(0.0, min(1.0, float(nx0_f))) * (mw - 1)
+                xb_ = max(0.0, min(1.0, float(nx1_f))) * (mw - 1)
+                ya = max(0.0, min(1.0, float(ny0_f))) * (mh - 1)
+                yb_ = max(0.0, min(1.0, float(ny1_f))) * (mh - 1)
+                x0, x1 = sorted((xa, xb_))
+                y0, y1 = sorted((ya, yb_))
+                w = max(MIN_BOX_SIDE, int(round(x1 - x0)))
+                h = max(MIN_BOX_SIDE, int(round(y1 - y0)))
+                x0 = max(0, min(mw - w, int(round(x0))))
+                y0 = max(0, min(mh - h, int(round(y0))))
             else:
-                x = max(0, min(mw - 1, int(request.form.get("x"))))
-                y = max(0, min(mh - 1, int(request.form.get("y"))))
+                nx = request.form.get("nx")
+                ny = request.form.get("ny")
+                if nx is not None and ny is not None:
+                    nx = max(0.0, min(1.0, float(nx)))
+                    ny = max(0.0, min(1.0, float(ny)))
+                    x = int(round(nx * (mw - 1)))
+                    y = int(round(ny * (mh - 1)))
+                else:
+                    x = max(0, min(mw - 1, int(request.form.get("x"))))
+                    y = max(0, min(mh - 1, int(request.form.get("y"))))
 
-            w, h = box_size(mw, mh, state.bMoovingTgt)
-            x0 = max(0, min(mw - w, x - w // 2))
-            y0 = max(0, min(mh - h, y - h // 2))
+                w, h = box_size(mw, mh, state.bMoovingTgt)
+                x0 = max(0, min(mw - w, x - w // 2))
+                y0 = max(0, min(mh - h, y - h // 2))
 
             lw, lh = state.lores_size
             sx = lw / mw; sy = lh / mh
@@ -158,7 +186,11 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
             state.bbox = None
             state.tracker = None
 
-            state.last_init_source = "click"
+            # "area_search" tells tracker-so.py to shrink the box back to the
+            # normal fixed default size as soon as the white blob is first
+            # found within it, instead of tracking at this (often large)
+            # search-rectangle size for the rest of the flight.
+            state.last_init_source = "area_search" if is_area_search else "click"
             state.tracker = t
             state.bbox = bbox_main
             state.tracking = True

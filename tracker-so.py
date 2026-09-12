@@ -1475,6 +1475,14 @@ _log_prev_cx = _log_prev_cy = None   # previous frame's MAIN-coord center, for j
 _blob_center_countdown = 0   # frames left until the next periodic re-center-on-blob
 _BLOB_CENTER_EVERY_N_FRAMES = 15   # how often to resync the box onto the blob, in frames
 
+# GCS's drag-to-select-area (white-target mode) inits the tracker at the
+# operator's own (often large) search rectangle — good for finding the blob
+# despite a shaky video, but the box should shrink back to the normal
+# fixed default size (flask_app.box_size(), same as a plain click) as soon
+# as the blob is actually found, rather than tracking at the big search-box
+# size for the rest of the flight.
+_awaiting_first_lock_shrink = False
+
 _aim_smooth = None   # (cx, cy) last-accepted aim point in MAIN coords; None until first found
 _AIM_SMOOTH_SNAP_FRAC = 0.25   # jump beyond this fraction of box size = candidate "real motion",
                                 # needs confirmation below before actually snapping to it
@@ -1598,6 +1606,7 @@ while True:
         _log_prev_cx = _log_prev_cy = None
         _aim_smooth = None
         _aim_jump_streak = 0
+        _awaiting_first_lock_shrink = (state.last_init_source == "area_search")
 
     if state.tracking and state.tracker is not None:
         try:
@@ -1661,6 +1670,31 @@ while True:
                         # from the live box over a gap and never re-catch it.
                         aim_cx, aim_cy, _aim_found = _refine_aim_point(
                             frame, x, y, bw, bh, cx, cy, prev_point=(cx, cy))
+
+                    # First blob found after an "area_search" init (GCS drag-
+                    # select) — shrink the box from the operator's (often
+                    # large) search rectangle down to the normal fixed
+                    # default size, same as a plain click, centered on the
+                    # blob. One-shot: only fires once per area_search init.
+                    if _awaiting_first_lock_shrink and _aim_found:
+                        _awaiting_first_lock_shrink = False
+                        dbw, dbh = flask_app.box_size(mw, mh, state.bMoovingTgt)
+                        nx = max(0, min(mw - dbw, aim_cx - dbw // 2))
+                        ny = max(0, min(mh - dbh, aim_cy - dbh // 2))
+                        xb = int(nx * sx_m2l); yb = int(ny * sy_m2l)
+                        wb = max(2, int(dbw * sx_m2l)); hb = max(2, int(dbh * sy_m2l))
+                        state.tracker = create_gts_tracker(state.bMoovingTgt)
+                        state.tracker.init(lores_frame, (xb, yb, wb, hb))
+                        state.last_init_source = "area_search_shrink"
+                        state.bbox = (nx, ny, dbw, dbh)
+                        x, y, bw, bh, cx, cy = nx, ny, dbw, dbh, aim_cx, aim_cy
+                        aim_cx, aim_cy = cx, cy
+                        _last_tracker_id = id(state.tracker)
+                        _tq_needs_init   = True
+                        _tq_monitor.reset()
+                        _log_session_id += 1
+                        _log_session_source = "area_search_shrink"
+                        _log_prev_cx = _log_prev_cy = None
 
                     # Periodically resync the tracker's own box onto the aim point —
                     # same reinit approach as flask_app.py's /nudge endpoint (shift

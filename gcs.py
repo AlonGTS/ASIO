@@ -177,6 +177,16 @@ def _screen_display_width(panel_w, fallback=1200):
 
 DISPLAY_W   = _screen_display_width(PANEL_W)   # video is stretched to this width for display
 
+# NOTE: tried making this reactive to live window resize/maximize via
+# cv2.getWindowImageRect() polled every frame — reverted. On this OpenCV/
+# macOS (Cocoa, non-Qt) build, that call reflects the highgui content
+# view's own size, not the outer OS window frame, and the content view does
+# not resize when the user drags/maximizes the window. Worse, feeding that
+# stale value back into computing the next frame's target size created a
+# feedback loop that locked onto a SMALLER size than this fixed startup
+# value, regardless of the actual window size. A fixed, generously-computed-
+# at-startup width is the reliable option on this backend.
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 
 launched        = False
@@ -196,6 +206,8 @@ _status_ts = 0.0
 _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
 _press_on_video = False   # True from LBUTTONDOWN-on-video until release; commits select_point then
 _press_start_ts = 0.0     # time.time() when the press started; gates the zoom loupe's appearance
+_drag_start = [0, 0]      # display-coord position of the LBUTTONDOWN that started the current press
+DRAG_MIN_PX = 10          # release within this of the press start = a click; further = a dragged area
 _quit         = threading.Event()  # set to break the main loop from any thread
 
 def _handle_term_signal(signum, frame):
@@ -330,6 +342,23 @@ def select_point(x, y):
     _post("select_point", nx=nx, ny=ny, **extra)
     set_status(f"Selected ({x}, {y})")
     _vt_reset(x, y)
+
+def select_area(x0, y0, x1, y1):
+    """Init tracking on a manually-dragged rectangle instead of a fixed-size
+    box around a single clicked point — much easier to land on a small/dim
+    target when the video itself is shaking too much to click it precisely.
+    (x0,y0)-(x1,y1) in raw-frame coords, any drag direction (corners get
+    sorted below, so top-left-to-bottom-right isn't required)."""
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    nx0 = round(x0 / _cur_video_w, 6)
+    ny0 = round(y0 / _cur_video_h, 6)
+    nx1 = round(x1 / _cur_video_w, 6)
+    ny1 = round(y1 / _cur_video_h, 6)
+    extra = {"frame_gen": _frame_gen} if _frame_gen is not None else {}
+    _post("select_point", nx0=nx0, ny0=ny0, nx1=nx1, ny1=ny1, **extra)
+    set_status(f"Selected area ({x0},{y0})-({x1},{y1})")
+    _vt_reset((x0 + x1) // 2, (y0 + y1) // 2)
 
 def lock_target(x, y):
     """Commit (x, y) — the current mouse position — as the tracking target.
@@ -1790,6 +1819,7 @@ def main():
             elif x < _cur_video_w:
                 _press_on_video = True      # commit on release, not on press
                 _press_start_ts = time.time()
+                _drag_start[0], _drag_start[1] = x, y
             else:
                 for btn in _buttons:        # click on panel → button action
                     if btn.hit(x, y):
@@ -1798,8 +1828,22 @@ def main():
         elif event == cv2.EVENT_LBUTTONUP:
             if _press_on_video:
                 _press_on_video = False
-                fx, fy = _to_raw_coords(x, y)   # undo display-only stabilization shift
-                select_point(fx, fy)            # release → track target
+                # A small release-vs-press movement is a plain click (fixed-
+                # size box at the point, as before); dragging further draws
+                # a rectangle instead — much easier to land on a target when
+                # the video itself is shaking too much to click it precisely.
+                # Only offered in white-target mode — that's the only case
+                # this was built for (searching a white blob within a marked
+                # area); a plain click always behaves exactly as before it.
+                if not white_target_enabled or (
+                        abs(x - _drag_start[0]) < DRAG_MIN_PX
+                        and abs(y - _drag_start[1]) < DRAG_MIN_PX):
+                    fx, fy = _to_raw_coords(x, y)   # undo display-only stabilization shift
+                    select_point(fx, fy)
+                else:
+                    fx0, fy0 = _to_raw_coords(_drag_start[0], _drag_start[1])
+                    fx1, fy1 = _to_raw_coords(x, y)
+                    select_area(fx0, fy0, fx1, fy1)
                 _reset_loupe_blend()
 
     cv2.setMouseCallback("Mahat GCS", on_mouse)
@@ -1812,6 +1856,7 @@ def main():
 
     while not _quit.is_set():
         ok, frame, frame_id, frame_gen = cap.read()
+        unstab_frame = None   # set below only for a real (non-placeholder) frame while recording
 
         if not ok or frame is None:
             frame = _waiting_frame(_cur_video_w, _cur_video_h)
@@ -1841,6 +1886,20 @@ def main():
             draw_feature_points(frame)          # drawn here (pre-warp) so dots move WITH the content, no
                                                  # separate raw->display coordinate conversion needed yet
 
+            # Snapshot BEFORE the stabilization warp, for local recording —
+            # stabilization is a display-only aid (it doesn't touch the real
+            # tracker/MAVLink pipeline either); a recording made from it
+            # would bake in the crop/warp and any stabilizer artifacts
+            # permanently, unlike the live view where toggling STAB back off
+            # immediately shows the raw feed again. Must be an actual copy,
+            # not just the same reference — _stabilize() returns a NEW array
+            # from cv2.warpAffine when it applies a correction, but the SAME
+            # array unchanged when it has no correction yet, so relying on
+            # the reference alone would inconsistently alias `frame` (and
+            # then pick up the HUD drawn on the display copy below, or not,
+            # depending on stabilizer state).
+            unstab_frame = frame.copy() if _local_recording else None
+
             if _stab_enabled:
                 frame = _stabilize(frame, is_new_frame)
 
@@ -1865,10 +1924,32 @@ def main():
 
         draw_hud(frame, est_fps)
         draw_virtual_target(frame)
+        if unstab_frame is not None:
+            draw_hud(unstab_frame, est_fps)
+            # VT marker deliberately NOT drawn here — draw_virtual_target()
+            # positions it via _vt_to_display(), which applies the
+            # stabilization transform forward; on the unwarped frame that
+            # would place the marker at the wrong spot rather than just
+            # omitting it.
+
+        # ── Drag-to-select-area preview — once the press has moved past the
+        # click/drag threshold, show the rectangle being drawn instead of the
+        # zoom loupe (the loupe is for landing a precise single point; once
+        # the operator is clearly dragging an area, that precision isn't the
+        # goal any more) ──────────────────────────────────────────────────
+        dragging_area = (white_target_enabled and _press_on_video
+                          and (abs(_mouse_pos[0] - _drag_start[0]) >= DRAG_MIN_PX
+                               or abs(_mouse_pos[1] - _drag_start[1]) >= DRAG_MIN_PX))
+        if dragging_area:
+            mx, my = _mouse_pos
+            rx0, rx1 = sorted((_drag_start[0], min(mx, w - 1)))
+            ry0, ry1 = sorted((_drag_start[1], min(my, h - 1)))
+            cv2.rectangle(frame, (rx0, ry0), (rx1, ry1), (0, 255, 255), 1, cv2.LINE_AA)
 
         # ── Zoom loupe — appears only after a long press (a quick click just
         # selects the cursor point directly) ─────────────────────────────────
-        if _zoom_enabled and _press_on_video and (time.time() - _press_start_ts) >= _ZOOM_HOLD_S:
+        if (_zoom_enabled and _press_on_video and not dragging_area
+                and (time.time() - _press_start_ts) >= _ZOOM_HOLD_S):
             mx, my = _mouse_pos
             if mx < w:
                 mx_c, my_c = min(w - 1, mx), min(h - 1, my)
@@ -1883,11 +1964,16 @@ def main():
         # Write to local recorder (video + HUD, no panel) — only on genuinely
         # new frames, so recorded playback speed matches real time instead of
         # being stretched by the render loop re-writing the same cached frame.
+        # Recorded from unstab_frame (pre-stabilization-warp) when available,
+        # so the recording is unaffected by STAB even while it's on for the
+        # live view — falls back to the placeholder frame when there's no
+        # real video yet (unstab_frame is only set for a genuine capture).
         if _local_recording and _local_writer is not None and frame_id != last_rec_id:
             last_rec_id = frame_id
-            fh, fw = frame.shape[:2]
-            rec_frame = frame if (fw, fh) == (_cur_video_w, _cur_video_h) else \
-                        cv2.resize(frame, (_cur_video_w, _cur_video_h))
+            rec_source = unstab_frame if unstab_frame is not None else frame
+            fh, fw = rec_source.shape[:2]
+            rec_frame = rec_source if (fw, fh) == (_cur_video_w, _cur_video_h) else \
+                        cv2.resize(rec_source, (_cur_video_w, _cur_video_h))
             _local_writer.write(rec_frame)
 
         # ── Composite canvas: video left + button panel right ──────────────
