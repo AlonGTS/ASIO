@@ -220,7 +220,7 @@ def _handle_term_signal(signum, frame):
 
 signal.signal(signal.SIGTERM, _handle_term_signal)
 signal.signal(signal.SIGINT, _handle_term_signal)
-_confirm_quit = False             # True while the "are you sure?" overlay is shown
+_confirm_action = None            # {"title","subtitle","on_confirm"} while the overlay is shown, else None
 _CONFIRM_YES  = None              # (x, y, w, h) of the Yes button in the overlay
 _CONFIRM_NO   = None              # (x, y, w, h) of the No  button in the overlay
 
@@ -262,12 +262,33 @@ def quit_gcs():
     send_cmd('q')
     _quit.set()
 
+def restart_app():
+    """Tell the Pi to restart the tracker service (systemd brings it back
+    up automatically — see tracker.service's Restart=on-failure)."""
+    _post("restart_app")
+    set_status("Restarting tracker app on Pi…")
+
+def reboot_pi():
+    """Tell the Pi to reboot outright."""
+    _post("reboot_pi")
+    set_status("Rebooting Pi…")
+
+def _ask(title, subtitle, on_confirm):
+    global _confirm_action
+    _confirm_action = {"title": title, "subtitle": subtitle, "on_confirm": on_confirm}
+
 def ask_quit():
-    global _confirm_quit
-    _confirm_quit = True
+    _ask("Quit GCS?", "This will also quit the Pi.", quit_gcs)
+
+def ask_restart():
+    _ask("Restart tracker app?", "Video/tracking drops for a few seconds.", restart_app)
+
+def ask_reboot():
+    _ask("Reboot the Pi?", "Everything drops until it boots back up.", reboot_pi)
 
 def _draw_confirm_overlay(canvas):
-    """Draw a semi-transparent 'Are you sure?' dialog over the canvas."""
+    """Draw a semi-transparent 'Are you sure?' dialog over the canvas,
+    for whichever action is pending in _confirm_action."""
     global _CONFIRM_YES, _CONFIRM_NO
 
     ch, cw = canvas.shape[:2]
@@ -283,8 +304,8 @@ def _draw_confirm_overlay(canvas):
     cv2.rectangle(canvas, (dx, dy), (dx + dw, dy + dh), (150, 150, 150), 2)
 
     for txt, scale, oy, color in [
-        ("Quit GCS?",                    0.65, 38,  (255, 255, 255)),
-        ("This will also quit the Pi.",  0.46, 64,  (180, 180, 180)),
+        (_confirm_action["title"],       0.65, 38,  (255, 255, 255)),
+        (_confirm_action["subtitle"],    0.46, 64,  (180, 180, 180)),
         ("Y = confirm   Esc = cancel",   0.40, 84,  (130, 130, 130)),
     ]:
         (tw, th), _ = cv2.getTextSize(txt, _FONT, scale, 1)
@@ -1324,6 +1345,12 @@ def _build_buttons(vx: int):
     btn("Quit", 36, ask_quit, (40, 40, 170))
     y += 52
 
+    # ── Pi power controls (destructive — confirmed via overlay) ────────────
+    btn("Restart App", 32, ask_restart, (120, 70, 20))
+    y += 40
+    btn("Reboot Pi", 32, ask_reboot, (120, 30, 30))
+    y += 44
+
     # ── Target mode ────────────────────────────────────────────────────────
     btn(
         lambda: f"Target: {'MOVING' if moving_tgt else 'FIXED'}",
@@ -1887,7 +1914,7 @@ class _FileCapture:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_quit, _frame_gen
+    global launched, _cur_video_w, _cur_video_h, est_fps_ref, _confirm_action, _frame_gen
     global cap, _gcs_video_mode
     global _local_recording, _local_writer
     global _hires_pending, _hires_crop_img, _hires_request_id
@@ -1914,17 +1941,17 @@ def main():
     cv2.namedWindow("Mahat GCS", cv2.WINDOW_AUTOSIZE)
 
     def on_mouse(event, x, y, flags, _):
-        global _confirm_quit, _press_on_video, _press_start_ts, _hires_crop_img
+        global _confirm_action, _press_on_video, _press_start_ts, _hires_crop_img
         _mouse_pos[0], _mouse_pos[1] = x, y
         if event == cv2.EVENT_LBUTTONDOWN:
-            if _confirm_quit:
+            if _confirm_action:
                 if _CONFIRM_YES and _CONFIRM_YES[0] <= x < _CONFIRM_YES[0] + _CONFIRM_YES[2] \
                                 and _CONFIRM_YES[1] <= y < _CONFIRM_YES[1] + _CONFIRM_YES[3]:
-                    _confirm_quit = False
-                    quit_gcs()
+                    _confirm_action["on_confirm"]()
+                    _confirm_action = None
                 elif _CONFIRM_NO and _CONFIRM_NO[0] <= x < _CONFIRM_NO[0] + _CONFIRM_NO[2] \
                                  and _CONFIRM_NO[1] <= y < _CONFIRM_NO[1] + _CONFIRM_NO[3]:
-                    _confirm_quit = False
+                    _confirm_action = None
             elif x < _cur_video_w:
                 _press_on_video = True      # commit on release, not on press
                 _press_start_ts = time.time()
@@ -2128,7 +2155,7 @@ def main():
         for btn in _buttons:
             btn.draw(canvas, hover=btn.hit(mx, my))
 
-        if _confirm_quit:
+        if _confirm_action:
             _draw_confirm_overlay(canvas)
 
         cv2.imshow("Mahat GCS", canvas)
@@ -2138,13 +2165,11 @@ def main():
         if key == -1:
             continue
 
-        if _confirm_quit:
+        if _confirm_action:
             k = key & 0xFF
             if k in (ord('y'), ord('Y'), 13):   # Y or Enter → confirm
-                _confirm_quit = False
-                quit_gcs()
-            else:                               # anything else → cancel
-                _confirm_quit = False
+                _confirm_action["on_confirm"]()
+            _confirm_action = None              # anything else → cancel
             continue
 
         direction = _ARROW.get(key)

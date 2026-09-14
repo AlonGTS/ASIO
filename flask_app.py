@@ -7,6 +7,8 @@ Usage:
     app = flask_app.create_app(state, create_csrt_tracker)
     # then run app in a thread
 """
+import subprocess
+
 import cv2
 from flask import Flask, request, Response
 from flask_cors import CORS
@@ -60,6 +62,23 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
             state.command_from_remote = cmd
             return "OK", 200
         return "Invalid", 400
+
+    @app.route('/restart_app', methods=['POST'])
+    def restart_app():
+        """Restart the tracker systemd service from the GCS. Fires the
+        restart in the background and returns immediately — the process
+        issuing this request is the one about to be killed, so it can't
+        wait around for systemctl to finish. Requires passwordless sudo
+        for the service user (already set up on the Pi)."""
+        subprocess.Popen(["sudo", "systemctl", "restart", "tracker"])
+        return "OK", 200
+
+    @app.route('/reboot_pi', methods=['POST'])
+    def reboot_pi():
+        """Reboot the Pi outright from the GCS. Same fire-and-forget
+        reasoning as /restart_app."""
+        subprocess.Popen(["sudo", "reboot"])
+        return "OK", 200
 
     @app.route('/select_point', methods=['POST'])
     def select_point():
