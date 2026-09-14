@@ -7,3 +7,4 @@ __pycache__/
 *.tlog
 *.tlog.raw
 logs/
+res_state.json

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 # CLI args / timestamps / small GUI dialogs for file/duration picking
 import fcntl
+import json
 import os
 import signal
 import socket
@@ -303,8 +304,28 @@ state = SimpleNamespace(
                                # "bbox_clamp". Consumed by the baseline logger's session_source.
 )
 
-_main_idx = 0       # index into MAIN_SIZES
-_lores_idx = 0      # index into LORES_SIZES
+# MAIN/LORES resolution indices are persisted to disk (see _save_res_state)
+# so the operator's chosen resolution survives an app restart/reboot instead
+# of silently reverting to MAIN_SIZES[0]/LORES_SIZES[0] every time.
+_RES_STATE_PATH = _HERE / "res_state.json"
+
+def _load_res_state():
+    try:
+        with open(_RES_STATE_PATH) as f:
+            d = json.load(f)
+        return int(d.get("main_idx", 0)) % len(MAIN_SIZES), \
+               int(d.get("lores_idx", 0)) % len(LORES_SIZES)
+    except Exception:
+        return 0, 0
+
+def _save_res_state():
+    try:
+        with open(_RES_STATE_PATH, "w") as f:
+            json.dump({"main_idx": _main_idx, "lores_idx": _lores_idx}, f)
+    except Exception as e:
+        print(f"[WARN] Couldn't save resolution state: {e}")
+
+_main_idx, _lores_idx = _load_res_state()
 
 main_size = list(MAIN_SIZES[_main_idx])    # [W, H] for capture/preview/output
 lores_size = list(LORES_SIZES[_lores_idx]) # [W, H] for tracking
@@ -700,6 +721,22 @@ def _shutdown(signum, frame):
             _baseline_thread.join(timeout=1.0)
     except NameError:
         pass                   # baseline logger not yet initialised (early signal)
+    # Release the camera before exiting. SIGTERM (e.g. `systemctl restart`,
+    # which sends this instead of running the script to completion) used to
+    # skip straight to sys.exit() here, bypassing the normal end-of-script
+    # cleanup below that calls picam2.stop()/close(). The still-open camera
+    # handle then made the freshly-restarted process's Picamera2() fail with
+    # "Device or resource busy" / "Pipeline handler in use by another
+    # process", so `systemctl restart tracker` reliably crash-looped instead
+    # of coming back up.
+    try:
+        if args.mode != 'playback' and picam2 is not None:
+            try: picam2.stop()
+            except Exception: pass
+            try: picam2.close()
+            except Exception: pass
+    except NameError:
+        pass                   # camera not yet initialised (early signal)
     mavlink_client._stop_mavproxy()
     sys.exit(0)
 
@@ -1203,6 +1240,7 @@ def _cycle_main(delta):
     _main_idx = (_main_idx + delta) % len(MAIN_SIZES)
     main_size = list(MAIN_SIZES[_main_idx])
     print(f"[LIVE] Reconfig MAIN → {main_size[0]}x{main_size[1]} (restart reader)")
+    _save_res_state()
     _restart_reader_live()
 
 def _cycle_lores(delta):
@@ -1214,6 +1252,7 @@ def _cycle_lores(delta):
     _lores_idx = (_lores_idx + delta) % len(LORES_SIZES)
     state.lores_size = list(LORES_SIZES[_lores_idx])
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
+    _save_res_state()
 
 # Launch button: "custom" mode just flips the launch flag the Simulink app
 # reads over NAMED_VALUE_FLOAT; "px4" mode actually arms/disarms the FC
