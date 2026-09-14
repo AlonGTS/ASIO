@@ -2081,8 +2081,8 @@ def main():
                     draw_hires_loupe(frame, min(w - 1, mx), min(h - 1, my), _hires_crop_img)
                 else:
                     cv2.putText(frame, "High res capturing",
-                                (min(w - 220, mx + 15), max(20, my - 15)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 230), 1, cv2.LINE_AA)
+                                (min(w - 300, mx + 15), max(30, my - 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (50, 50, 230), 2, cv2.LINE_AA)
 
         # ── Zoom loupe — appears only after a long press (a quick click just
         # selects the cursor point directly) ─────────────────────────────────
