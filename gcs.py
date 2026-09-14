@@ -142,7 +142,10 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 954     # minimum canvas height so all buttons fit (was 914 — +40 for the "Open hires images" button)
+PANEL_MIN_H = 1046    # minimum canvas height so all buttons fit (was 954 — +84 for the "Restart App"/"Reboot Pi"
+                       # buttons pulled in from the Pi side, which didn't bump this — that omission pushed the
+                       # MAIN/TRACK resolution buttons below the visible canvas entirely, looking like they'd
+                       # vanished)
 
 def _screen_display_width(panel_w, fallback=1200):
     """Video display width sized to fill as much of the screen as possible
