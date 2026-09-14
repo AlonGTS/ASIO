@@ -604,8 +604,15 @@ def _capture_hires_crop(nx, ny):
         # feed) for much longer than this small region needs, which was the
         # likely cause of occasional stream hiccups/decode errors coinciding
         # with a hires capture.
+        # format must match _init_live_camera()'s live config ("RGB888") or
+        # the two capture paths disagree on channel order — Picamera2 names
+        # this backwards from what it sounds like: "RGB888" is actually the
+        # format that comes out OpenCV-compatible (BGR-ordered) here, so
+        # leaving it unset (still-config's own default) swapped red and
+        # blue in every saved hires crop while the live video, which does
+        # set it, stayed correct.
         still_config = picam2.create_still_configuration(
-            main={"size": (_HIRES_CROP_SIZE, _HIRES_CROP_SIZE)},
+            main={"size": (_HIRES_CROP_SIZE, _HIRES_CROP_SIZE), "format": "RGB888"},
             controls={"ScalerCrop": (x0, y0, _HIRES_CROP_SIZE, _HIRES_CROP_SIZE)},
         )
         picam2.configure(still_config)
