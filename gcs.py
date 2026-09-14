@@ -38,6 +38,7 @@ import os
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -141,7 +142,7 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 # ── Layout constants ──────────────────────────────────────────────────────────
 
 PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 914     # minimum canvas height so all buttons fit (was 870 — +44 for the HIRES ZOOM button)
+PANEL_MIN_H = 954     # minimum canvas height so all buttons fit (was 914 — +40 for the "Open hires images" button)
 
 def _screen_display_width(panel_w, fallback=1200):
     """Video display width sized to fill as much of the screen as possible
@@ -1044,6 +1045,32 @@ _hires_zoom_enabled = False
 _hires_pending      = False   # a fetch is currently in flight
 _hires_crop_img     = None    # decoded numpy array of the last fetched crop, or None
 _hires_request_id   = 0       # bumped per request; lets a stale in-flight response be ignored
+_HIRES_ZOOM_OUT     = _ZOOM_OUT * 2   # on-screen loupe size for hires crops — real detail
+                                       # deserves a bigger window than the plain digital loupe
+
+# Fixed location next to gcs.py itself, not whatever the current working
+# directory happens to be — a plain relative filename here used to save
+# wherever gcs.py was launched FROM, which made the images hard to find
+# ("easy access" meant first fixing where they land predictably).
+_HIRES_SAVE_DIR = Path(__file__).parent / "hires_crops"
+
+def open_hires_folder():
+    """Open _HIRES_SAVE_DIR in the OS file browser — the "easy access"
+    entry point for the saved images, rather than hunting for them."""
+    _HIRES_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(_HIRES_SAVE_DIR)])
+        elif sys.platform.startswith("linux"):
+            subprocess.Popen(["xdg-open", str(_HIRES_SAVE_DIR)])
+        elif sys.platform.startswith("win"):
+            os.startfile(str(_HIRES_SAVE_DIR))
+        else:
+            set_status(f"Hires crops folder: {_HIRES_SAVE_DIR}")
+            return
+        set_status(f"Opened {_HIRES_SAVE_DIR}")
+    except Exception as e:
+        set_status(f"Couldn't open folder: {e}")
 
 def toggle_hires_zoom():
     global _hires_zoom_enabled
@@ -1064,11 +1091,12 @@ def _fetch_hires_crop(nx, ny, req_id):
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if req_id == _hires_request_id and img is not None:
                 _hires_crop_img = img
-                fname = f"hires_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                _HIRES_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+                fname = _HIRES_SAVE_DIR / f"hires_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
                 try:
                     with open(fname, "wb") as f:
                         f.write(r.content)   # raw bytes from the Pi — no re-encode
-                    set_status(f"Hires crop saved → {fname}", log=False)
+                    set_status(f"Hires crop saved → {fname.name}", log=False)
                 except OSError as e:
                     set_status(f"Hires crop save failed: {e}", log=False)
         else:
@@ -1086,7 +1114,7 @@ def draw_hires_loupe(frame, mx, my, crop_img):
     crops it that way already), so the crosshair goes at the image's own
     center rather than needing a source-offset like the digital loupe."""
     h, w = frame.shape[:2]
-    out = min(_ZOOM_OUT, w, h)
+    out = min(_HIRES_ZOOM_OUT, w, h)
     zoom = cv2.resize(crop_img, (out, out), interpolation=cv2.INTER_AREA)
 
     cx = cy = out // 2
@@ -1363,6 +1391,8 @@ def _build_buttons(vx: int):
         lambda: (90, 40, 40) if launched else
                 ((30, 140, 50) if _hires_zoom_enabled else (90, 90, 30)),
     )
+    y += 40
+    btn("Open hires images", 32, open_hires_folder, (70, 70, 90))
     y += 44
 
     # ── Feature tracking diagnostic (green dots) ────────────────────────────
