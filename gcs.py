@@ -1064,6 +1064,13 @@ def _fetch_hires_crop(nx, ny, req_id):
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if req_id == _hires_request_id and img is not None:
                 _hires_crop_img = img
+                fname = f"hires_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                try:
+                    with open(fname, "wb") as f:
+                        f.write(r.content)   # raw bytes from the Pi — no re-encode
+                    set_status(f"Hires crop saved → {fname}", log=False)
+                except OSError as e:
+                    set_status(f"Hires crop save failed: {e}", log=False)
         else:
             set_status(f"Hires zoom: {r.text}", log=False)
     except Exception as e:
