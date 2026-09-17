@@ -141,11 +141,9 @@ threading.Thread(target=_heartbeat_sender, daemon=True).start()
 
 # ── Layout constants ──────────────────────────────────────────────────────────
 
-PANEL_W     = 210     # right-side button panel width  (px)
-PANEL_MIN_H = 1046    # minimum canvas height so all buttons fit (was 954 — +84 for the "Restart App"/"Reboot Pi"
-                       # buttons pulled in from the Pi side, which didn't bump this — that omission pushed the
-                       # MAIN/TRACK resolution buttons below the visible canvas entirely, looking like they'd
-                       # vanished)
+PANEL_W      = 210    # right-side button panel width (px) — primary/operational controls
+LEFT_PANEL_W = 210    # left-side button panel width (px) — secondary/diagnostic controls
+PANEL_MIN_H  = 572    # minimum canvas height so the taller of the two side panels fits
 
 def _screen_display_width(panel_w, fallback=1200):
     """Video display width sized to fill as much of the screen as possible
@@ -179,7 +177,7 @@ def _screen_display_width(panel_w, fallback=1200):
     except Exception:
         return fallback
 
-DISPLAY_W   = _screen_display_width(PANEL_W)   # video is stretched to this width for display
+DISPLAY_W   = _screen_display_width(LEFT_PANEL_W + PANEL_W)   # video is stretched to this width for display
 
 # NOTE: tried making this reactive to live window resize/maximize via
 # cv2.getWindowImageRect() polled every frame — reverted. On this OpenCV/
@@ -211,7 +209,10 @@ _mouse_pos = [0, 0]   # updated by mouse callback; used for hover highlight
 _press_on_video = False   # True from LBUTTONDOWN-on-video until release; commits select_point then
 _press_start_ts = 0.0     # time.time() when the press started; gates the zoom loupe's appearance
 _drag_start = [0, 0]      # display-coord position of the LBUTTONDOWN that started the current press
-DRAG_MIN_PX = 10          # release within this of the press start = a click; further = a dragged area
+DRAG_MIN_PX = 25          # release within this of the press start = a click; further = a dragged area
+                          # (was 10 — too tight now that drag-to-box fires on every click, not just
+                          # white-target mode: ordinary click jitter on a shaky feed exceeded it,
+                          # misclassifying plain clicks as tiny drags that floor out at MIN_BOX_SIDE)
 _quit         = threading.Event()  # set to break the main loop from any thread
 
 def _handle_term_signal(signum, frame):
@@ -1312,109 +1313,124 @@ _cur_video_w = 0    # rebuilt whenever video width changes
 est_fps_ref  = [0.0]  # [0] updated each frame; readable from button lambdas
 
 
-def _build_buttons(vx: int):
+def _build_buttons(video_w: int):
     """
-    Populate _buttons for a panel that starts at x=vx.
-    Called once at startup (vx=640) and again if the stream resolution changes.
+    Populate _buttons for two side panels flanking the video: a left panel
+    at x=0 for secondary/diagnostic controls, and a right panel at
+    x = LEFT_PANEL_W + video_w for primary/operational controls (the ones
+    touched during an actual run: launch, reset/stop, quit, target mode,
+    recording, stabilization).
+    Called once at startup (video_w=640) and again if the stream resolution
+    changes.
     """
     _buttons.clear()
 
-    bw   = PANEL_W - 16          # button width (8 px margin each side)
-    bx   = vx + 8                # button left edge
-    y    = 12
+    # ── Right panel (primary/operational controls) ─────────────────────────
+    rbw = PANEL_W - 16            # button width (8 px margin each side)
+    rbx = LEFT_PANEL_W + video_w + 8
+    y   = 12
 
-    def btn(label, h, action, bg):
-        _buttons.append(Button(label, bx, y, bw, h, action, bg))
+    def btn_r(label, h, action, bg):
+        _buttons.append(Button(label, rbx, y, rbw, h, action, bg))
 
-    def btn2(l1, l2, h, a1, a2, bg):
+    def btn2_r(l1, l2, h, a1, a2, bg):
         """Two equal-width buttons side by side."""
-        w2 = (bw - 4) // 2
-        _buttons.append(Button(l1, bx,          y, w2, h, a1, bg))
-        _buttons.append(Button(l2, bx + w2 + 4, y, w2, h, a2, bg))
+        w2 = (rbw - 4) // 2
+        _buttons.append(Button(l1, rbx,          y, w2, h, a1, bg))
+        _buttons.append(Button(l2, rbx + w2 + 4, y, w2, h, a2, bg))
 
-    # ── Main controls ─────────────────────────────────────────────────────
-    btn(
+    btn_r(
         lambda: "LAUNCHED" if launched else "Launch",
         44, send_launch,
         lambda: (30, 140, 50) if launched else (30, 90, 200),
     )
     y += 52
 
-    btn2("Reset", "Stop",  36,
-         lambda: send_cmd('r'), lambda: send_cmd('s'),
-         (35, 120, 35))
+    btn2_r("Reset", "Stop",  36,
+           lambda: send_cmd('r'), lambda: send_cmd('s'),
+           (35, 120, 35))
     y += 44
 
-    btn("Quit", 36, ask_quit, (40, 40, 170))
+    btn_r("Quit", 36, ask_quit, (40, 40, 170))
     y += 52
 
-    # ── Pi power controls (destructive — confirmed via overlay) ────────────
-    btn("Restart App", 32, ask_restart, (120, 70, 20))
-    y += 40
-    btn("Reboot Pi", 32, ask_reboot, (120, 30, 30))
-    y += 44
-
-    # ── Target mode ────────────────────────────────────────────────────────
-    btn(
+    btn_r(
         lambda: f"Target: {'MOVING' if moving_tgt else 'FIXED'}",
         36, toggle_target,
         lambda: (140, 80, 20) if moving_tgt else (60, 80, 140),
     )
     y += 44
 
-    # ── Pi Record ──────────────────────────────────────────────────────────
-    btn(
+    btn_r(
         lambda: "■ Pi REC" if _pi_recording else "● Pi REC",
         36, lambda: toggle_pi_record(est_fps_ref[0]),
         lambda: (30, 30, 180) if _pi_recording else (35, 120, 35),
     )
     y += 44
 
-    # ── Local Record ───────────────────────────────────────────────────────
-    btn(
+    btn_r(
         lambda: "■ Local REC" if _local_recording else "● Local REC",
         36, lambda: toggle_local_record(_cur_video_w, _cur_video_h),
         lambda: (140, 30, 30) if _local_recording else (35, 120, 35),
     )
     y += 44
 
-    # ── Pi camera FPS (idle/power-save ↔ full) ─────────────────────────────
-    btn(
+    btn_r(
+        lambda: "STAB: ON" if _stab_enabled else "STAB: OFF",
+        36, toggle_stabilization,
+        lambda: (30, 140, 50) if _stab_enabled else (90, 90, 30),
+    )
+    y += 44
+
+    # Pi camera FPS (idle/power-save ↔ full)
+    btn_r(
         lambda: "FPS: FULL" if cam_active else "FPS: IDLE",
         36, toggle_fps,
         lambda: (30, 140, 50) if cam_active else (90, 90, 30),
     )
     y += 44
 
-    # ── White target mode ────────────────────────────────────────────────────
-    btn(
+    # White target mode
+    btn_r(
         lambda: f"WHITE TARGET: {aim_phase.upper()}" if white_target_enabled else "WHITE TARGET: OFF",
         36, toggle_white_target,
         lambda: (30, 140, 50) if white_target_enabled else (90, 90, 30),
     )
-    y += 44
 
-    # ── Video stabilization ─────────────────────────────────────────────────
-    btn(
-        lambda: "STAB: ON" if _stab_enabled else "STAB: OFF",
-        36, toggle_stabilization,
-        lambda: (30, 140, 50) if _stab_enabled else (90, 90, 30),
-    )
+    # ── Left panel (secondary / diagnostic / admin controls) ───────────────
+    lbw = LEFT_PANEL_W - 16
+    lbx = 8
+    y   = 12
+
+    def btn_l(label, h, action, bg):
+        _buttons.append(Button(label, lbx, y, lbw, h, action, bg))
+
+    def btn2_l(l1, l2, h, a1, a2, bg):
+        w2 = (lbw - 4) // 2
+        _buttons.append(Button(l1, lbx,          y, w2, h, a1, bg))
+        _buttons.append(Button(l2, lbx + w2 + 4, y, w2, h, a2, bg))
+
+    # Pi power controls (destructive — confirmed via overlay)
+    btn_l("Restart App", 32, ask_restart, (120, 70, 20))
     y += 40
-    btn2("STAB -", "STAB +", 32,
-         lambda: cycle_stab_alpha(-1), lambda: cycle_stab_alpha(+1), (55, 55, 85))
+    btn_l("Reboot Pi", 32, ask_reboot, (120, 30, 30))
     y += 44
 
-    # ── Zoom loupe (press + drag on video to aim) ───────────────────────────
-    btn(
+    # Video stabilization fine-tuning
+    btn2_l("STAB -", "STAB +", 32,
+           lambda: cycle_stab_alpha(-1), lambda: cycle_stab_alpha(+1), (55, 55, 85))
+    y += 44
+
+    # Zoom loupe (press + drag on video to aim)
+    btn_l(
         lambda: "ZOOM: ON" if _zoom_enabled else "ZOOM: OFF",
         36, toggle_zoom,
         lambda: (30, 140, 50) if _zoom_enabled else (90, 90, 30),
     )
     y += 44
 
-    # ── Hi-res pre-launch zoom (long-press on video, real sensor detail) ────
-    btn(
+    # Hi-res pre-launch zoom (long-press on video, real sensor detail)
+    btn_l(
         lambda: "HIRES ZOOM: LOCKED" if launched else
                 ("HIRES ZOOM: ON" if _hires_zoom_enabled else "HIRES ZOOM: OFF"),
         36, toggle_hires_zoom,
@@ -1422,49 +1438,39 @@ def _build_buttons(vx: int):
                 ((30, 140, 50) if _hires_zoom_enabled else (90, 90, 30)),
     )
     y += 40
-    btn("Open hires images", 32, open_hires_folder, (70, 70, 90))
+    btn_l("Open hires images", 32, open_hires_folder, (70, 70, 90))
     y += 44
 
-    # ── Feature tracking diagnostic (green dots) ────────────────────────────
-    btn(
+    # Feature tracking diagnostic (green dots)
+    btn_l(
         lambda: "FEATURES: ON" if _feat_enabled else "FEATURES: OFF",
         36, toggle_features,
         lambda: (30, 140, 50) if _feat_enabled else (90, 90, 30),
     )
     y += 44
 
-    # ── Virtual target (yellow marker — estimates position out of FOV) ──────
-    btn(
+    # Virtual target (yellow marker — estimates position out of FOV)
+    btn_l(
         lambda: "VT: ON" if _vt_enabled else "VT: OFF",
         36, toggle_virtual_target,
         lambda: (30, 140, 50) if _vt_enabled else (90, 90, 30),
     )
     y += 44
 
-    # ── Video transport (jpeg_udp <-> h264_udp, live) ────────────────────────
-    btn(
+    # Video transport (jpeg_udp <-> h264_udp, live)
+    btn_l(
         lambda: f"VIDEO: {_gcs_video_mode.replace('_udp', '').upper()}" if _gcs_video_mode else "VIDEO: n/a",
         36, toggle_video_mode,
         lambda: (55, 55, 85) if _gcs_video_mode else (60, 60, 60),
     )
     y += 44
 
-    # ── D-pad ──────────────────────────────────────────────────────────────
-    dw  = dh  = 46
-    dpx = vx + (PANEL_W - dw * 3) // 2    # centre the 3-wide grid in panel
-
-    _buttons.append(Button("^",  dpx + dw,      y,          dw, dh, lambda: nudge( 0, -5), (75,75,75)))
-    _buttons.append(Button("<",  dpx,            y + dh,     dw, dh, lambda: nudge(-5,  0), (75,75,75)))
-    _buttons.append(Button(">",  dpx + dw*2,     y + dh,     dw, dh, lambda: nudge( 5,  0), (75,75,75)))
-    _buttons.append(Button("v",  dpx + dw,       y + dh*2,   dw, dh, lambda: nudge( 0,  5), (75,75,75)))
-    y += dh * 3 + 16
-
-    # ── Resolution cycling ─────────────────────────────────────────────────
-    btn2("MAIN -", "MAIN +",   32,
-         lambda: cycle_main(-1), lambda: cycle_main(+1), (55, 55, 85))
+    # Resolution cycling
+    btn2_l("MAIN -", "MAIN +",   32,
+           lambda: cycle_main(-1), lambda: cycle_main(+1), (55, 55, 85))
     y += 40
-    btn2("TRACK -", "TRACK +", 32,
-         lambda: cycle_lores(-1), lambda: cycle_lores(+1), (55, 55, 85))
+    btn2_l("TRACK -", "TRACK +", 32,
+           lambda: cycle_lores(-1), lambda: cycle_lores(+1), (55, 55, 85))
 
 
 # Build with default 640-wide video so buttons exist before stream arrives
@@ -1478,8 +1484,11 @@ _build_buttons(640)
 def draw_hud(frame, fps):
     h, w = frame.shape[:2]
 
-    # Top bar
-    cv2.rectangle(frame, (0, 0), (w, 36), (20, 20, 20), -1)
+    # Top bar — semi-transparent (like the bottom status bar below) so it
+    # tints the video/Pi-baked telemetry text under it instead of hiding it
+    bar = frame.copy()
+    cv2.rectangle(bar, (0, 0), (w, 36), (0, 0, 0), -1)
+    cv2.addWeighted(bar, 0.55, frame, 0.45, 0, frame)
 
     mode_col   = (60, 200, 60)  if not moving_tgt else (60, 160, 255)
     launch_col = (255,255,255)  if not launched    else (60, 160, 255)
@@ -1955,10 +1964,10 @@ def main():
                 elif _CONFIRM_NO and _CONFIRM_NO[0] <= x < _CONFIRM_NO[0] + _CONFIRM_NO[2] \
                                  and _CONFIRM_NO[1] <= y < _CONFIRM_NO[1] + _CONFIRM_NO[3]:
                     _confirm_action = None
-            elif x < _cur_video_w:
+            elif LEFT_PANEL_W <= x < LEFT_PANEL_W + _cur_video_w:
                 _press_on_video = True      # commit on release, not on press
                 _press_start_ts = time.time()
-                _drag_start[0], _drag_start[1] = x, y
+                _drag_start[0], _drag_start[1] = x - LEFT_PANEL_W, y
                 _hires_crop_img = None      # new press — drop any stale hires result
             else:
                 for btn in _buttons:        # click on panel → button action
@@ -1970,19 +1979,17 @@ def main():
                 _press_on_video = False
                 # A small release-vs-press movement is a plain click (fixed-
                 # size box at the point, as before); dragging further draws
-                # a rectangle instead — much easier to land on a target when
-                # the video itself is shaking too much to click it precisely.
-                # Only offered in white-target mode — that's the only case
-                # this was built for (searching a white blob within a marked
-                # area); a plain click always behaves exactly as before it.
-                if not white_target_enabled or (
-                        abs(x - _drag_start[0]) < DRAG_MIN_PX
+                # a rectangle instead, letting the operator hand-fit a snug
+                # box around a small/low-contrast target — useful well beyond
+                # white-target mode (which it was originally built for), so
+                # it's available any time, not gated on that toggle.
+                if (abs((x - LEFT_PANEL_W) - _drag_start[0]) < DRAG_MIN_PX
                         and abs(y - _drag_start[1]) < DRAG_MIN_PX):
-                    fx, fy = _to_raw_coords(x, y)   # undo display-only stabilization shift
+                    fx, fy = _to_raw_coords(x - LEFT_PANEL_W, y)   # undo display-only stabilization shift
                     select_point(fx, fy)
                 else:
                     fx0, fy0 = _to_raw_coords(_drag_start[0], _drag_start[1])
-                    fx1, fy1 = _to_raw_coords(x, y)
+                    fx1, fy1 = _to_raw_coords(x - LEFT_PANEL_W, y)
                     select_area(fx0, fy0, fx1, fy1)
                 _reset_loupe_blend()
 
@@ -2077,11 +2084,11 @@ def main():
         # zoom loupe (the loupe is for landing a precise single point; once
         # the operator is clearly dragging an area, that precision isn't the
         # goal any more) ──────────────────────────────────────────────────
-        dragging_area = (white_target_enabled and _press_on_video
-                          and (abs(_mouse_pos[0] - _drag_start[0]) >= DRAG_MIN_PX
+        dragging_area = (_press_on_video
+                          and (abs(_mouse_pos[0] - LEFT_PANEL_W - _drag_start[0]) >= DRAG_MIN_PX
                                or abs(_mouse_pos[1] - _drag_start[1]) >= DRAG_MIN_PX))
         if dragging_area:
-            mx, my = _mouse_pos
+            mx, my = _mouse_pos[0] - LEFT_PANEL_W, _mouse_pos[1]
             rx0, rx1 = sorted((_drag_start[0], min(mx, w - 1)))
             ry0, ry1 = sorted((_drag_start[1], min(my, h - 1)))
             cv2.rectangle(frame, (rx0, ry0), (rx1, ry1), (0, 255, 255), 1, cv2.LINE_AA)
@@ -2096,7 +2103,7 @@ def main():
                         and _press_on_video and not dragging_area
                         and (time.time() - _press_start_ts) >= _ZOOM_HOLD_S)
         if hires_active:
-            mx, my = _mouse_pos
+            mx, my = _mouse_pos[0] - LEFT_PANEL_W, _mouse_pos[1]
             if mx < w:
                 if _hires_crop_img is None and not _hires_pending:
                     _hires_pending = True
@@ -2118,7 +2125,7 @@ def main():
         # selects the cursor point directly) ─────────────────────────────────
         elif (_zoom_enabled and _press_on_video and not dragging_area
                 and (time.time() - _press_start_ts) >= _ZOOM_HOLD_S):
-            mx, my = _mouse_pos
+            mx, my = _mouse_pos[0] - LEFT_PANEL_W, _mouse_pos[1]
             if mx < w:
                 mx_c, my_c = min(w - 1, mx), min(h - 1, my)
                 crop, x0, y0 = _smoothed_crop(frame, mx_c, my_c)
@@ -2126,7 +2133,7 @@ def main():
 
         # ── Gamepad lock — Square/rectangle button selects at mouse position ─
         if gamepad.lock_pressed():
-            fx, fy = _to_raw_coords(min(w - 1, _mouse_pos[0]), min(h - 1, _mouse_pos[1]))
+            fx, fy = _to_raw_coords(min(w - 1, _mouse_pos[0] - LEFT_PANEL_W), min(h - 1, _mouse_pos[1]))
             lock_target(fx, fy)
 
         # Write to local recorder (video + HUD, no panel) — only on genuinely
@@ -2144,14 +2151,18 @@ def main():
                         cv2.resize(rec_source, (_cur_video_w, _cur_video_h))
             _local_writer.write(rec_frame)
 
-        # ── Composite canvas: video left + button panel right ──────────────
+        # ── Composite canvas: diagnostic panel left + video + operational panel right ──
         canvas_h = max(h, PANEL_MIN_H)
-        canvas   = np.zeros((canvas_h, w + PANEL_W, 3), np.uint8)
-        canvas[:h, :w] = frame
+        canvas   = np.zeros((canvas_h, LEFT_PANEL_W + w + PANEL_W, 3), np.uint8)
+        canvas[:h, LEFT_PANEL_W:LEFT_PANEL_W + w] = frame
 
-        # Panel background + separator line
-        cv2.rectangle(canvas, (w, 0), (w + PANEL_W, canvas_h), (30, 30, 30), -1)
-        cv2.line(canvas, (w, 0), (w, canvas_h), (70, 70, 70), 1)
+        # Left panel background + separator line
+        cv2.rectangle(canvas, (0, 0), (LEFT_PANEL_W, canvas_h), (30, 30, 30), -1)
+        cv2.line(canvas, (LEFT_PANEL_W, 0), (LEFT_PANEL_W, canvas_h), (70, 70, 70), 1)
+
+        # Right panel background + separator line
+        cv2.rectangle(canvas, (LEFT_PANEL_W + w, 0), (LEFT_PANEL_W + w + PANEL_W, canvas_h), (30, 30, 30), -1)
+        cv2.line(canvas, (LEFT_PANEL_W + w, 0), (LEFT_PANEL_W + w, canvas_h), (70, 70, 70), 1)
 
         # Buttons (with hover highlight)
         mx, my = _mouse_pos

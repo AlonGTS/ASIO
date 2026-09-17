@@ -21,9 +21,16 @@ from flask_cors import CORS
 # (geometric mean of the width and height ratios to the baseline) rather
 # than independent width/height fractions, so switching to a non-4:3
 # resolution (e.g. 1280x720) can't skew it into a rectangle.
+# Also what a white-target area-search box shrinks back down to once the
+# blob is first found inside it (tracker-so.py) — keep in sync with that.
 BOX_BASE_MOVING        = 22
 BOX_BASE_FIXED         = 58
 BOX_BASE_NUDGE_DEFAULT = 43
+
+# Floor for a manually-dragged box only — guards against a degenerate
+# near-zero size from a drag that was just barely over the GCS's own
+# click-vs-drag threshold.
+MIN_BOX_SIDE = 10
 
 
 def _scaled_square(base, mw, mh):
@@ -132,7 +139,6 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
                 # is shaking too much to click one exact spot. MIN_BOX_SIDE
                 # guards against a degenerate near-zero box from a drag that
                 # was just barely over the GCS's own click-vs-drag threshold.
-                MIN_BOX_SIDE = 10
                 xa = max(0.0, min(1.0, float(nx0_f))) * (mw - 1)
                 xb_ = max(0.0, min(1.0, float(nx1_f))) * (mw - 1)
                 ya = max(0.0, min(1.0, float(ny0_f))) * (mh - 1)
