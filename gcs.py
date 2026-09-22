@@ -846,8 +846,15 @@ def toggle_fps():
 def toggle_white_target():
     """Explicitly tell the Pi to turn white-target aim refinement/recovery on
     or off. Off = tracking behaves exactly as plain bbox-center tracking."""
-    global white_target_enabled
+    global white_target_enabled, aim_phase
     white_target_enabled = not white_target_enabled
+    # Optimistic, matching what the Pi will report on its next /status poll
+    # (aim_phase="blob" the instant white-target turns on, "cross" only after
+    # WHITE_TARGET_CLOSE_RANGE_AFTER_S post-launch) — without this, the button's
+    # color (driven by white_target_enabled, updates this frame) and its label
+    # (driven by aim_phase, only refreshed every 2s by _status_poller) could
+    # disagree for up to 2s: green button still reading "WHITE TARGET: OFF".
+    aim_phase = "blob" if white_target_enabled else "off"
     _post("set_white_target", enabled=1 if white_target_enabled else 0)
     set_status("White target: ON" if white_target_enabled else "White target: OFF")
 
