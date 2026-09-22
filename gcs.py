@@ -198,6 +198,7 @@ _local_recording = False  # GCS-side recording state
 _local_writer    = None   # cv2.VideoWriter when local recording is active
 cam_active      = False   # Pi camera fps state: False=idle (power-save), True=full fps
 white_target_enabled = False   # Pi-side white-target aim refinement/recovery on/off
+white_target_has_cross = True  # Pi-side: whether the current target has a printed "+" mark
 aim_phase       = "off"   # "off" | "blob" | "cross" — which detector is currently active, polled from /status
 _cpu_percent    = None    # Pi CPU usage %, polled from /status; None until first poll
 _cpu_temp_c     = None    # Pi SoC temperature °C, polled from /status; None until first poll
@@ -858,11 +859,20 @@ def toggle_white_target():
     _post("set_white_target", enabled=1 if white_target_enabled else 0)
     set_status("White target: ON" if white_target_enabled else "White target: OFF")
 
+def toggle_wt_has_cross():
+    """Explicitly tell the Pi whether the current white target has a printed
+    "+" mark. Off = close-range refinement skips cross detection entirely
+    and always uses the sheet centroid (see _find_cross_centroid)."""
+    global white_target_has_cross
+    white_target_has_cross = not white_target_has_cross
+    _post("set_wt_has_cross", enabled=1 if white_target_has_cross else 0)
+    set_status("Target: HAS CROSS" if white_target_has_cross else "Target: NO CROSS")
+
 def _status_poller():
     """Background: poll /status every 2s to keep cam_active/_cpu_percent/_cpu_temp_c/
-    _pi_tracking/white_target_enabled/aim_phase fresh even when nothing else is
-    triggering a request (e.g. after Pi restarts)."""
-    global cam_active, _cpu_percent, _cpu_temp_c, _pi_tracking, white_target_enabled, aim_phase
+    _pi_tracking/white_target_enabled/white_target_has_cross/aim_phase fresh even
+    when nothing else is triggering a request (e.g. after Pi restarts)."""
+    global cam_active, _cpu_percent, _cpu_temp_c, _pi_tracking, white_target_enabled, white_target_has_cross, aim_phase
     while not _quit.is_set():
         data = _get("status")
         if data:
@@ -871,6 +881,7 @@ def _status_poller():
             _cpu_temp_c  = data.get("cpu_temp", _cpu_temp_c)
             _pi_tracking = data.get("tracking", _pi_tracking)
             white_target_enabled = data.get("white_target", white_target_enabled)
+            white_target_has_cross = data.get("wt_has_cross", white_target_has_cross)
             aim_phase    = data.get("aim_phase", aim_phase)
         time.sleep(2.0)
 
@@ -1402,6 +1413,16 @@ def _build_buttons(video_w: int):
         lambda: f"WHITE TARGET: {aim_phase.upper()}" if white_target_enabled else "WHITE TARGET: OFF",
         36, toggle_white_target,
         lambda: (30, 140, 50) if white_target_enabled else (90, 90, 30),
+    )
+    y += 44
+
+    # Whether the current white target has a printed "+" mark — off = close-
+    # range refinement skips cross detection entirely, always uses the sheet
+    # centroid instead.
+    btn_r(
+        lambda: "TARGET: HAS CROSS" if white_target_has_cross else "TARGET: NO CROSS",
+        36, toggle_wt_has_cross,
+        lambda: (30, 140, 50) if white_target_has_cross else (90, 90, 30),
     )
 
     # ── Left panel (secondary / diagnostic / admin controls) ───────────────

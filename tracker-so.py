@@ -396,10 +396,24 @@ _wt_close_range = False   # far/medium-range (blob) vs close-range (cross) phase
                            # iteration, since real Pi hardware init — camera, MAVProxy — happens
                            # in between and takes real time)
 
+# GCS-controlled: whether the current physical target has a "+" printed on
+# it at all. True (default) = close-range refinement tries cross detection,
+# falling back to the sheet centroid only when a confident cross isn't found
+# this frame (see _find_cross_centroid). False = skip the cross search
+# entirely and always use the sheet centroid — for a target that will never
+# have a cross, this avoids wasting every frame on a doomed Stage-2 search
+# and just goes straight to the detector that actually works for it.
+_wt_has_cross = True
+
 def _set_white_target(enabled: bool):
     global _white_target_enabled
     _white_target_enabled = enabled
     print(f"[WT]   White-target mode {'ON' if enabled else 'OFF'}")
+
+def _set_wt_has_cross(enabled: bool):
+    global _wt_has_cross
+    _wt_has_cross = enabled
+    print(f"[WT]   Target has cross: {'YES' if enabled else 'NO'}")
 
 def _reader_playback(path, loop=False):
     """
@@ -985,7 +999,7 @@ _CROSS_MAX_AREA_FRAC = _cfg["tracking"].get("aim_cross_max_area_frac", 0.35)
 _CROSS_MIN_CONTRAST  = _cfg["tracking"].get("aim_cross_min_contrast", 20)
 _CROSS_SEARCH_PAD_FRAC = _cfg["tracking"].get("aim_cross_search_pad_frac", 0.5)
 
-def _find_cross_centroid(frame, x, y, bw, bh, fallback_cx, fallback_cy):
+def _find_cross_centroid(frame, x, y, bw, bh, fallback_cx, fallback_cy, search_cross=True):
     """Return (cx, cy, found) — the centroid of a dark "+"-shaped mark found
     within the bright sheet inside bbox (x,y,bw,bh); if the sheet is found
     but no confidently-present mark is (no cross on this target, glare, bad
@@ -993,6 +1007,10 @@ def _find_cross_centroid(frame, x, y, bw, bh, fallback_cx, fallback_cy):
     found=True since it's a real fix on the target. Only returns
     (fallback_cx, fallback_cy, False) — the caller's raw CSRT box center —
     when no sheet-like region is found at all this frame.
+
+    search_cross=False (GCS "target has no cross" toggle) skips Stage 2
+    entirely and always returns the sheet centroid — for a target that will
+    never have a cross, Stage 2 can only ever waste time finding nothing.
 
     Deliberately no prev_point/stickiness gate here (unlike
     _refine_aim_point, which uses one to pick among several bright-blob
@@ -1079,6 +1097,9 @@ def _find_cross_centroid(frame, x, y, bw, bh, fallback_cx, fallback_cy):
     sheet_ys, sheet_xs = np.nonzero(sheet_extent)
     sheet_cx = x + t + int(round(sheet_xs.mean()))
     sheet_cy = y + t + int(round(sheet_ys.mean()))
+
+    if not search_cross:
+        return sheet_cx, sheet_cy, True
 
     # Stage 2: find the dark cross strictly INSIDE the sheet (erode first so
     # the sheet's own edge pixels aren't mistaken for the mark).
@@ -1327,6 +1348,8 @@ app = flask_app.create_app(
     get_video_mode_fn  = lambda: _current_video_mode,
     set_white_target_fn = _set_white_target,
     get_white_target_fn  = lambda: _white_target_enabled,
+    set_wt_has_cross_fn = _set_wt_has_cross,
+    get_wt_has_cross_fn  = lambda: _wt_has_cross,
     get_aim_phase_fn = lambda: (
         "cross" if _white_target_enabled and _wt_close_range else
         "blob"  if _white_target_enabled else
@@ -1798,7 +1821,8 @@ while True:
                 # a corner of the sheet instead of its true center.
                 if _wt_active:
                     if _wt_close_range:
-                        aim_cx, aim_cy, _aim_found = _find_cross_centroid(frame, x, y, bw, bh, cx, cy)
+                        aim_cx, aim_cy, _aim_found = _find_cross_centroid(
+                            frame, x, y, bw, bh, cx, cy, search_cross=_wt_has_cross)
                     else:
                         # prev_point is the CSRT box's own LIVE center (cx, cy),
                         # recomputed fresh every frame — not the frozen last-
