@@ -983,12 +983,16 @@ def _refine_aim_point(frame, x, y, bw, bh, fallback_cx, fallback_cy, prev_point=
 _CROSS_MIN_AREA_FRAC = _cfg["tracking"].get("aim_cross_min_area_frac", 0.01)
 _CROSS_MAX_AREA_FRAC = _cfg["tracking"].get("aim_cross_max_area_frac", 0.35)
 _CROSS_MIN_CONTRAST  = _cfg["tracking"].get("aim_cross_min_contrast", 20)
+_CROSS_SEARCH_PAD_FRAC = _cfg["tracking"].get("aim_cross_search_pad_frac", 0.5)
 
 def _find_cross_centroid(frame, x, y, bw, bh, fallback_cx, fallback_cy):
     """Return (cx, cy, found) — the centroid of a dark "+"-shaped mark found
-    within the bright sheet inside bbox (x,y,bw,bh), or (fallback_cx,
-    fallback_cy, False) if no sheet-like region or no confidently-present
-    mark is found this frame.
+    within the bright sheet inside bbox (x,y,bw,bh); if the sheet is found
+    but no confidently-present mark is (no cross on this target, glare, bad
+    angle, ...), falls back to the sheet's own centroid, still reported as
+    found=True since it's a real fix on the target. Only returns
+    (fallback_cx, fallback_cy, False) — the caller's raw CSRT box center —
+    when no sheet-like region is found at all this frame.
 
     Deliberately no prev_point/stickiness gate here (unlike
     _refine_aim_point, which uses one to pick among several bright-blob
@@ -1004,6 +1008,25 @@ def _find_cross_centroid(frame, x, y, bw, bh, fallback_cx, fallback_cy):
     caller's confirm-streak alone is the single source of jump protection."""
     if bw < 6 or bh < 6:
         return fallback_cx, fallback_cy, False
+
+    # Search a region padded past the box edges, not just the box itself —
+    # at close range the box's growth is capped (max_bb_width/height,
+    # config.toml [tracking]) well before the physical target's apparent
+    # size stops growing, so a crop limited to the box alone can end up
+    # entirely inside the sheet with no edge in view. Stage 1 below would
+    # then find one bright blob filling the whole crop, and its centroid
+    # degrades to just the crop's (i.e. the box's) own center — silently
+    # losing the sheet-centroid fallback's ability to correct CSRT drift
+    # right when it's needed most. Padding keeps the sheet's real boundary
+    # visible so a genuine offset can still be recovered.
+    fh, fw = frame.shape[:2]
+    pad_x = int(bw * _CROSS_SEARCH_PAD_FRAC)
+    pad_y = int(bh * _CROSS_SEARCH_PAD_FRAC)
+    x, y_ = max(0, x - pad_x), max(0, y - pad_y)
+    bw = min(fw, x + bw + 2 * pad_x) - x
+    bh = min(fh, y_ + bh + 2 * pad_y) - y_
+    y = y_
+
     crop = frame[y:y + bh, x:x + bw]
     if crop.size == 0:
         return fallback_cx, fallback_cy, False
@@ -1043,20 +1066,34 @@ def _find_cross_centroid(frame, x, y, bw, bh, fallback_cx, fallback_cy):
     sheet_idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     sheet_extent = labels == sheet_idx
 
+    # Sheet centroid — used as the fallback aim point below whenever Stage 2
+    # can't confirm a cross (no mark on this target, glare, bad angle, ...).
+    # It's still a real, live position fix on the actual target (unlike
+    # fallback_cx/fallback_cy, the raw CSRT box center passed in by the
+    # caller), so returning it as "found" lets the caller's periodic
+    # box-recentering and aim-smoothing keep correcting CSRT drift even on a
+    # target with no printed cross — previously that correction path went
+    # completely dead the moment no cross was detectable, which let CSRT's
+    # box silently drift off-target at close range (low-texture white sheet,
+    # more prone to drift) with nothing to pull it back.
+    sheet_ys, sheet_xs = np.nonzero(sheet_extent)
+    sheet_cx = x + t + int(round(sheet_xs.mean()))
+    sheet_cy = y + t + int(round(sheet_ys.mean()))
+
     # Stage 2: find the dark cross strictly INSIDE the sheet (erode first so
     # the sheet's own edge pixels aren't mistaken for the mark).
     interior = cv2.erode(sheet_extent.astype(np.uint8) * 255, np.ones((7, 7), np.uint8)) > 0
     if interior.sum() == 0:
-        return fallback_cx, fallback_cy, False
+        return sheet_cx, sheet_cy, True
     dark_in_sheet = interior & (bright_raw == 0)
     dark_frac = dark_in_sheet.sum() / interior.sum()
     if dark_frac < _CROSS_MIN_AREA_FRAC or dark_frac > _CROSS_MAX_AREA_FRAC:
-        return fallback_cx, fallback_cy, False
+        return sheet_cx, sheet_cy, True
     ys_i, xs_i = np.nonzero(interior)
     vals = gray_in[ys_i, xs_i]
     dark_sel = dark_in_sheet[ys_i, xs_i]
     if vals[~dark_sel].mean() - vals[dark_sel].mean() < _CROSS_MIN_CONTRAST:
-        return fallback_cx, fallback_cy, False   # not enough contrast — likely just noise/shadow
+        return sheet_cx, sheet_cy, True   # not enough contrast — likely just noise/shadow
     dys, dxs = np.nonzero(dark_in_sheet)
     return x + t + int(round(dxs.mean())), y + t + int(round(dys.mean())), True
 

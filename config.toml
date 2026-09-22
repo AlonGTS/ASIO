@@ -30,6 +30,14 @@ white_target_close_range_after_s = 10
 aim_cross_min_area_frac  = 0.01
 aim_cross_max_area_frac  = 0.35
 aim_cross_min_contrast   = 20
+# How far past the box edges (as a fraction of box width/height, each side)
+# to search for the sheet itself. At close range the box's growth is capped
+# by max_bb_width/height above, well before the physical target's apparent
+# size stops growing — without this padding, the search crop ends up
+# entirely inside the sheet with no edge visible, and the sheet-centroid
+# fallback (see _find_cross_centroid) degrades to just the box's own
+# center, silently losing its ability to correct CSRT drift.
+aim_cross_search_pad_frac = 0.5
 
 [gts-track.common]
 use_hog             = true
