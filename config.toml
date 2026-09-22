@@ -126,12 +126,13 @@ gcs_port      = 14550
 local_port    = 14551
 # Dedicated unicast outputs — MAVProxy sends a copy to each IP:gcs_port
 # Add every QGC / GCS machine here that needs full telemetry
-extra_outputs = ["192.168.10.8", "10.50.117.41", "192.168.1.31", "192.168.1.43", "192.168.1.32"]
+extra_outputs = ["192.168.10.8", "10.50.117.41", "192.168.1.31", "192.168.1.43", "192.168.1.37"]
 
 [camera]
-# Safe/default resolutions for IMX708 path
-main_sizes  = [[640, 480], [960, 540], [1280, 720], [1640, 1232]]
-lores_sizes = [[320, 240], [416, 312], [512, 384], [640,  480], [800, 600], [960, 540], [1280, 720], [1640, 1232]]
+# Safe/default resolutions for IMX708 path. Index 0 is the startup default
+# for both main (video) and lores (tracking) — 1280x720 in both lists.
+main_sizes  = [[1280, 720], [640, 480], [800, 600], [960, 540], [1024, 768], [1280, 960], [1640, 1232]]
+lores_sizes = [[1280, 720], [320, 240], [416, 312], [512, 384], [640, 480], [800, 600], [960, 540], [1024, 768], [1280,960], [1640, 1232]]
 
 # Capture starts at idle_fps (low CPU/heat) and only switches to active_fps
 # when the GCS operator explicitly toggles it (FPS button / F key in gcs.py).
@@ -141,7 +142,5 @@ active_fps = 30
 
 # Size (native-resolution pixels, per side) of the hi-res pre-launch zoom
 # crop (see gcs.py's HIRES ZOOM button / tracker-so.py's _capture_hires_crop)
-# — a full-native-sensor still capture, cropped down to just this window
-# around the cursor before sending, so the response stays small despite the
-# underlying capture being much larger.
-hires_crop_size = 680
+# — read directly off the sensor via ScalerCrop, centered on the cursor.
+hires_crop_size = 800
