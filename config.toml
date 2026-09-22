@@ -10,8 +10,8 @@ baseline_enabled = true
 baseline_dir     = "logs"
 
 [tracking]
-max_bb_width = 120
-max_bb_height = 120
+max_bb_width = 150
+max_bb_height = 150
 # White-target mode (see gcs.py's WHITE TARGET button) switches from plain
 # brightness-blob detection to dark-cross-centroid detection this many
 # seconds after launch — up close (final few seconds before touchdown) the
