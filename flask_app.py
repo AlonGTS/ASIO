@@ -27,6 +27,13 @@ BOX_BASE_MOVING        = 22
 BOX_BASE_FIXED         = 58
 BOX_BASE_NUDGE_DEFAULT = 43
 
+# Fixed-target click box while white-target mode is on: 1.5x BOX_BASE_FIXED
+# so an imprecise click (operator fighting flight dynamics) still lands the
+# box on the white blob — white-target's own blob search (see tracker-so.py,
+# _refine_aim_point) only ever looks inside this box on the first frame, so
+# the box IS the search area; there's no separate/larger search radius.
+BOX_BASE_FIXED_WHITE_TARGET = round(BOX_BASE_FIXED * 1.5)
+
 # Floor for a manually-dragged box only — guards against a degenerate
 # near-zero size from a drag that was just barely over the GCS's own
 # click-vs-drag threshold.
@@ -39,9 +46,16 @@ def _scaled_square(base, mw, mh):
     return side, side
 
 
-def box_size(mw, mh, moving):
-    """Selection-box (w, h) in MAIN pixels, scaled to the mw x mh frame. Always square."""
-    base = BOX_BASE_MOVING if moving else BOX_BASE_FIXED
+def box_size(mw, mh, moving, white_target=False):
+    """Selection-box (w, h) in MAIN pixels, scaled to the mw x mh frame. Always square.
+    white_target only widens the FIXED-target case (BOX_BASE_FIXED_WHITE_TARGET) —
+    moving-target sizing is unaffected."""
+    if moving:
+        base = BOX_BASE_MOVING
+    elif white_target:
+        base = BOX_BASE_FIXED_WHITE_TARGET
+    else:
+        base = BOX_BASE_FIXED
     return _scaled_square(base, mw, mh)
 
 
@@ -161,7 +175,8 @@ def create_app(state, create_tracker_fn, cycle_main_fn=None, cycle_lores_fn=None
                     x = max(0, min(mw - 1, int(request.form.get("x"))))
                     y = max(0, min(mh - 1, int(request.form.get("y"))))
 
-                w, h = box_size(mw, mh, state.bMoovingTgt)
+                white_target = get_white_target_fn() if get_white_target_fn else False
+                w, h = box_size(mw, mh, state.bMoovingTgt, white_target)
                 x0 = max(0, min(mw - w, x - w // 2))
                 y0 = max(0, min(mh - h, y - h // 2))
 
